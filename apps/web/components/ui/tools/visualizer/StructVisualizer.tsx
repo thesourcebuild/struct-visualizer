@@ -3,6 +3,8 @@
 import React, { useState } from 'react';
 import { memberDeclarator, memberLabel, memberTypeLabel } from '@sp/core';
 import type { CalculationResult } from '@sp/core';
+import Tooltip from '@/components/ui/Tooltip';
+import { explainStats } from './stat-explanations';
 
 export type TabOption = 'all' | 'visualization' | 'statistics' | 'details';
 
@@ -41,8 +43,108 @@ function SectionToggle({ expanded, onToggle }: { expanded: boolean; onToggle: ()
   );
 }
 
+const TONES = {
+  blue: {
+    card: 'from-blue-50 to-blue-100 dark:from-blue-900/20 dark:to-blue-900/40 border-blue-200 dark:border-blue-800/50',
+    value: 'text-blue-600 dark:text-blue-400',
+    label: 'text-blue-700 dark:text-blue-300',
+    unit: 'text-blue-600 dark:text-blue-400',
+    blob: 'bg-blue-200 dark:bg-blue-800/30',
+  },
+  red: {
+    card: 'from-red-50 to-red-100 dark:from-red-900/20 dark:to-red-900/40 border-red-200 dark:border-red-800/50',
+    value: 'text-red-600 dark:text-red-400',
+    label: 'text-red-700 dark:text-red-300',
+    unit: 'text-red-600 dark:text-red-400',
+    blob: 'bg-red-200 dark:bg-red-800/30',
+  },
+  green: {
+    card: 'from-green-50 to-green-100 dark:from-green-900/20 dark:to-green-900/40 border-green-200 dark:border-green-800/50',
+    value: 'text-green-600 dark:text-green-400',
+    label: 'text-green-700 dark:text-green-300',
+    unit: 'text-green-600 dark:text-green-400',
+    blob: 'bg-green-200 dark:bg-green-800/30',
+  },
+  purple: {
+    card: 'from-purple-50 to-purple-100 dark:from-purple-900/20 dark:to-purple-900/40 border-purple-200 dark:border-purple-800/50',
+    value: 'text-purple-600 dark:text-purple-400',
+    label: 'text-purple-700 dark:text-purple-300',
+    unit: 'text-purple-600 dark:text-purple-400',
+    blob: 'bg-purple-200 dark:bg-purple-800/30',
+  },
+} as const;
+
+/**
+ * Where each card's tooltip lines up. The grid is two columns on phones and four from `md`, so the
+ * middle two cards change sides at that breakpoint; the outer two always open inwards.
+ */
+const TIP_SIDES = {
+  start: { placement: 'bottom-start', className: '' },
+  end: { placement: 'bottom-end', className: '' },
+  'end-then-start': { placement: 'bottom-start', className: 'max-md:left-auto max-md:right-0' },
+  'start-then-end': { placement: 'bottom-end', className: 'max-md:right-auto max-md:left-0' },
+} as const;
+
+/**
+ * One Statistics number, with an info button whose tooltip says why it has this value. The
+ * decorative circle is clipped on its own so that the tooltip can extend past the card.
+ */
+function StatCard({
+  tone,
+  value,
+  label,
+  unit,
+  explanation,
+  tip,
+}: {
+  tone: keyof typeof TONES;
+  value: React.ReactNode;
+  label: string;
+  unit: string;
+  explanation: string;
+  /** Which card edge the tooltip lines up with, so it opens towards the middle of the grid. */
+  tip: keyof typeof TIP_SIDES;
+}) {
+  const t = TONES[tone];
+  const side = TIP_SIDES[tip];
+  return (
+    <div className={`relative rounded-lg bg-gradient-to-br p-4 border ${t.card}`}>
+      <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-lg" aria-hidden>
+        <div className={`absolute top-0 right-0 w-12 h-12 rounded-full -mr-4 -mt-4 opacity-20 ${t.blob}`} />
+      </div>
+      {/* Positioned, so it paints over the circle and the tooltip lines up with this box's edges
+          rather than the icon's. No z-index: that would trap the tooltip under the next card. */}
+      <div className="relative flex items-start justify-between gap-2">
+        <div>
+          <div className={`text-2xl font-bold ${t.value}`}>{value}</div>
+          <div className={`text-xs font-medium mt-2 ${t.label}`}>{label}</div>
+          <div className={`text-xs mt-1 ${t.unit}`}>{unit}</div>
+        </div>
+        <Tooltip
+          content={explanation}
+          placement={side.placement}
+          anchorToParent
+          className={`w-64 max-w-[calc(100vw-2rem)] whitespace-normal text-left leading-relaxed ${side.className}`}
+        >
+          <button
+            type="button"
+            aria-label={`Why is ${label} ${value}?`}
+            className={`-mr-1 -mt-1 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full opacity-70 transition-opacity hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-current ${t.label}`}
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" aria-hidden>
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 11v5M12 8h.01" />
+            </svg>
+          </button>
+        </Tooltip>
+      </div>
+    </div>
+  );
+}
+
 export default function StructVisualizer({ result, hideDropdown = false, activeTab: controlledTab, onTabChange, sectionMinHeights }: StructVisualizerProps) {
   const [internalTab, setInternalTab] = useState<TabOption>('all');
+  const explanations = React.useMemo(() => explainStats(result), [result]);
   const activeTab = controlledTab !== undefined ? controlledTab : internalTab;
 
   const setActiveTab = (tab: TabOption) => {
@@ -386,57 +488,24 @@ export default function StructVisualizer({ result, hideDropdown = false, activeT
             </div>
             {expandedSections.statistics && (
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                <div className="relative overflow-hidden rounded-lg bg-gradient-to-br from-blue-50 to-blue-100 dark:from-blue-900/20 dark:to-blue-900/40 p-4 border border-blue-200 dark:border-blue-800/50">
-                  <div className="relative z-10">
-                    <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">
-                      {result.totalSize}
-                    </div>
-                    <div className="text-xs font-medium text-blue-700 dark:text-blue-300 mt-2">
-                      Total Size
-                    </div>
-                    <div className="text-xs text-blue-600 dark:text-blue-400 mt-1">bytes</div>
-                  </div>
-                  <div className="absolute top-0 right-0 w-12 h-12 bg-blue-200 dark:bg-blue-800/30 rounded-full -mr-4 -mt-4 opacity-20"></div>
-                </div>
-
-                <div className="relative overflow-hidden rounded-lg bg-gradient-to-br from-red-50 to-red-100 dark:from-red-900/20 dark:to-red-900/40 p-4 border border-red-200 dark:border-red-800/50">
-                  <div className="relative z-10">
-                    <div className="text-2xl font-bold text-red-600 dark:text-red-400">
-                      {result.totalPadding}
-                    </div>
-                    <div className="text-xs font-medium text-red-700 dark:text-red-300 mt-2">
-                      Padding
-                    </div>
-                    <div className="text-xs text-red-600 dark:text-red-400 mt-1">wasted</div>
-                  </div>
-                  <div className="absolute top-0 right-0 w-12 h-12 bg-red-200 dark:bg-red-800/30 rounded-full -mr-4 -mt-4 opacity-20"></div>
-                </div>
-
-                <div className="relative overflow-hidden rounded-lg bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900/20 dark:to-green-900/40 p-4 border border-green-200 dark:border-green-800/50">
-                  <div className="relative z-10">
-                    <div className="text-2xl font-bold text-green-600 dark:text-green-400">
-                      {result.efficiency.toFixed(1)}%
-                    </div>
-                    <div className="text-xs font-medium text-green-700 dark:text-green-300 mt-2">
-                      Efficiency
-                    </div>
-                    <div className="text-xs text-green-600 dark:text-green-400 mt-1">density</div>
-                  </div>
-                  <div className="absolute top-0 right-0 w-12 h-12 bg-green-200 dark:bg-green-800/30 rounded-full -mr-4 -mt-4 opacity-20"></div>
-                </div>
-
-                <div className="relative overflow-hidden rounded-lg bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900/20 dark:to-purple-900/40 p-4 border border-purple-200 dark:border-purple-800/50">
-                  <div className="relative z-10">
-                    <div className="text-2xl font-bold text-purple-600 dark:text-purple-400">
-                      {result.struct.alignment || 'N/A'}
-                    </div>
-                    <div className="text-xs font-medium text-purple-700 dark:text-purple-300 mt-2">
-                      Alignment
-                    </div>
-                    <div className="text-xs text-purple-600 dark:text-purple-400 mt-1">bytes</div>
-                  </div>
-                  <div className="absolute top-0 right-0 w-12 h-12 bg-purple-200 dark:bg-purple-800/30 rounded-full -mr-4 -mt-4 opacity-20"></div>
-                </div>
+                <StatCard tone="blue" value={result.totalSize} label="Total Size" unit="bytes" explanation={explanations.size} tip="start" />
+                <StatCard tone="red" value={result.totalPadding} label="Padding" unit="wasted" explanation={explanations.padding} tip="end-then-start" />
+                <StatCard
+                  tone="green"
+                  value={`${result.efficiency.toFixed(1)}%`}
+                  label="Efficiency"
+                  unit="density"
+                  explanation={explanations.efficiency}
+                  tip="start-then-end"
+                />
+                <StatCard
+                  tone="purple"
+                  value={result.struct.alignment || 'N/A'}
+                  label="Alignment"
+                  unit="bytes"
+                  explanation={explanations.alignment}
+                  tip="end"
+                />
               </div>
             )}
           </div>

@@ -27,6 +27,7 @@ Every script comes as a triplet: a `.bat` that forwards to a `.ps1` (Windows) an
 | `pnpm win:build` | `pnpm sh:build` | Build every package. Options: `-Clean`, `-Verify`, `-Smoke`, `-BasePath`. |
 | `pnpm win:verify` | `pnpm sh:verify` | The full gate (script check, version check, typecheck, lint, test), then build and smoke-check the export. |
 | `pnpm win:version` | `pnpm sh:version` | Sync every `package.json` to the `version` file. `-Set 0.2.0` bumps, `-Check` only reports. |
+| `pnpm win:clean` | `pnpm sh:clean` | Delete the local caches and build output (`.next`, `out`, `.turbo`, `*.tsbuildinfo`) and report the space freed. `-DryRun` / `--dry-run` only lists; `-All` / `--all` also removes `node_modules`. Stop `pnpm web` first. |
 | `pnpm win:check` | `pnpm sh:check` | Every script is ASCII, uses the right line endings, and parses (PowerShell 5.1 included). |
 
 ## Environment variables (web)
