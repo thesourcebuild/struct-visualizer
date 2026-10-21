@@ -86,6 +86,8 @@ interface TypeInfo {
   type: string;
   declaredType?: string;
   isPointer: boolean;
+  /** A pointer to a function, not to data. Kept through typedefs and arrays of the type. */
+  functionPointer?: boolean;
   dims: number[];
   recordRef?: { keyword: RecordKeyword; name: string };
   nestedStruct?: ParsedStruct;
@@ -566,7 +568,7 @@ export class StructParser {
 
     const def: ParsedEnum = { name, members };
     if (underlyingType) def.underlyingType = underlyingType;
-    else if (attrs.packed) def.underlyingType = smallestEnumType(members);
+    else if (attrs.packed) def.packed = true;
 
     if (name) {
       if (this.enums.has(name) && tag) {
@@ -894,6 +896,8 @@ export class StructParser {
       type: `${base.type}${'*'.repeat(Math.max(1, levels))}`,
       declaredType: func ? `${base.declaredType ?? base.type} (*)(${func.params})` : base.declaredType ? `${base.declaredType}*` : undefined,
       isPointer: true,
+      // One pointer straight onto a function; a pointer to a function pointer points at data.
+      ...(levels === 1 && rest[1]?.kind === 'func' && { functionPointer: true }),
       dims,
     };
   }
@@ -1066,6 +1070,7 @@ export class StructParser {
     const info = this.applyDeclarator(base, decl, name || 'bit-field');
 
     const member: StructMember = { name, type: info.type, line: decl.line };
+    if (info.functionPointer) member.functionPointer = true;
     const declared = spec.base!.kind === 'name' ? (info.isPointer ? info.declaredType ?? undefined : spec.base!.name) : info.declaredType;
     if (declared && declared !== info.type) member.declaredType = declared;
 
@@ -1212,15 +1217,4 @@ function canonicalBuiltin(words: readonly string[]): string {
   if (has('char')) return unsigned ? 'unsigned char' : signed ? 'signed char' : 'char';
   const base = has('short') ? 'short' : longs >= 2 ? 'long long' : longs === 1 ? 'long' : 'int';
   return unsigned ? `unsigned ${base}` : base;
-}
-
-/** GCC's packed enum: the smallest integer type that holds every enumerator. */
-export function smallestEnumType(members: readonly EnumMember[]): string {
-  const values = members.map((m) => m.value).filter((v): v is number => v !== undefined);
-  const min = Math.min(0, ...values);
-  const max = Math.max(0, ...values);
-  if (min >= 0) return max <= 0xff ? 'unsigned char' : max <= 0xffff ? 'unsigned short' : 'unsigned int';
-  if (min >= -0x80 && max <= 0x7f) return 'signed char';
-  if (min >= -0x8000 && max <= 0x7fff) return 'short';
-  return 'int';
 }

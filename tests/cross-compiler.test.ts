@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -8,20 +8,24 @@ import { analyzeStruct, examples } from "@sp/core";
 import type { PlatformSelection } from "@sp/core";
 
 /**
- * Ground truth for bit-fields: every case is compiled for every target whose compiler is
- * installed, and the size, alignment, offsetof of each plain member and the first bit and width
- * of each bit-field are read back from the object file. Nothing is run, so cross compilers work.
+ * Ground truth on every target: each case (the bit-field, enum and pointer cases below, and every C
+ * example) is compiled for every target whose compiler is installed, and the size, alignment,
+ * offsetof of each plain member and the first bit and width of each bit-field are read back from
+ * the object file. Nothing is run, so cross compilers work.
  *
- * Each case contributes a byte array of its sizes and offsets, and one constant per bit-field with
+ * Each case is its own translation unit, compiled in one shell call per target. It contributes a
+ * byte array of its sizes and offsets, and one constant per bit-field with
  * only that field set to all ones: the bits that come out set are the field's. Bits are numbered
  * from the least significant bit of each byte; every target here is little-endian.
  *
  * The compilers are looked up on the PATH, or inside WSL when the tests run on Windows. A target
- * whose compiler is missing is skipped. On Ubuntu:
- *   apt install gcc-i686-linux-gnu gcc-mingw-w64 gcc-arm-linux-gnueabihf gcc-arm-none-eabi \
- *     gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-riscv64-unknown-elf gcc-mipsel-linux-gnu \
- *     gcc-avr avr-libc sdcc
+ * whose compiler is missing is skipped, or fails when SP_REQUIRE_COMPILERS is set (as in CI). On
+ * Ubuntu:
+ *   apt install --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf \
+ *     gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-mipsel-linux-gnu gcc-mingw-w64-x86-64-win32 \
+ *     gcc-mingw-w64-i686-win32 gcc-arm-none-eabi gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
  */
+const requireCompilers = Boolean(process.env.SP_REQUIRE_COMPILERS);
 
 const run = promisify(execFile);
 
@@ -72,7 +76,7 @@ const TARGETS: Target[] = [
   { name: "ARM32 Linux (gcc)", selection: { target: "arm32", dataModel: "ILP32", os: "linux" }, cc: "arm-linux-gnueabihf-gcc", flags: [] },
   { name: "ARM32 bare metal (arm-none-eabi)", selection: { target: "arm32", dataModel: "ILP32", os: "none" }, cc: "arm-none-eabi-gcc", flags: ["-mcpu=cortex-m4", "-mthumb"] },
   { name: "ARM64 Linux (gcc)", selection: { target: "arm64", dataModel: "LP64", os: "linux" }, cc: "aarch64-linux-gnu-gcc", flags: [] },
-  { name: "RISC-V 32 Linux (gcc)", selection: { target: "riscv32", dataModel: "ILP32", os: "linux" }, cc: "riscv64-linux-gnu-gcc", flags: ["-march=rv32gc", "-mabi=ilp32d", "-ffreestanding"] }, // no RV32 glibc headers: GCC's own <stdint.h>
+  { name: "RISC-V 32 Linux (gcc)", selection: { target: "riscv32", dataModel: "ILP32", os: "linux" }, cc: "riscv64-linux-gnu-gcc", flags: ["-march=rv32gc", "-mabi=ilp32d"] },
   { name: "RISC-V 32 bare metal (gcc)", selection: { target: "riscv32", dataModel: "ILP32", os: "none" }, cc: "riscv64-unknown-elf-gcc", flags: ["-march=rv32imac", "-mabi=ilp32"] },
   { name: "RISC-V 64 Linux (gcc)", selection: { target: "riscv64", dataModel: "LP64", os: "linux" }, cc: "riscv64-linux-gnu-gcc", flags: [] },
   { name: "RISC-V 64 bare metal (gcc)", selection: { target: "riscv64", dataModel: "LP64", os: "none" }, cc: "riscv64-unknown-elf-gcc", flags: ["-march=rv64imac", "-mabi=lp64"] },
@@ -147,12 +151,17 @@ const CASES: Record<string, string> = {
   "pragma pack 2, zero-width": "#pragma pack(push, 2)\nstruct S { char a:3; int :0; char b; };\n#pragma pack(pop)",
   "union of fields": "union S { char a; int b:20; long long c:3; };",
   "union with unnamed field": "union S { char a; int :4; };",
-  ...Object.fromEntries(
-    examples.filter((e) => /:\s*\d/.test(e.code.c)).map((e) => [`example: ${e.name}`, e.code.c]),
-  ),
+  // Enum sizes where the values need more than a byte, or are negative.
+  "enum above 255": "enum E { E_LO, E_HI = 300 }; struct S { char a; enum E e; char c; };",
+  "enum above 65535": "enum E { E_HUGE = 70000 }; struct S { char a; enum E e; char c; };",
+  "negative enum": "enum E { E_NEG = -1, E_POS = 1 }; struct S { char a; enum E e; char c; };",
+  "negative enum below -128": "enum E { E_NEG = -200 }; struct S { char a; enum E e; char c; };",
+  // Function pointers, which some targets size apart from data pointers.
+  "function pointers": "struct S { char a; void (*f)(void); char b; void (**pf)(void); char c; int *p; char d; };",
+  "typedef'd function pointers": "typedef void (*cb_t)(int); struct S { char a; cb_t cbs[2]; char b; cb_t *pcb; char c; };",
+  // Every C example: nested structs, unions, arrays, pointers and enums on every target.
+  ...Object.fromEntries(examples.map((e) => [`example: ${e.name}`, e.code.c])),
 };
-
-const renamed = (code: string, i: number) => code.replace(/\b([STE])\b/g, `$1_${i}`);
 
 /** Named top-level members of the case's last definition: [name, is a bit-field]. */
 function membersOf(code: string): { kind: "struct" | "union"; tag: string; members: [string, boolean][] } {
@@ -164,24 +173,24 @@ function membersOf(code: string): { kind: "struct" | "union"; tag: string; membe
   };
 }
 
-/** One translation unit for the given case indices; symbols are numbered by case index. */
-function probeSource(indices: number[]): string {
+/**
+ * The translation unit for case i. Each case is compiled on its own, since the examples reuse
+ * type names; its symbols carry the case's index.
+ */
+function probeSource(i: number): string {
+  const code = entries[i]![1];
+  const { kind, tag, members } = membersOf(code);
+  const t = `${kind} ${tag}`;
+  const values = [`sizeof(${t})`, `_Alignof(${t})`, ...members.filter(([, bf]) => !bf).map(([m]) => `offsetof(${t}, ${m})`)];
   const out = [
     "#include <stddef.h>",
     "#include <stdint.h>",
     "#define LO(v) ((unsigned char)((v) & 0xff))",
     "#define HI(v) ((unsigned char)(((v) >> 8) & 0xff))",
+    code,
+    `const unsigned char sv_${i}[] = { 0xA5, ${values.map((v) => `LO(${v}), HI(${v})`).join(", ")} };`,
+    ...members.filter(([, bf]) => bf).map(([m]) => `const ${t} bi_${i}_${m} = { .${m} = -1 };`),
   ];
-  indices.forEach((i) => {
-    const code = entries[i]![1];
-    const src = renamed(code, i);
-    const { kind, tag, members } = membersOf(src);
-    const t = `${kind} ${tag}`;
-    const values = [`sizeof(${t})`, `_Alignof(${t})`, ...members.filter(([, bf]) => !bf).map(([m]) => `offsetof(${t}, ${m})`)];
-    out.push(src);
-    out.push(`const unsigned char sv_${i}[] = { 0xA5, ${values.map((v) => `LO(${v}), HI(${v})`).join(", ")} };`);
-    for (const [m, bf] of members) if (bf) out.push(`const ${t} bi_${i}_${m} = { .${m} = -1 };`);
-  });
   return `${out.join("\n")}\n`;
 }
 
@@ -228,7 +237,7 @@ interface Measured {
 }
 
 function measured(symbols: Map<string, number[]>, code: string, i: number): Measured {
-  const { members } = membersOf(renamed(code, i));
+  const { members } = membersOf(code);
   const sv = symbols.get(`sv_${i}`);
   if (!sv || sv[0] !== 0xa5) throw new Error(`sv_${i} not found in the object file`);
   const word = (k: number) => sv[1 + 2 * k]! | (sv[2 + 2 * k]! << 8);
@@ -264,7 +273,7 @@ function measured(symbols: Map<string, number[]>, code: string, i: number): Meas
 }
 
 function modelled(code: string, i: number, selection: PlatformSelection): Measured {
-  const analysis = analyzeStruct(renamed(code, i), selection);
+  const analysis = analyzeStruct(code, selection);
   expect(analysis.errors.map((e) => e.message)).toEqual([]);
   const result = analysis.result!;
   const offsets: Measured["offsets"] = {};
@@ -280,41 +289,47 @@ function modelled(code: string, i: number, selection: PlatformSelection): Measur
 const entries = Object.entries(CASES);
 // A case the engine cannot parse fails in its test rather than being sent to the compilers.
 const parsable = entries.flatMap(([, code], i) =>
-  analyzeStruct(renamed(code, i), TARGETS[0]!.selection).errors.length === 0 ? [i] : [],
+  analyzeStruct(code, TARGETS[0]!.selection).errors.length === 0 ? [i] : [],
 );
 
 for (const target of TARGETS) {
-  describe.skipIf(!hasTool(target.cc))(`bit-fields match ${target.name}`, () => {
+  if (!hasTool(target.cc)) {
+    if (requireCompilers) {
+      it(`${target.cc} is installed for ${target.name}`, () => {
+        throw new Error(`${target.cc} not found, and SP_REQUIRE_COMPILERS is set`);
+      });
+    } else {
+      describe.skip(`layouts match ${target.name} (${target.cc} not installed)`, () => {
+        it.skip("not run", () => {});
+      });
+    }
+    continue;
+  }
+  describe(`layouts match ${target.name}`, () => {
     const sdcc = target.cc === "sdcc";
     /** Symbols per case index, or the compiler's error for a case it rejects. */
     const results = new Map<number, Map<string, number[]> | string>();
 
-    async function compile(indices: number[]): Promise<Map<string, number[]>> {
-      const dir = mkdtempSync(join(tmpdir(), "sp-bf-"));
-      writeFileSync(join(dir, "probe.c"), probeSource(indices));
-      if (sdcc) {
-        await tool("sdcc", [...target.flags, "-c", "probe.c", "-o", "probe.rel"], dir);
-        return readSymbols(readFileSync(join(dir, "probe.asm"), "utf8"), true);
-      }
-      const common = ["-std=gnu11", "-w", "-O0", "-c", "-fdata-sections", "-fno-common"];
-      await tool(target.cc, [...target.flags, ...common, "-o", "probe.o", "probe.c"], dir);
-      return readSymbols(await tool(target.cc.replace(/gcc$/, "objdump"), ["-s", "probe.o"], dir), false);
-    }
-
     beforeAll(async () => {
-      try {
-        const symbols = await compile(parsable);
-        parsable.forEach((i) => results.set(i, symbols));
-      } catch {
-        // Some case is rejected: compile them one by one to find out which.
-        for (const i of parsable) {
-          try {
-            results.set(i, await compile([i]));
-          } catch (err) {
-            const e = err as { stderr?: string; stdout?: string; message?: string };
-            results.set(i, (e.stderr || e.stdout || e.message || "").trim());
-          }
-        }
+      const dir = mkdtempSync(join(tmpdir(), "sp-cc-"));
+      for (const i of parsable) writeFileSync(join(dir, `case_${i}.c`), probeSource(i));
+      const quote = (args: string[]) => args.map((a) => `'${a}'`).join(" ");
+      // Freestanding: GCC's own <stddef.h> and <stdint.h>, so no target C library is needed.
+      const common = ["-std=gnu11", "-ffreestanding", "-w", "-O0", "-c", "-fdata-sections", "-fno-common"];
+      const objdump = target.cc.replace(/gcc$/, "objdump");
+      const each = sdcc
+        ? `if sdcc ${quote(target.flags)} -c "$f" -o "$b.rel" > "$b.err" 2>&1; then :; else rm -f "$b.asm"; fi`
+        : `if ${target.cc} ${quote([...target.flags, ...common])} -o "$b.o" "$f" 2> "$b.err"; then ${objdump} -s "$b.o" > "$b.dump"; fi`;
+      await tool("sh", ["-c", `for f in case_*.c; do b="\${f%.c}"; ${each}; done`], dir);
+
+      for (const i of parsable) {
+        const output = join(dir, `case_${i}.${sdcc ? "asm" : "dump"}`);
+        results.set(
+          i,
+          existsSync(output)
+            ? readSymbols(readFileSync(output, "utf8"), sdcc)
+            : readFileSync(join(dir, `case_${i}.err`), "utf8").trim(),
+        );
       }
     }, 600_000);
 
@@ -323,13 +338,13 @@ for (const target of TARGETS) {
         const symbols = results.get(i);
         if (symbols === undefined) {
           // Not parsable by the engine: report the parser's errors.
-          expect(analyzeStruct(renamed(code, i), target.selection).errors.map((e) => e.message)).toEqual([]);
+          expect(analyzeStruct(code, target.selection).errors.map((e) => e.message)).toEqual([]);
           return;
         }
         if (typeof symbols === "string") {
           // The compiler does not accept this declaration, so it has no layout to compare.
           const reason = symbols.split("\n").find((l) => /error/i.test(l)) ?? symbols;
-          if (process.env.SP_BITFIELD_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${reason}`);
+          if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${reason}`);
           ctx.skip(`${target.cc} rejects it: ${reason}`);
           return;
         }
@@ -339,11 +354,11 @@ for (const target of TARGETS) {
           expected = measured(symbols, code, i);
         } catch (err) {
           if (!(err instanceof Unmeasurable)) throw err;
-          if (process.env.SP_BITFIELD_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${err.message}`);
+          if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${err.message}`);
           ctx.skip(err.message);
           return;
         }
-        if (process.env.SP_BITFIELD_VERBOSE && JSON.stringify(actual) !== JSON.stringify(expected)) {
+        if (process.env.SP_CROSS_VERBOSE && JSON.stringify(actual) !== JSON.stringify(expected)) {
           console.log(`[diff] ${target.name} | ${label}\n  engine:   ${JSON.stringify(actual)}\n  compiler: ${JSON.stringify(expected)}`);
         }
         expect(actual).toEqual(expected);

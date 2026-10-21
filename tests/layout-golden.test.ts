@@ -141,24 +141,32 @@ function getEnumInfoForExpected(
     };
   }
 
-  if (architecture.shortEnums) {
-    // -fshort-enums: 1, 2 or 4 bytes, whichever is the smallest that holds every value.
-    const values = enumType.members.map((m) => m.value ?? 0);
-    const lo = Math.min(0, ...values);
-    const hi = Math.max(0, ...values);
-    const fits = (bytes: number) =>
-      lo >= 0 ? hi < 2 ** (8 * bytes) : lo >= -(2 ** (8 * bytes - 1)) && hi < 2 ** (8 * bytes - 1);
-    const size = [1, 2, 4].find(fits) ?? 4;
-    const maxAlign = architecture.maxAlignment ?? architecture.defaultAlignment;
-    return { size, alignment: Math.min(size, maxAlign) };
-  }
-
-  const enumSize = dataModels[dataModel].dataTypes.enumSize;
+  // The smallest of 1, 2, 4 or 8 bytes that holds every value; packed and short enums use it, other
+  // enums are int-sized unless a value needs more.
+  const values = enumType.members.map((m) => m.value ?? 0);
+  const lo = Math.min(0, ...values);
+  const hi = Math.max(0, ...values);
+  const fits = (bytes: number) =>
+    lo >= 0 ? hi < 2 ** (8 * bytes) : lo >= -(2 ** (8 * bytes - 1)) && hi < 2 ** (8 * bytes - 1);
+  const needed = [1, 2, 4].find(fits) ?? 8;
+  const intSize = dataModels[dataModel].dataTypes.enumSize;
+  const size = enumType.packed || architecture.shortEnums ? needed : Math.max(intSize, needed);
   const maxAlign = architecture.maxAlignment ?? architecture.defaultAlignment;
-  return {
-    size: enumSize,
-    alignment: Math.min(enumSize, maxAlign),
-  };
+  return { size, alignment: Math.min(size, maxAlign) };
+}
+
+/** A scalar or pointer member; function pointers take the model's code-pointer size if it has one. */
+function getScalarInfoForExpected(
+  member: StructMember,
+  architecture: ResolvedArchitecture,
+  dataModel: DataModel
+): { size: number; alignment: number } {
+  const functionPointerSize = dataModels[dataModel].dataTypes.functionPointerSize;
+  if (member.functionPointer && functionPointerSize !== undefined) {
+    const maxAlign = architecture.maxAlignment ?? architecture.defaultAlignment;
+    return { size: functionPointerSize, alignment: Math.min(functionPointerSize, maxAlign) };
+  }
+  return getTypeInfoForExpected(member.type, architecture, dataModel);
 }
 
 function getMemberSizeAndAlignmentForExpected(
@@ -184,7 +192,7 @@ function getMemberSizeAndAlignmentForExpected(
       };
     }
 
-    const elem = getTypeInfoForExpected(member.type, architecture, dataModel);
+    const elem = getScalarInfoForExpected(member, architecture, dataModel);
     return {
       size: elem.size * member.arraySize,
       alignment: isPacked ? 1 : elem.alignment,
@@ -215,7 +223,7 @@ function getMemberSizeAndAlignmentForExpected(
     };
   }
 
-  const typeInfo = getTypeInfoForExpected(member.type, architecture, dataModel);
+  const typeInfo = getScalarInfoForExpected(member, architecture, dataModel);
   return {
     size: typeInfo.size,
     alignment: isPacked ? 1 : typeInfo.alignment,
@@ -261,7 +269,7 @@ function calculateExpectedLayout(
 
   for (const member of parsed.members) {
     if (member.bitField !== undefined) {
-      throw new Error('the reference layout does not model bit-fields; tests/bitfield-compiler.test.ts checks them');
+      throw new Error('the reference layout does not model bit-fields; tests/cross-compiler.test.ts checks them');
     }
 
     const { size, alignment } = getMemberSizeAndAlignmentForExpected(member, architecture, dataModel, isPacked);
@@ -409,7 +417,7 @@ function runSingleCode(
   const packed = calculator.calculate(parsed, { packed: true });
   const comparison = calculator.compareLayouts(parsed);
 
-  // Bit-field placement is checked against the real compilers in tests/bitfield-compiler.test.ts;
+  // Bit-field placement is checked against the real compilers in tests/cross-compiler.test.ts;
   // the reference here covers everything else.
   if (!hasBitfields(parsed)) {
     const expected = calculateExpectedLayout(parsed, architecture, dataModel, false);

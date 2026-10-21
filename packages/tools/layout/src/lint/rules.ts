@@ -75,7 +75,7 @@ const unknownTypes: Rule = {
 
 /**
  * SP004 — the bit-fields are laid out by rules not checked against this target's compiler. Every
- * other target's rules are checked bit by bit in tests/bitfield-compiler.test.ts.
+ * other target's rules are checked bit by bit in tests/cross-compiler.test.ts.
  */
 const bitfieldUnverified: Rule = {
   code: "SP004",

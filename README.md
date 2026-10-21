@@ -80,18 +80,18 @@ The engines are tested against the real compilers, not against expected values w
 
 | Language | Ground truth (`tests/`) |
 |---|---|
-| C | `compiler.test.ts` compiles each case with GCC and compares `sizeof`, alignment and every `offsetof` |
+| C | `compiler.test.ts` compiles and runs each case with the host's GCC and compares `sizeof`, alignment and every `offsetof` |
+| C, every target | `cross-compiler.test.ts` compiles every C example and the bit-field, enum and pointer cases for 14 targets: GCC for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64 (Linux and bare metal), MIPS (PIC32) and AVR; MinGW for x86-64 and i386 Windows (MSVC's bit-field rules); SDCC for the 8051. It reads size, alignment, every `offsetof` and each bit-field's bit position back from the object file, so cross compilers need not run anything |
 | Go | `go-compiler.test.ts` checks every case and its reordered version against `go/types` on all 14 architectures, then compiles and runs the generated verification code with `GOARCH=amd64` and `GOARCH=386` |
 | Rust | `rust-compiler.test.ts` compiles and runs 71 cases on x86_64-pc-windows-msvc, and checks the same facts as compile-time assertions on thumbv7em-none-eabihf (no_std) |
-| C bit-fields | `bitfield-compiler.test.ts` compiles every case for 14 targets: GCC for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64 (Linux and bare metal), MIPS (PIC32) and AVR; MinGW for x86-64 and i386 Windows (MSVC's bit-field rules); SDCC for the 8051. It reads size, alignment, every `offsetof` and each bit-field's bit position back from the object file, so cross compilers need not run anything |
 | All | `cross-language.test.ts` checks that the Go ports and the `repr(C)` Rust ports of the C examples have the C layout |
 
-The bit-field test finds its compilers on the PATH, or in WSL on Windows. On Ubuntu:
+The cross-compiler test finds its compilers on the PATH, or in WSL on Windows. On Ubuntu:
 
 ```bash
-sudo apt install gcc-i686-linux-gnu gcc-mingw-w64 gcc-arm-linux-gnueabihf gcc-arm-none-eabi \
-  gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-riscv64-unknown-elf gcc-mipsel-linux-gnu \
-  gcc-avr avr-libc sdcc
+sudo apt install --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf \
+  gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-mipsel-linux-gnu gcc-mingw-w64-x86-64-win32 \
+  gcc-mingw-w64-i686-win32 gcc-arm-none-eabi gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
 ```
 
 Rust targets whose standard library is not installed locally are modelled from their LLVM data layouts but not compiler-checked. Install one with `rustup target add <triple>` to add it to the test.

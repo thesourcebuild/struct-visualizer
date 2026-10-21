@@ -34,6 +34,11 @@ export interface StructMember {
   alignAttribute?: AlignRequest;
   /** `__attribute__((packed))` on the member: alignment 1. */
   packed?: boolean;
+  /**
+   * A pointer to a function (or an array of them). It holds a code address, which some targets
+   * size apart from data pointers: 2 bytes on SDCC's 8051 against 3 for a generic data pointer.
+   */
+  functionPointer?: boolean;
   /** 1-based source line of the declaration. */
   line?: number;
 }
@@ -71,7 +76,10 @@ export interface EnumMember {
 export interface ParsedEnum {
   name: string;
   members: EnumMember[];
+  /** Written as `enum E : type` (C23, C++11). */
   underlyingType?: string;
+  /** `__attribute__((packed))`: the smallest integer type that holds every value. */
+  packed?: boolean;
 }
 
 export interface Architecture {

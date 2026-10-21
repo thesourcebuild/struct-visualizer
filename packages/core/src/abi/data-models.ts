@@ -18,6 +18,8 @@ export interface DataModelInfo {
         longSize: number;
         longLongSize: number;
         pointerSize: number;
+        /** A pointer to a function, where it differs from `pointerSize` (SDCC's 8051: 2 against 3). */
+        functionPointerSize?: number;
         floatSize: number;
         doubleSize: number;
         enumSize: number;
@@ -245,8 +247,10 @@ export const dataModels: Record<DataModel, DataModelInfo> = {
             intSize: 2,
             longSize: 4,
             longLongSize: 8,
-            // A generic pointer carries a byte saying which memory space it points into.
+            // A generic pointer carries a byte saying which memory space it points into; a function
+            // pointer is a plain code address.
             pointerSize: 3,
+            functionPointerSize: 2,
             floatSize: 4,
             doubleSize: 4,
             enumSize: 2,
@@ -746,7 +750,7 @@ export function resolveArchitectureForSelection(
 
 /**
  * How the target's compiler lays out bit-fields and plain enums. Every combination here is checked
- * against that compiler in tests/bitfield-compiler.test.ts, except those `bitfieldsVerified`
+ * against that compiler in tests/cross-compiler.test.ts, except those `bitfieldVerification`
  * reports as not.
  */
 function bitfieldAndEnumRules(
@@ -756,7 +760,8 @@ function bitfieldAndEnumRules(
 ): Pick<ResolvedArchitecture, 'bitfieldLayout' | 'bitfieldTypeMatters' | 'alignUnnamedBitfields' | 'shortEnums'> {
     // MSVC, and MinGW with its default -mms-bitfields.
     if (osType === 'windows') return { bitfieldLayout: 'ms' };
-    if (dataModel === 'SDCC') return { bitfieldLayout: 'sdcc' };
+    // SDCC also sizes every enum like -fshort-enums.
+    if (dataModel === 'SDCC') return { bitfieldLayout: 'sdcc', shortEnums: true };
     const arm = targetArchitecture === 'arm32' || targetArchitecture === 'arm64';
     return {
         bitfieldLayout: 'gcc',
@@ -771,7 +776,7 @@ function bitfieldAndEnumRules(
 
 /**
  * Whether this platform's bit-field layout has been checked against its compiler, and if not,
- * which compiler it would need. The checked ones are the targets of tests/bitfield-compiler.test.ts;
+ * which compiler it would need. The checked ones are the targets of tests/cross-compiler.test.ts;
  * XC16 and Keil C51 are proprietary and could not be run.
  */
 export function bitfieldVerification(

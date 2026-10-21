@@ -1,11 +1,19 @@
 import type { AlignRequest, Architecture, ParsedStruct, StructMember, CalculationResult, ParsedEnum } from '../types';
 import { dataModels, getStandardTypeMap } from '../abi/data-models';
 import type { DataModel } from '../abi/data-models';
-import { smallestEnumType } from '../parser/struct-parser';
 
 /** The most alignment packing leaves a member of `struct`: 1 when packed, else #pragma pack's n. */
 function packingCap(struct: ParsedStruct): number | undefined {
   return struct.packed ? 1 : struct.pragmaPack;
+}
+
+/** The fewest of 1, 2, 4 or 8 bytes whose integer holds every value: unsigned when none is negative. */
+function bytesForValues(values: readonly number[]): number {
+  const lo = Math.min(0, ...values);
+  const hi = Math.max(0, ...values);
+  const fits = (bytes: number) =>
+    lo >= 0 ? hi < 2 ** (8 * bytes) : lo >= -(2 ** (8 * bytes - 1)) && hi < 2 ** (8 * bytes - 1);
+  return [1, 2, 4].find(fits) ?? 8;
 }
 
 /** `bit` rounded up to the next multiple of `alignment` bytes. */
@@ -64,7 +72,7 @@ export class PaddingCalculator {
    * member that is not a bit-field always starts on a byte, at the first one its alignment allows.
    *
    * Bit-fields follow the target compiler's rules (`bitfieldLayout`), both checked against the
-   * compilers in tests/bitfield-compiler.test.ts:
+   * compilers in tests/cross-compiler.test.ts:
    * - 'gcc' (GCC and Clang outside Windows): a field goes at the next free bit unless that would
    *   make it span more units of its type's alignment than its type has, in which case it moves to
    *   the next such boundary. Under `packed` or any `#pragma pack` that check is skipped.
@@ -80,7 +88,7 @@ export class PaddingCalculator {
    * member that is not a bit-field always starts on a byte, at the first one its alignment allows.
    *
    * Bit-fields follow the target compiler's rules (`bitfieldLayout`), each checked against the
-   * compiler in tests/bitfield-compiler.test.ts:
+   * compiler in tests/cross-compiler.test.ts:
    * - 'gcc' (GCC and Clang outside Windows): a field goes at the next free bit. On targets where
    *   the field's type matters (GCC's PCC_BITFIELD_TYPE_MATTERS, all but AVR here) it moves to the
    *   next boundary of its type's alignment if it would otherwise span more of those units than
@@ -369,7 +377,7 @@ export class PaddingCalculator {
         };
       }
 
-      const elementInfo = this.getTypeInfo(member.type);
+      const elementInfo = this.scalarTypeInfo(member);
       return { size: elementInfo.size * member.arraySize, alignment: elementInfo.alignment };
     }
 
@@ -391,6 +399,16 @@ export class PaddingCalculator {
       };
     }
 
+    return this.scalarTypeInfo(member);
+  }
+
+  /** A member of a scalar or pointer type; function pointers take the model's code-pointer size. */
+  private scalarTypeInfo(member: StructMember): { size: number; alignment: number } {
+    const functionPointerSize = dataModels[this.dataModel]?.dataTypes.functionPointerSize;
+    if (member.functionPointer && functionPointerSize !== undefined) {
+      const maxAlign = this.architecture.maxAlignment ?? this.architecture.defaultAlignment;
+      return { size: functionPointerSize, alignment: Math.min(functionPointerSize, maxAlign) };
+    }
     return this.getTypeInfo(member.type);
   }
 
@@ -456,6 +474,13 @@ export class PaddingCalculator {
       .trim();
   }
 
+  /**
+   * An enum's size and alignment. A written underlying type wins, then the user's override. A
+   * packed enum, or any enum where the target uses short enums (arm-none-eabi, SDCC), is the
+   * smallest of 1, 2, 4 or 8 bytes that holds its values. Otherwise it is int-sized, widened as GCC
+   * does when a value does not fit an int: 70000 takes 4 bytes where int is 2 (AVR, SDCC). Checked
+   * in tests/cross-compiler.test.ts.
+   */
   private getEnumTypeInfo(enumType: ParsedEnum): { size: number; alignment: number } {
     if (enumType.underlyingType) {
       return this.getTypeInfo(enumType.underlyingType);
@@ -470,18 +495,20 @@ export class PaddingCalculator {
       return { size: enumTypeInfo.size, alignment: cappedAlignment };
     }
 
-    // -fshort-enums makes every enum what __attribute__((packed)) makes one.
-    if (this.architecture.shortEnums) {
-      return this.getTypeInfo(smallestEnumType(enumType.members));
+    const needed = bytesForValues(enumType.members.map((m) => m.value ?? 0));
+    const intSize = dataModels[this.dataModel].dataTypes.enumSize;
+    const short = enumType.packed === true || this.architecture.shortEnums === true;
+    return this.integerOfSize(short ? needed : Math.max(intSize, needed));
+  }
+
+  /** The target's integer type of `size` bytes, for its alignment. */
+  private integerOfSize(size: number): { size: number; alignment: number } {
+    for (const type of ['char', 'short', 'int', 'long', 'long long']) {
+      const info = this.getTypeInfo(type);
+      if (info.size === size) return info;
     }
-
-    // Fall back to data model's explicit enum size
-    const dataModelInfo = dataModels[this.dataModel];
-    const enumSize = dataModelInfo.dataTypes.enumSize;
     const maxAlign = this.architecture.maxAlignment ?? this.architecture.defaultAlignment;
-    const enumAlignment = Math.min(enumSize, maxAlign);
-
-    return { size: enumSize, alignment: enumAlignment };
+    return { size, alignment: Math.min(size, maxAlign) };
   }
 
   private calculatePadding(currentOffset: number, alignment: number): number {
