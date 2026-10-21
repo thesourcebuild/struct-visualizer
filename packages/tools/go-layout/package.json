@@ -1,0 +1,29 @@
+{
+  "name": "@sp/go-layout",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "//": "The 'go' tool family. index/manifests/pure are eager and must not import @sp/core; definition is loaded lazily.",
+  "exports": {
+    ".": "./src/index.ts",
+    "./pure": "./src/pure.ts",
+    "./manifests": "./src/manifest.ts",
+    "./definition": "./src/definition.ts",
+    "./compute": "./src/compute.ts",
+    "./lint": "./src/lint/run.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sp/contracts": "workspace:*",
+    "@sp/core": "workspace:*",
+    "@sp/engine": "workspace:*",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@sp/config": "workspace:*",
+    "typescript": "^5.9.0"
+  }
+}

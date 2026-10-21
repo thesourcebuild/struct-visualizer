@@ -1,0 +1,8 @@
+node_modules
+.next
+out
+.turbo
+pnpm-lock.yaml
+*.md
+packages/core/src/examples/C
+packages/core/src/examples/C++

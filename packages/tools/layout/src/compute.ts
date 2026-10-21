@@ -1,0 +1,132 @@
+import {
+  CCodeGenerator,
+  analyzeStruct,
+  dataModels,
+  osTypes,
+  targetArchitectures,
+} from "@sp/core";
+import type { CalculationResult, StructAnalysis } from "@sp/core";
+import type { ToolResult, ToolResultField } from "@sp/engine";
+import { readLanguage, readMode } from "./pure";
+import type { LayoutMode } from "./pure";
+import { selectionFromSpec } from "./resolve";
+import type { LayoutSpec } from "./spec";
+
+/** Payload for the struct-layout result view. */
+export interface LayoutData {
+  analysis: StructAnalysis;
+  mode: LayoutMode;
+  /** The layout selected by `mode` (falls back to natural when unavailable). */
+  display: CalculationResult | null;
+  /** Reordered source for the optimized layout, when reordering changes anything. */
+  optimizedCode: string | null;
+  platformLabel: { target: string; dataModel: string; os: string; architecture: string };
+}
+
+export function buildLayoutData(spec: LayoutSpec, input: string): LayoutData {
+  const analysis = analyzeStruct(input, selectionFromSpec(spec));
+  const mode = readMode(spec.options);
+  const { result, packed, optimized, platform } = analysis;
+
+  const display =
+    mode === "packed" ? (packed ?? result) : mode === "optimized" ? (optimized ?? result) : result;
+
+  const optimizedCode =
+    result && optimized && result.totalSize !== optimized.totalSize
+      ? CCodeGenerator.generateOptimizedCode(result.struct, optimized.struct)
+      : null;
+
+  return {
+    analysis,
+    mode,
+    display,
+    optimizedCode,
+    platformLabel: {
+      target: targetArchitectures[platform.target]?.displayName ?? platform.target,
+      dataModel: dataModels[platform.dataModel]?.displayName ?? platform.dataModel,
+      os: osTypes[platform.os]?.displayName ?? platform.os,
+      architecture: platform.architecture.displayName,
+    },
+  };
+}
+
+function layoutFields(data: LayoutData): ToolResultField[] {
+  const r = data.display;
+  if (!r) return [];
+  return [
+    { label: "Total size", value: `${r.totalSize} bytes`, mono: true },
+    { label: "Padding", value: `${r.totalPadding} bytes`, mono: true },
+    { label: "Alignment", value: `${r.struct.alignment ?? 1} bytes`, mono: true },
+    { label: "Efficiency", value: `${r.efficiency.toFixed(1)}%`, mono: true },
+    {
+      label: "Platform",
+      value: `${data.platformLabel.target} · ${data.platformLabel.dataModel} · ${data.platformLabel.os}`,
+    },
+  ];
+}
+
+export function computeLayout(spec: LayoutSpec, input: string): ToolResult<LayoutData> {
+  const data = buildLayoutData(spec, input);
+  return {
+    data,
+    fields: layoutFields(data),
+    error: data.analysis.errors.length > 0 ? data.analysis.errors[0]!.message : undefined,
+  };
+}
+
+export function computeVerificationCode(spec: LayoutSpec, input: string): ToolResult<LayoutData> {
+  const data = buildLayoutData(spec, input);
+  const { result, optimized } = data.analysis;
+  if (!result) {
+    return {
+      data,
+      error:
+        data.analysis.errors[0]?.message ??
+        "Fix the errors in your struct or union to generate verification code.",
+    };
+  }
+
+  const language = readLanguage(spec.options);
+  const useOptimized = data.mode === "optimized" && optimized;
+  const code = useOptimized
+    ? CCodeGenerator.generateVerificationCode(
+        CCodeGenerator.generateOptimizedCode(result.struct, optimized.struct),
+        CCodeGenerator.getOptimizedRootName(result.struct, optimized.struct),
+        language,
+      )
+    : CCodeGenerator.generateVerificationCode(input, result.struct.name, language);
+
+  const ext = language === "cpp" ? "cpp" : "c";
+  const filename = `${result.struct.name}_verify.${ext}`;
+  const compile =
+    language === "cpp" ? `g++ -std=c++17 -o test ${filename}` : `gcc -o test ${filename}`;
+
+  return {
+    data,
+    text: code,
+    files: [
+      {
+        filename,
+        content: code,
+        mimeType: "text/x-c",
+        label: language === "cpp" ? "C++ verification program" : "C verification program",
+      },
+    ],
+    fields: [
+      { label: "Compile", value: compile, mono: true },
+      { label: "Run", value: "./test   (test.exe on Windows)", mono: true },
+      {
+        label: "Expected sizeof",
+        value: `${(useOptimized ? optimized : result).totalSize} bytes on ${data.platformLabel.architecture}`,
+        mono: true,
+      },
+    ],
+    working: [
+      "1. Download or copy the program.",
+      `2. Compile: \`${compile}\``,
+      "3. Run it and compare the printed sizeof/offsetof values with the Struct Layout tool.",
+      "Results reflect your actual compiler and ABI; they may differ from the selected target.",
+    ].join("\n"),
+    workingFormat: "markdown",
+  };
+}

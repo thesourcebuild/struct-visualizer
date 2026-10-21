@@ -1,0 +1,21 @@
+{
+  "name": "@sp/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "//": "Tool-agnostic schemas and types shared by engine, tools, platform and the web app.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@sp/config": "workspace:*",
+    "typescript": "^5.9.0"
+  }
+}

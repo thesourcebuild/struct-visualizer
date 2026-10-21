@@ -1,0 +1,13 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "packages/tools/*"
+
+# Packages allowed to run install scripts (pnpm 11+; replaces onlyBuiltDependencies).
+allowBuilds:
+  esbuild: true
+  sharp: true
+  unrs-resolver: true
+
+# Matches the npm min-release-age = 7 policy: versions younger than 7 days are not resolved.
+minimumReleaseAge: 10080

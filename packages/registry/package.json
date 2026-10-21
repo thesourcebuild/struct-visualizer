@@ -1,0 +1,23 @@
+{
+  "name": "@sp/registry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sp/engine": "workspace:*",
+    "@sp/go-layout": "workspace:*",
+    "@sp/layout": "workspace:*",
+    "@sp/rust-layout": "workspace:*"
+  },
+  "devDependencies": {
+    "@sp/config": "workspace:*",
+    "typescript": "^5.9.0"
+  }
+}

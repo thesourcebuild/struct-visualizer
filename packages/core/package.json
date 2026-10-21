@@ -1,0 +1,18 @@
+{
+  "name": "@sp/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "//": "Pure layout logic: C parser, ABI tables, padding calculator, verification codegen. No React, no DOM.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@sp/config": "workspace:*",
+    "typescript": "^5.9.0"
+  }
+}

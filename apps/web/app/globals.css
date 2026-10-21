@@ -1,0 +1,10 @@
+@import "tailwindcss";
+@import "@sp/ui/styles.css";
+
+/* Tailwind only scans this app by default; include the shared UI package. */
+@source "../../../packages/ui/src";
+
+@theme inline {
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+}

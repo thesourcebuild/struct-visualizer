@@ -1,0 +1,39 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck, lint, test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install the compilers the bit-field ground truth checks against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-i686-linux-gnu gcc-mingw-w64 gcc-arm-linux-gnueabihf gcc-arm-none-eabi \
+            gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-riscv64-unknown-elf gcc-mipsel-linux-gnu \
+            gcc-avr avr-libc sdcc
+      - run: pnpm typecheck
+      - run: pnpm lint
+      # TODO: add `pnpm format:check` after the one-off `pnpm format` commit
+      # (kept separate from the monorepo move so git still detects the renames).
+      - run: pnpm test
+      - name: Static export builds
+        run: pnpm --filter @sp/web build

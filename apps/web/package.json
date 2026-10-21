@@ -1,0 +1,35 @@
+{
+  "name": "@sp/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "npx serve out",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sp/contracts": "workspace:*",
+    "@sp/core": "workspace:*",
+    "@sp/engine": "workspace:*",
+    "@sp/go-layout": "workspace:*",
+    "@sp/layout": "workspace:*",
+    "@sp/platform": "workspace:*",
+    "@sp/registry": "workspace:*",
+    "@sp/rust-layout": "workspace:*",
+    "@sp/ui": "workspace:*",
+    "next": "16.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@sp/config": "workspace:*",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "tailwindcss": "^4",
+    "typescript": "^5.9.0"
+  }
+}

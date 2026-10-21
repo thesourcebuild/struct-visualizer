@@ -1,0 +1,6 @@
+# Shell scripts must keep LF even on a Windows checkout with core.autocrlf=true:
+# bash reads a CR as part of the command and fails with "$'\r': command not found".
+*.sh   text eol=lf
+# cmd.exe mis-parses labels and multi-line blocks in LF-only batch files.
+*.bat  text eol=crlf
+*.ps1  text eol=crlf

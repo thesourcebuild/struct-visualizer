@@ -1,0 +1,10 @@
+{
+  "//": "Root config exists only so editors resolve workspace paths. Each package has its own. It includes just the root config files: an empty include makes editors report 'No inputs were found'.",
+  "extends": "./packages/config/tsconfig/base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["vitest.config.ts"],
+  "exclude": ["node_modules", "**/out", "**/.next"]
+}
