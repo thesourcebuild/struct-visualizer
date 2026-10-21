@@ -218,4 +218,4 @@ MIT — see [LICENSE](LICENSE).
 Muhammad Hassaan Shah
 
 - GitHub: [@thesourcebuild](https://github.com/thesourcebuild)
-- Project: [github.com/thesourcebuild/structvisualizer](https://github.com/thesourcebuild/structvisualizer)
+- Project: [github.com/thesourcebuild/struct-visualizer](https://github.com/thesourcebuild/struct-visualizer)

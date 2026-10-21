@@ -1,6 +1,6 @@
 # Reporting an issue
 
-Open issues at [github.com/thesourcebuild/structvisualizer/issues](https://github.com/thesourcebuild/structvisualizer/issues). Search the open and closed issues first; someone may already have reported it.
+Open issues at [github.com/thesourcebuild/struct-visualizer/issues](https://github.com/thesourcebuild/struct-visualizer/issues). Search the open and closed issues first; someone may already have reported it.
 
 ## Wrong layout
 

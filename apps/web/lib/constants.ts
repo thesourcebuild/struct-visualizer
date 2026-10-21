@@ -29,7 +29,7 @@ export const SITE_KEYWORDS = [
 // The source repository, set by the deploy workflow (NEXT_PUBLIC_GITHUB_URL). Undefined in builds
 // without it, which then show no source link rather than one to github.com's front page.
 export const GITHUB_URL: string | undefined = process.env.NEXT_PUBLIC_GITHUB_URL || undefined;
-// Deployment sub-path (GitHub Pages project sites), e.g. "/structvisualizer". Empty at a domain root.
+// Deployment sub-path (GitHub Pages project sites), e.g. "/struct-visualizer". Empty at a domain root.
 export const BASE_PATH = (process.env.NEXT_PUBLIC_BASE_PATH || '').replace(/\/$/, '');
 // Absolute URL of the site root, sub-path included, for canonical links, Open Graph, the sitemap
 // and structured data. NEXT_PUBLIC_SITE_URL is the origin (the deploy workflow passes
