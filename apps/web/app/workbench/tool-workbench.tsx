@@ -6,13 +6,12 @@ import type { OptionValue, OptionValues } from "@sp/contracts";
 import { platform } from "@sp/platform";
 import { Button, Panel } from "@sp/ui";
 import { encodeShareState } from "../share-link";
-import { CUSTOM_RESULTS } from "./custom-results";
 import { DiagnosticsPanel } from "./diagnostics-panel";
 import { FieldTable } from "./field-table";
 import { InputPanel } from "./input-panel";
 import { OptionsForm } from "./options-form";
 import { ResultPanel } from "./result-panel";
-import { cachedTool, loadToolCached } from "./tool-cache";
+import { useTool } from "./tool-definitions";
 import { useCompute } from "./use-compute";
 import { VariantsPanel } from "./variants-panel";
 
@@ -41,64 +40,48 @@ export function ToolWorkbench({
   sharedOptions,
   onOpenSidebar,
 }: ToolWorkbenchProps) {
-  // The shell keys this component by tool id, so state starts fresh for every tool. When the
-  // definition is already cached (always, after the first visit) it initialises in the same
-  // render -- no empty frame, no layout jump.
-  const [tool, setTool] = useState<AnyToolDefinition | undefined>(() => cachedTool(manifest.id));
-  const [spec, setSpec] = useState<ToolSpecBase | undefined>(() => {
-    const t = cachedTool(manifest.id);
-    return t ? restoreSpec(t, sharedOptions) : undefined;
-  });
-  const [loadError, setLoadError] = useState<string>();
+  // The shell keys this component by tool id, so state starts fresh for every tool. The page's own
+  // language is there synchronously, so the static HTML holds the whole workbench and the first
+  // render in the browser is that same markup: nothing is swapped in, nothing moves.
+  const { definition: tool, ResultView: Custom } = useTool(manifest.id);
+  // The first render must match that HTML, so it uses the defaults; saved and shared options can
+  // only be read after mount (localStorage, the URL fragment) and are applied then.
+  const [spec, setSpec] = useState<ToolSpecBase>(() => tool.createSpec());
+  const [restored, setRestored] = useState(false);
   const [shareNote, setShareNote] = useState<string>();
 
-  // First visit only: the definition is not cached yet, so load it.
   useEffect(() => {
-    if (tool) return;
-    let cancelled = false;
-    loadToolCached(manifest.id)
-      .then((t) => {
-        if (cancelled) return;
-        setTool(t);
-        setSpec(restoreSpec(t, sharedOptions));
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [tool, manifest.id, sharedOptions]);
+    // One-time restore from browser state, which the static HTML cannot know.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSpec(restoreSpec(tool, sharedOptions));
+    setRestored(true);
+  }, [tool, sharedOptions]);
 
+  // Not before the restore: the defaults of the first render would overwrite the saved options.
   useEffect(() => {
-    if (tool && spec) platform().writeSavedState(specKey(tool.id), spec.options);
-  }, [tool, spec]);
+    if (restored) platform().writeSavedState(specKey(tool.id), spec.options);
+  }, [tool, spec, restored]);
 
   const compute = useCompute(tool, spec, input);
 
   const setOption = useCallback(
     (id: string, value: OptionValue) => {
-      if (!tool) return;
-      setSpec((s) =>
-        s ? (tool.onOptionChange?.(s, id, value) ?? { ...s, options: { ...s.options, [id]: value } }) : s,
-      );
+      setSpec((s) => tool.onOptionChange?.(s, id, value) ?? { ...s, options: { ...s.options, [id]: value } });
     },
     [tool],
   );
 
   const applyOptions = useCallback(
     (patch: OptionValues) => {
-      if (!tool) return;
-      setSpec((s) => (s ? tool.createSpec({ ...s.options, ...patch }) : s));
+      setSpec((s) => tool.createSpec({ ...s.options, ...patch }));
     },
     [tool],
   );
 
   const applyFix = useCallback(
     (apply: (s: ToolSpecBase) => ToolSpecBase) => {
-      if (!tool) return;
       // Re-normalise through createSpec so fixes can't leave an invalid combination.
-      setSpec((s) => (s ? tool.createSpec(apply(s).options) : s));
+      setSpec((s) => tool.createSpec(apply(s).options));
     },
     [tool],
   );
@@ -109,7 +92,6 @@ export function ToolWorkbench({
   );
 
   const copyShareLink = async () => {
-    if (!tool || !spec) return;
     const { hash, inputOmitted } = encodeShareState({
       toolId: tool.id,
       options: spec.options,
@@ -124,8 +106,6 @@ export function ToolWorkbench({
     }
     setTimeout(() => setShareNote(undefined), 2500);
   };
-
-  const Custom = CUSTOM_RESULTS[manifest.id];
 
   return (
     <div className="space-y-4">
@@ -143,7 +123,7 @@ export function ToolWorkbench({
             <h1 className="text-xl font-bold text-gray-900 dark:text-gray-100">{manifest.label}</h1>
           </div>
           <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
-            {tool && spec ? tool.describe(spec) : manifest.summary}
+            {tool.describe(spec)}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -152,69 +132,53 @@ export function ToolWorkbench({
               {shareNote}
             </span>
           )}
-          <Button onClick={copyShareLink} disabled={!spec}>
+          <Button onClick={copyShareLink}>
             Copy share link
           </Button>
         </div>
       </header>
 
-      {loadError && (
-        <p role="alert" className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-700">
-          Failed to load tool: {loadError}
-        </p>
-      )}
-
-      {!loadError && !(tool && spec) && (
-        // First visit only: hold the space the workbench will take, so nothing jumps when it loads.
-        <div aria-busy="true" className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_20rem]">
-          <div className="h-96 animate-pulse rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800" />
-          <div className="h-96 animate-pulse rounded-xl border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800" />
-        </div>
-      )}
-
-      {tool && spec && (
-        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_20rem]">
-          <div className="min-w-0 space-y-4">
-            {tool.readsInput && (
-              <InputPanel
-                value={input}
-                onChange={onInputChange}
-                samples={tool.samples}
-                pending={compute.status === "pending"}
-                language={manifest.inputLanguage ?? "c"}
-              />
-            )}
-
-            <DiagnosticsPanel diagnostics={compute.diagnostics} onFix={applyFix} />
-
-            {compute.result &&
-              (Custom ? (
-                <Custom result={compute.result} spec={spec} input={input} />
-              ) : compute.result.error ? null : (
-                <ResultPanel result={compute.result} />
-              ))}
-
-            {tool.variants && compute.result?.data !== undefined && !compute.result.error && (
-              <VariantsPanel tool={tool} spec={spec} input={input} onSelect={applyOptions} />
-            )}
-          </div>
-
-          <aside className="space-y-4 xl:sticky xl:top-20 xl:self-start">
-            <OptionsForm
-              tool={tool}
-              spec={spec}
-              tags={compute.tags}
-              highlighted={highlighted}
-              onChange={setOption}
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_20rem]">
+        <div className="min-w-0 space-y-4">
+          {tool.readsInput && (
+            <InputPanel
+              value={input}
+              onChange={onInputChange}
+              samples={tool.samples}
+              pending={compute.status === "pending"}
+              language={manifest.inputLanguage ?? "c"}
             />
-            {tool.info && (
-              <Panel title="Platform facts" collapsible defaultCollapsed>
-                <FieldTable fields={tool.info(spec)} />
-              </Panel>
-            )}
-          </aside>
+          )}
+
+          <DiagnosticsPanel diagnostics={compute.diagnostics} onFix={applyFix} />
+
+          {compute.result &&
+            (Custom ? (
+              <Custom result={compute.result} spec={spec} input={input} />
+            ) : compute.result.error ? null : (
+              <ResultPanel result={compute.result} />
+            ))}
+
+          {tool.variants && compute.result?.data !== undefined && !compute.result.error && (
+            <VariantsPanel tool={tool} spec={spec} input={input} onSelect={applyOptions} />
+          )}
         </div>
-      )}
+
+        <aside className="space-y-4 xl:sticky xl:top-20 xl:self-start">
+          <OptionsForm
+            tool={tool}
+            spec={spec}
+            tags={compute.tags}
+            highlighted={highlighted}
+            onChange={setOption}
+          />
+          {tool.info && (
+            <Panel title="Platform facts" collapsible defaultCollapsed>
+              <FieldTable fields={tool.info(spec)} />
+            </Panel>
+          )}
+        </aside>
+      </div>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { startTransition, useCallback, useEffect, useState } from "react";
 import { DEFAULT_TOOL_ID, equivalentTool, getManifest, isLanguageFamily } from "@sp/registry";
 import type { OptionValues } from "@sp/contracts";
 import type { InputLanguage, ToolFamily } from "@sp/engine";
@@ -8,9 +8,10 @@ import { platform } from "@sp/platform";
 import { BASE_PATH } from "@/lib/constants";
 import { parseShareHash } from "../share-link";
 import { DEFAULT_INPUTS } from "./default-input";
-import { preloadAllTools } from "./tool-cache";
 import { openGuide } from "@/components/guides/guide-overlay";
 import { Sidebar } from "./sidebar";
+import { ToolErrorBoundary } from "./tool-boundary";
+import { prefetchToolFamilies } from "./tool-definitions";
 import { ToolWorkbench } from "./tool-workbench";
 
 const KEY_LAST_TOOL = "lastTool";
@@ -32,16 +33,18 @@ function toolIdFromPath(pathname: string): string | undefined {
   return id && getManifest(id) ? id : undefined;
 }
 
-interface AppShellProps {
+export interface AppShellProps {
   /** Tool chosen by the route (/tools/<id>/). Undefined on /tools/, which restores the last tool. */
   initialToolId?: string;
+  /** The language whose definitions the page loaded up front (set by the family shells). */
+  preloadedFamily?: "layout" | "go" | "rust";
 }
 
 /**
  * The workbench: sidebar + one tool. Owns the tool selection, persistence and the inputs: one
  * per language, shared by that language's tools, so a Go tool never receives C source.
  */
-export function AppShell({ initialToolId }: AppShellProps) {
+export function AppShell({ initialToolId, preloadedFamily = "layout" }: AppShellProps) {
   const [selectedId, setSelectedId] = useState(initialToolId ?? DEFAULT_TOOL_ID);
   const [inputs, setInputs] = useState<Record<InputLanguage, string>>(DEFAULT_INPUTS);
   const [sharedOptions, setSharedOptions] = useState<OptionValues>();
@@ -49,11 +52,17 @@ export function AppShell({ initialToolId }: AppShellProps) {
   /** Sidebar language; follows the open tool, and is kept while a reference tool is open. */
   const [language, setLanguage] = useState<ToolFamily>(() => familyLanguage(initialToolId ?? DEFAULT_TOOL_ID) ?? "layout");
 
-  /** Show a tool; the sidebar language follows it when it belongs to a language. */
+  /**
+   * Show a tool; the sidebar language follows it when it belongs to a language. A transition, so
+   * that if the tool's language is still downloading, React keeps the current tool on screen until
+   * it arrives instead of showing anything in between.
+   */
   const openTool = useCallback((id: string) => {
-    setSelectedId(id);
-    const family = familyLanguage(id);
-    if (family) setLanguage(family);
+    startTransition(() => {
+      setSelectedId(id);
+      const family = familyLanguage(id);
+      if (family) setLanguage(family);
+    });
   }, []);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [hydrated, setHydrated] = useState(false);
@@ -87,9 +96,15 @@ export function AppShell({ initialToolId }: AppShellProps) {
       else if (initialToolId) openTool(initialToolId);
     }
     setHydrated(true);
-    // Warm every tool definition so later sidebar clicks render in one frame.
-    preloadAllTools();
   }, [initialToolId, openTool]);
+
+  // Once the page is idle, fetch the other languages' tools so switching to one is immediate.
+  useEffect(() => {
+    const idle = window.requestIdleCallback ?? ((cb: () => void) => window.setTimeout(cb, 1));
+    const cancel = window.cancelIdleCallback ?? window.clearTimeout;
+    const handle = idle(() => prefetchToolFamilies(preloadedFamily));
+    return () => cancel(handle);
+  }, [preloadedFamily]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -190,21 +205,20 @@ export function AppShell({ initialToolId }: AppShellProps) {
       )}
 
       <div className="min-w-0 flex-1">
-        {hydrated ? (
-          <ToolWorkbench
-            key={manifest.id}
-            manifest={manifest}
-            input={inputs[inputLanguage]}
-            onInputChange={setInput}
-            sharedOptions={sharedOptions}
-            onOpenSidebar={() => setDrawerOpen(true)}
-          />
-        ) : (
-          <div className="space-y-2">
-            <h1 className="text-xl font-bold text-gray-900 dark:text-gray-100">{manifest.label}</h1>
-            <p className="text-sm text-gray-600 dark:text-gray-400">{manifest.summary}</p>
-          </div>
-        )}
+        {/* In the static HTML as well, with the default input and options; what the browser has
+            saved is applied after mount. The workbench does not suspend (its definition is
+            imported up front), and it has no Suspense boundary on purpose: React moves a
+            boundary's content out of line once it is over ~12.8 KB, even when nothing suspends,
+            so the HTML would carry a placeholder that slow connections paint before the swap. */}
+        <ToolErrorBoundary key={manifest.id}>
+            <ToolWorkbench
+              manifest={manifest}
+              input={inputs[inputLanguage]}
+              onInputChange={setInput}
+              sharedOptions={sharedOptions}
+              onOpenSidebar={() => setDrawerOpen(true)}
+            />
+        </ToolErrorBoundary>
       </div>
     </div>
   );

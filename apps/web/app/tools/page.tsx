@@ -1,5 +1,5 @@
 import { pageMetadata } from "@/lib/seo";
-import { AppShell } from "../workbench/app-shell";
+import { LayoutAppShell } from "../workbench/shell-layout";
 
 export const metadata = pageMetadata({
   path: "/tools/",
@@ -18,7 +18,10 @@ export const metadata = pageMetadata({
   ],
 });
 
-/** /tools/ — opens the last-used tool (or the default). Per-tool URLs live at /tools/<id>/. */
+/**
+ * /tools/ — opens the last-used tool (or the default, a C/C++ tool, whose language is the one
+ * loaded up front). Per-tool URLs live at /tools/<id>/.
+ */
 export default function ToolsPage() {
-  return <AppShell />;
+  return <LayoutAppShell />;
 }

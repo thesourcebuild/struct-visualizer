@@ -1,6 +1,6 @@
 {
   "name": "@sp/web",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "type": "module",
   "scripts": {
@@ -19,7 +19,7 @@
     "@sp/registry": "workspace:*",
     "@sp/rust-layout": "workspace:*",
     "@sp/ui": "workspace:*",
-    "next": "16.4.0",
+    "next": "16.4.2",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },

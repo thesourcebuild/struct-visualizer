@@ -1,28 +1,32 @@
+import type { ComponentType } from "react";
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
-import { TOOL_MANIFESTS, getManifest } from "@sp/registry";
+import { getManifest } from "@sp/registry";
+import type { ToolManifest } from "@sp/engine";
 import { JsonLd } from "@/components/seo/JsonLd";
 import { SITE_TITLE } from "@/lib/constants";
 import { breadcrumbs, pageMetadata, pageUrl } from "@/lib/seo";
-import { AppShell } from "../../workbench/app-shell";
+import type { AppShellProps } from "../workbench/app-shell";
 
-// One static page per tool, for SEO and deep links; the shell takes over client-side.
-export const dynamicParams = false;
+/**
+ * Shared by the per-tool routes (app/tools/<id>/page.tsx). Each tool has its own route file rather
+ * than one dynamic [tool] route because Next.js bundles per route: a route file that imports only
+ * its own language's shell is the only way a page loads only that language's code up front.
+ * tests/tool-routes.test.ts checks every registered tool has one, with the right shell.
+ */
 
-export function generateStaticParams() {
-  return TOOL_MANIFESTS.map((m) => ({ tool: m.id }));
+function requireManifest(id: string): ToolManifest {
+  const manifest = getManifest(id);
+  if (!manifest) throw new Error(`No tool registered with id '${id}'`);
+  return manifest;
 }
-
-type Props = { params: Promise<{ tool: string }> };
 
 // The summary says what the tool does; the suffix is what a searcher is deciding on, added when
 // it fits in the ~160 characters a search result shows.
 const SUFFIX = " Runs in your browser; nothing is uploaded.";
 const description = (summary: string) => (summary.length + SUFFIX.length <= 160 ? summary + SUFFIX : summary);
 
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
-  const manifest = getManifest((await params).tool);
-  if (!manifest) return {};
+export function toolMetadata(id: string): Metadata {
+  const manifest = requireManifest(id);
   return pageMetadata({
     path: `/tools/${manifest.id}/`,
     title: manifest.label,
@@ -31,11 +35,9 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   });
 }
 
-export default async function ToolPage({ params }: Props) {
-  const manifest = getManifest((await params).tool);
-  if (!manifest) notFound();
+export function ToolPage({ id, Shell }: { id: string; Shell: ComponentType<AppShellProps> }) {
+  const manifest = requireManifest(id);
   const path = `/tools/${manifest.id}/`;
-
   return (
     <>
       <JsonLd
@@ -59,7 +61,7 @@ export default async function ToolPage({ params }: Props) {
           ],
         }}
       />
-      <AppShell initialToolId={manifest.id} />
+      <Shell initialToolId={manifest.id} />
     </>
   );
 }
