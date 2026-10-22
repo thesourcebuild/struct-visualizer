@@ -5,6 +5,8 @@ import {
   getValidDataModelsForArchitecture,
   dataModels,
   osTypes,
+  packingSyntaxes,
+  packingSyntaxesFor,
   StructParser,
 } from "@sp/core";
 import { OPTION_GROUP_META } from "./catalogue/groups";
@@ -23,9 +25,11 @@ import {
   OPTION_ENUM_ALIGN,
   OPTION_ENUM_SIZE,
   OPTION_OS,
+  OPTION_PACKING,
   TAG_HAS_ENUM,
   TAG_OPTIMIZED,
   TAG_OS_SELECTABLE,
+  TAG_PACKED,
   TOOL_DATA_MODELS,
   TOOL_STRUCT_LAYOUT,
   TOOL_VERIFICATION_CODE,
@@ -46,6 +50,7 @@ function variantTags(spec: LayoutSpec, input: string): string[] {
   const os = getSupportedOSTypes(target);
   if (os.length > 1 || os[0] !== "none") tags.push(TAG_OS_SELECTABLE);
   if (readMode(spec.options) === "optimized") tags.push(TAG_OPTIMIZED);
+  if (readMode(spec.options) === "packed") tags.push(TAG_PACKED);
   // Cheap: parse only to see whether any enum is declared.
   if (/\benum\b/.test(input)) {
     const parser = new StructParser();
@@ -67,6 +72,15 @@ function choicesFor(spec: LayoutSpec, optionId: string) {
     return getSupportedOSTypes(target).map((id) => ({
       value: id,
       label: osTypes[id]?.displayName ?? id,
+    }));
+  }
+  if (optionId === OPTION_PACKING) {
+    // Only what the platform's compiler accepts: #pragma pack alone for MSVC and the 8051.
+    const platform = resolveSpec(spec);
+    return packingSyntaxesFor(platform.os, platform.dataModel).map((id) => ({
+      value: id,
+      label: packingSyntaxes[id].code,
+      summary: `Accepted by ${packingSyntaxes[id].compilers}`,
     }));
   }
   if (optionId === OPTION_ENUM_SIZE || optionId === OPTION_ENUM_ALIGN) {

@@ -1,6 +1,6 @@
 import type { ZodType } from "zod";
 import type { Diagnostic, LintRule, OptionValue, OptionValues } from "@sp/contracts";
-import type { OptionCatalogue } from "./catalogue/options";
+import type { OptionCatalogue, OptionEnumChoice } from "./catalogue/options";
 import type { OptionGroupMeta } from "./catalogue/groups";
 
 export type ToolFamily = "layout" | "go" | "rust" | "reference";
@@ -124,7 +124,7 @@ export interface ToolDefinition<TSpec extends ToolSpecBase = ToolSpecBase, TData
   /** Tags that drive option visibility (`OptionDef.availableOn`). May depend on the input. */
   variantTag?(spec: TSpec, input: string): string | readonly string[] | undefined;
   /** Per-option choice lists that depend on other options (e.g. data models valid for a target). */
-  choicesFor?(spec: TSpec, optionId: string): readonly { value: string; label: string }[] | undefined;
+  choicesFor?(spec: TSpec, optionId: string): readonly OptionEnumChoice[] | undefined;
   /** Hook to keep dependent options consistent when one changes. */
   onOptionChange?(spec: TSpec, id: string, value: OptionValue): TSpec;
 }

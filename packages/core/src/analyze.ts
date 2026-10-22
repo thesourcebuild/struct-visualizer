@@ -4,6 +4,8 @@ import { validateSupportedTypes } from './parser/validate-types';
 import { PaddingCalculator } from './layout/padding-calculator';
 import { resolvePlatform } from './abi/resolve-selection';
 import type { PlatformSelection, ResolvedPlatform } from './abi/resolve-selection';
+import { applyPacking, resolvePackingSyntax } from './packing';
+import type { PackingSyntax } from './packing';
 
 export interface StructAnalysis {
   platform: ResolvedPlatform;
@@ -19,7 +21,10 @@ export interface StructAnalysis {
   unusedDefinitions: string[];
   enumDetected: boolean;
   result: CalculationResult | null;
+  /** The layout with every definition packed in `packing` (see applyPacking). */
   packed: CalculationResult | null;
+  /** The packing syntax `packed` uses: the one asked for if the target's compiler accepts it. */
+  packing: PackingSyntax;
   optimized: CalculationResult | null;
   /** Types that fell back to the 4/4 default during calculation. */
   unknownTypes: string[];
@@ -27,10 +32,13 @@ export interface StructAnalysis {
 
 /**
  * The one pipeline from C source + platform selection to layouts: parse, validate types,
- * then compute the natural, packed and optimized layouts of the last definition.
+ * then compute the natural, packed and optimized layouts of the last definition. The packed
+ * layout is that of the source with packing written into it in `packing`, so it is exactly what
+ * a compiler given that source produces.
  */
-export function analyzeStruct(code: string, selection: PlatformSelection): StructAnalysis {
+export function analyzeStruct(code: string, selection: PlatformSelection, packing?: PackingSyntax): StructAnalysis {
   const platform = resolvePlatform(selection);
+  const syntax = resolvePackingSyntax(platform.os, platform.dataModel, packing);
   const parser = new StructParser();
   const validation = parser.parse(code);
   const typeErrors = validation.isValid
@@ -47,6 +55,7 @@ export function analyzeStruct(code: string, selection: PlatformSelection): Struc
     enumDetected: parser.getAllEnums().length > 0,
     result: null,
     packed: null,
+    packing: syntax,
     optimized: null,
     unknownTypes: [],
   };
@@ -64,10 +73,18 @@ export function analyzeStruct(code: string, selection: PlatformSelection): Struc
     (name) => parser.resolveRecord(name),
   );
   analysis.result = calculator.calculate(definition);
-  analysis.packed = calculator.calculate(definition, { packed: true });
+  analysis.packed = packedLayout(applyPacking(code, syntax), platform);
   analysis.optimized = calculator.compareLayouts(definition).optimized;
   analysis.unknownTypes = calculator.getUnknownTypes();
   return analysis;
+}
+
+/** The last definition of already-packed source, laid out on `platform`. */
+function packedLayout(code: string, platform: ResolvedPlatform): CalculationResult | null {
+  const parser = new StructParser();
+  if (!parser.parse(code).isValid) return null;
+  const definition = parser.getLastDefinition();
+  return definition ? new PaddingCalculator(platform.architecture, platform.dataModel).calculate(definition) : null;
 }
 
 const ANONYMOUS_PREFIX = '__anon_';

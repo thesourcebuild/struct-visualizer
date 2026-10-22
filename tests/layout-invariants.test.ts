@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { it } from 'vitest';
 import {
+  applyPacking,
   CCodeGenerator,
   PaddingCalculator,
   StructParser,
@@ -116,7 +117,10 @@ function runSingleCode(
 
   const calculator = new PaddingCalculator(architecture, dataModel);
   const result = calculator.calculate(parsed);
-  const packed = calculator.calculate(parsed, { packed: true });
+  // Packed: the source with __attribute__((packed)) on every definition, laid out the same way.
+  const packedParser = new StructParser();
+  packedParser.parse(applyPacking(code, 'attribute'));
+  const packed = calculator.calculate(packedParser.getLastDefinition()!);
   const comparison = calculator.compareLayouts(parsed);
 
   assert.ok(comparison.optimized.totalSize <= comparison.current.totalSize, 'optimized layout must not be larger');

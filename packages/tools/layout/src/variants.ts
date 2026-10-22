@@ -8,7 +8,7 @@ import {
 } from "@sp/core";
 import type { ToolVariantRow, ToolVariantTable } from "@sp/engine";
 import { selectionFromSpec } from "./resolve";
-import { OPTION_DATA_MODEL, OPTION_OS, OPTION_TARGET, readMode } from "./pure";
+import { OPTION_DATA_MODEL, OPTION_OS, OPTION_TARGET, readMode, readPacking } from "./pure";
 import type { LayoutSpec } from "./spec";
 
 /** The same struct laid out on every valid target × data model × OS. */
@@ -19,7 +19,8 @@ export function layoutVariants(spec: LayoutSpec, input: string): ToolVariantTabl
   const mode = readMode(spec.options);
 
   const rows: ToolVariantRow[] = allPlatformCombinations().map((combo) => {
-    const analysis = analyzeStruct(input, { ...selection, ...combo });
+    // Each combination packs in the chosen syntax if its compiler accepts it (MSVC: #pragma pack).
+    const analysis = analyzeStruct(input, { ...selection, ...combo }, readPacking(spec.options));
     const r =
       mode === "packed"
         ? analysis.packed

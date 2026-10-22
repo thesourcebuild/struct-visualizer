@@ -93,7 +93,8 @@ interface TypeInfo {
   nestedStruct?: ParsedStruct;
   enumRef?: string;
   enumType?: ParsedEnum;
-  alignAttribute?: AlignRequest;
+  /** Set by an aligned typedef: the type's own alignment (see StructMember.typeAlignment). */
+  typeAlignment?: AlignRequest;
 }
 
 class Recover extends Error {}
@@ -107,6 +108,8 @@ export class StructParser {
   private enumAliases: Map<string, string> = new Map();
   private structAliases: Map<string, string> = new Map();
   private typeAliases: Map<string, TypeInfo> = new Map();
+  /** Alignment set by an aligned typedef of a struct, union or enum, by alias name. */
+  private aliasAlignments: Map<string, AlignRequest> = new Map();
   private enumConstants: Map<string, number> = new Map();
   private definitionOrder: Array<{ name: string; isUnion: boolean }> = [];
   private anonymousTypeCounter = 0;
@@ -123,6 +126,7 @@ export class StructParser {
     this.enumAliases.clear();
     this.structAliases.clear();
     this.typeAliases.clear();
+    this.aliasAlignments.clear();
     this.enumConstants.clear();
     this.definitionOrder = [];
     this.anonymousTypeCounter = 0;
@@ -362,15 +366,19 @@ export class StructParser {
   private registerTypedef(spec: Specifiers, decl: Declarator): void {
     const name = decl.name!;
     const base = spec.base!;
+    // `typedef int a8 __attribute__((aligned(8)));` gives the new type its own alignment.
+    const aligned = decl.attrs.aligned ?? spec.attrs.aligned;
     if (decl.derivations.length === 0 && base.kind === 'record') {
       const target = base.def?.name ?? base.tag;
       // `typedef struct Tag Alias;` may precede Tag's definition; references resolve at the end.
       if (target && target !== name) this.structAliases.set(name, target);
+      if (aligned !== undefined) this.aliasAlignments.set(name, aligned);
       return;
     }
     if (decl.derivations.length === 0 && base.kind === 'enum') {
       const target = base.def?.name ?? base.tag;
       if (target && target !== name) this.enumAliases.set(name, target);
+      if (aligned !== undefined) this.aliasAlignments.set(name, aligned);
       return;
     }
     if (decl.derivations[0]?.kind === 'func') return; // function type alias: never a member type
@@ -379,7 +387,7 @@ export class StructParser {
       this.errors.push({ message: `Typedef '${name}' cannot have an array of unknown size.`, line: decl.line, type: 'semantic' });
       return;
     }
-    this.typeAliases.set(name, { ...info, declaredType: name });
+    this.typeAliases.set(name, { ...info, declaredType: name, ...(aligned !== undefined && { typeAlignment: aligned }) });
   }
 
   // ------------------------------------------------------------------ specifiers
@@ -396,6 +404,9 @@ export class StructParser {
     };
     const words: string[] = [];
     const written: string[] = [];
+    // Keil's and IAR's `__packed struct S { ... }` packs the type, unlike a GCC attribute in that
+    // position, which applies to the declaration.
+    let packedKeyword = false;
 
     for (;;) {
       const t = this.peek();
@@ -408,6 +419,7 @@ export class StructParser {
       const v = t.value;
 
       if (v === '__attribute__' || v === '__attribute' || v === '__declspec' || v === 'alignas' || v === '_Alignas' || v === '__packed') {
+        if (v === '__packed') packedKeyword = true;
         this.parseAttribute(spec.attrs);
         continue;
       }
@@ -437,6 +449,7 @@ export class StructParser {
       if (v === 'struct' || v === 'union' || v === 'class') {
         if (spec.base) break;
         spec.base = this.parseRecordSpecifier(ownerName, topLevel);
+        if (packedKeyword && spec.base.def) spec.base.def.packed = true;
         written.push(`${spec.base.keyword} ${spec.base.def?.name ?? spec.base.tag ?? ''}`.trim());
         continue;
       }
@@ -845,7 +858,6 @@ export class StructParser {
           dims: [],
           recordRef: { keyword: base.keyword, name },
           nestedStruct: base.def,
-          alignAttribute: undefined,
         };
       }
       case 'enum': {
@@ -855,11 +867,13 @@ export class StructParser {
       case 'name': {
         const alias = this.typeAliases.get(base.name);
         if (alias) return { ...alias, dims: [...alias.dims] };
+        const aligned = this.aliasAlignments.get(base.name);
+        const typeAlignment = aligned !== undefined ? { typeAlignment: aligned } : {};
         if (this.structAliases.has(base.name) || this.structs.has(base.name) || this.unions.has(base.name)) {
-          return { type: base.name, isPointer: false, dims: [], recordRef: { keyword: 'struct', name: base.name } };
+          return { type: base.name, isPointer: false, dims: [], recordRef: { keyword: 'struct', name: base.name }, ...typeAlignment };
         }
         if (this.enumAliases.has(base.name) || this.enums.has(base.name)) {
-          return { type: base.name, isPointer: false, dims: [], enumRef: base.name };
+          return { type: base.name, isPointer: false, dims: [], enumRef: base.name, ...typeAlignment };
         }
         return { type: base.name, isPointer: false, dims: [] };
       }
@@ -1095,8 +1109,10 @@ export class StructParser {
       }
     }
 
-    const aligned = decl.attrs.aligned ?? spec.attrs.aligned ?? (info.isPointer ? undefined : info.alignAttribute);
+    const aligned = decl.attrs.aligned ?? spec.attrs.aligned;
     if (aligned !== undefined) member.alignAttribute = aligned;
+    // A pointer to an aligned typedef is an ordinary pointer.
+    if (!info.isPointer && info.typeAlignment !== undefined) member.typeAlignment = info.typeAlignment;
     if (decl.attrs.packed || spec.attrs.packed) member.packed = true;
     return member;
   }

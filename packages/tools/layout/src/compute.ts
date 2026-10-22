@@ -1,13 +1,14 @@
 import {
   CCodeGenerator,
   analyzeStruct,
+  applyPacking,
   dataModels,
   osTypes,
   targetArchitectures,
 } from "@sp/core";
 import type { CalculationResult, StructAnalysis } from "@sp/core";
 import type { ToolResult, ToolResultField } from "@sp/engine";
-import { readLanguage, readMode } from "./pure";
+import { readLanguage, readMode, readPacking } from "./pure";
 import type { LayoutMode } from "./pure";
 import { selectionFromSpec } from "./resolve";
 import type { LayoutSpec } from "./spec";
@@ -24,7 +25,7 @@ export interface LayoutData {
 }
 
 export function buildLayoutData(spec: LayoutSpec, input: string): LayoutData {
-  const analysis = analyzeStruct(input, selectionFromSpec(spec));
+  const analysis = analyzeStruct(input, selectionFromSpec(spec), readPacking(spec.options));
   const mode = readMode(spec.options);
   const { result, packed, optimized, platform } = analysis;
 
@@ -88,13 +89,20 @@ export function computeVerificationCode(spec: LayoutSpec, input: string): ToolRe
 
   const language = readLanguage(spec.options);
   const useOptimized = data.mode === "optimized" && optimized;
+  // Packed: the very source the Struct Layout tool laid out for this mode, packing written in.
+  const usePacked = data.mode === "packed" && data.analysis.packed;
   const code = useOptimized
     ? CCodeGenerator.generateVerificationCode(
         CCodeGenerator.generateOptimizedCode(result.struct, optimized.struct),
         CCodeGenerator.getOptimizedRootName(result.struct, optimized.struct),
         language,
       )
-    : CCodeGenerator.generateVerificationCode(input, result.struct.name, language);
+    : CCodeGenerator.generateVerificationCode(
+        usePacked ? applyPacking(input, data.analysis.packing) : input,
+        result.struct.name,
+        language,
+      );
+  const expected = useOptimized ? optimized : usePacked ? data.analysis.packed! : result;
 
   const ext = language === "cpp" ? "cpp" : "c";
   const filename = `${result.struct.name}_verify.${ext}`;
@@ -117,7 +125,7 @@ export function computeVerificationCode(spec: LayoutSpec, input: string): ToolRe
       { label: "Run", value: "./test   (test.exe on Windows)", mono: true },
       {
         label: "Expected sizeof",
-        value: `${(useOptimized ? optimized : result).totalSize} bytes on ${data.platformLabel.architecture}`,
+        value: `${expected.totalSize} bytes on ${data.platformLabel.architecture}`,
         mono: true,
       },
     ],

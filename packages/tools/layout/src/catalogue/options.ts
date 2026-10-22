@@ -1,6 +1,6 @@
 import { createOptionCatalogue } from "@sp/engine";
 import type { OptionCatalogue, OptionDef } from "@sp/engine";
-import { dataModelList, osTypeList, targetArchitectureList } from "@sp/core";
+import { dataModelList, osTypeList, packingSyntaxes, targetArchitectureList } from "@sp/core";
 import {
   OPTION_COMPARE,
   OPTION_DATA_MODEL,
@@ -10,11 +10,13 @@ import {
   OPTION_LANGUAGE,
   OPTION_MODE,
   OPTION_OS,
+  OPTION_PACKING,
   OPTION_REFERENCE_MODEL,
   OPTION_TARGET,
   TAG_HAS_ENUM,
   TAG_OPTIMIZED,
   TAG_OS_SELECTABLE,
+  TAG_PACKED,
   TOOL_DATA_MODELS,
   TOOL_STRUCT_LAYOUT,
   TOOL_VERIFICATION_CODE,
@@ -72,12 +74,26 @@ const MODE: OptionDef<LayoutGroup> = {
   kind: "enum",
   choices: [
     { value: "natural", label: "Natural", summary: "Default compiler alignment." },
-    { value: "packed", label: "Packed", summary: "Like __attribute__((packed)): no padding." },
+    { value: "packed", label: "Packed", summary: "Every struct packed, in the syntax chosen below: no padding." },
     { value: "optimized", label: "Optimized", summary: "Members reordered to minimise padding." },
   ],
   summary: "Which layout to display.",
   order: 0,
   colSpan: 2,
+};
+
+const PACKING: OptionDef<LayoutGroup> = {
+  id: OPTION_PACKING,
+  label: "Packing syntax",
+  group: "layout",
+  kind: "enum",
+  // Narrowed per platform by choicesFor: MSVC and the 8051 compilers accept only #pragma pack.
+  choices: Object.values(packingSyntaxes).map((s) => ({ value: s.id, label: s.code, summary: `Accepted by ${s.compilers}` })),
+  summary: "How the packing is written. Compilers accept different ones, and they differ for zero-width bit-fields.",
+  availableOn: [TAG_PACKED],
+  order: 1,
+  colSpan: 2,
+  control: "select",
 };
 
 const COMPARE: OptionDef<LayoutGroup> = {
@@ -134,13 +150,10 @@ const LANGUAGE: OptionDef<LayoutGroup> = {
   order: 0,
 };
 
-const OPTIMIZED_ONLY_MODE: OptionDef<LayoutGroup> = {
+// The same three modes, with the same labels, as the Struct Layout tool.
+const VERIFY_MODE: OptionDef<LayoutGroup> = {
   ...MODE,
-  choices: [
-    { value: "natural", label: "Original order" },
-    { value: "optimized", label: "Optimized order" },
-  ],
-  summary: "Verify the struct as written, or the reordered version.",
+  summary: "Verify the struct as written, packed in the syntax chosen below, or reordered.",
 };
 
 const REFERENCE_MODEL: OptionDef<LayoutGroup> = {
@@ -151,8 +164,8 @@ const REFERENCE_MODEL: OptionDef<LayoutGroup> = {
 };
 
 const CATALOGUES: Record<string, readonly OptionDef<LayoutGroup>[]> = {
-  [TOOL_STRUCT_LAYOUT]: [TARGET, DATA_MODEL, OS, MODE, COMPARE, EXPLAIN, ENUM_SIZE, ENUM_ALIGN],
-  [TOOL_VERIFICATION_CODE]: [LANGUAGE, OPTIMIZED_ONLY_MODE, TARGET, DATA_MODEL, OS, ENUM_SIZE, ENUM_ALIGN],
+  [TOOL_STRUCT_LAYOUT]: [TARGET, DATA_MODEL, OS, MODE, PACKING, COMPARE, EXPLAIN, ENUM_SIZE, ENUM_ALIGN],
+  [TOOL_VERIFICATION_CODE]: [LANGUAGE, VERIFY_MODE, PACKING, TARGET, DATA_MODEL, OS, ENUM_SIZE, ENUM_ALIGN],
   [TOOL_DATA_MODELS]: [REFERENCE_MODEL],
 };
 

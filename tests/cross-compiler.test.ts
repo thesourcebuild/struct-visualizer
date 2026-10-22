@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { beforeAll, describe, expect, it } from "vitest";
-import { analyzeStruct, examples } from "@sp/core";
-import type { PlatformSelection } from "@sp/core";
+import { analyzeStruct, applyPacking, examples, packingSyntaxesFor } from "@sp/core";
+import type { PackingSyntax, PlatformSelection } from "@sp/core";
 
 /**
  * Ground truth on every target: each case (the bit-field, enum and pointer cases below, and every C
@@ -159,6 +159,17 @@ const CASES: Record<string, string> = {
   // Function pointers, which some targets size apart from data pointers.
   "function pointers": "struct S { char a; void (*f)(void); char b; void (**pf)(void); char c; int *p; char d; };",
   "typedef'd function pointers": "typedef void (*cb_t)(int); struct S { char a; cb_t cbs[2]; char b; cb_t *pcb; char c; };",
+  // Alignment requests, which packing may or may not lower: each also runs packed both ways.
+  "aligned member": "struct S { char a; int b __attribute__((aligned(8))); char c; };",
+  "_Alignas member": "struct S { char a; _Alignas(8) char b; char c; };",
+  "aligned struct": "struct S { char a; int b; } __attribute__((aligned(16)));",
+  "aligned typedef member": "typedef int aint __attribute__((aligned(8))); struct S { char a; aint b; char c; };",
+  "under-aligned typedef member": "typedef int i2 __attribute__((aligned(2))); struct S { char a; i2 b; char c; };",
+  "aligned typedef array": "typedef short as8 __attribute__((aligned(8))); struct S { char a; as8 b[2]; char c; };",
+  "aligned typedef of a struct": "struct T { char x; }; typedef struct T T8 __attribute__((aligned(8))); struct S { char a; T8 t; char c; };",
+  "pragma pack 2, aligned member": "#pragma pack(push, 2)\nstruct S { char a; int b __attribute__((aligned(8))); char c; };\n#pragma pack(pop)",
+  "pragma pack 4, no bit-fields": "#pragma pack(push, 4)\nstruct S { char a; int b; double c; };\n#pragma pack(pop)",
+  "pragma pack 2, nested struct": "struct T { char x; int y; };\n#pragma pack(push, 2)\nstruct S { char a; struct T t; double d; };\n#pragma pack(pop)",
   // Every C example: nested structs, unions, arrays, pointers and enums on every target.
   ...Object.fromEntries(examples.map((e) => [`example: ${e.name}`, e.code.c])),
 };
@@ -178,7 +189,7 @@ function membersOf(code: string): { kind: "struct" | "union"; tag: string; membe
  * type names; its symbols carry the case's index.
  */
 function probeSource(i: number): string {
-  const code = entries[i]![1];
+  const code = source(entries[i]!);
   const { kind, tag, members } = membersOf(code);
   const t = `${kind} ${tag}`;
   const values = [`sizeof(${t})`, `_Alignof(${t})`, ...members.filter(([, bf]) => !bf).map(([m]) => `offsetof(${t}, ${m})`)];
@@ -272,10 +283,15 @@ function measured(symbols: Map<string, number[]>, code: string, i: number): Meas
   };
 }
 
-function modelled(code: string, i: number, selection: PlatformSelection): Measured {
-  const analysis = analyzeStruct(code, selection);
+/**
+ * The engine's layout: the natural one, or for a packed case the packed layout analyzeStruct
+ * works out in that syntax, exactly as the Struct Layout tool asks for it.
+ */
+function modelled(entry: Entry, selection: PlatformSelection): Measured {
+  const analysis = analyzeStruct(entry.code, selection, entry.packing);
   expect(analysis.errors.map((e) => e.message)).toEqual([]);
-  const result = analysis.result!;
+  if (entry.packing) expect(analysis.packing).toBe(entry.packing);
+  const result = (entry.packing ? analysis.packed : analysis.result)!;
   const offsets: Measured["offsets"] = {};
   const bits: Measured["bits"] = {};
   for (const m of result.members) {
@@ -286,11 +302,34 @@ function modelled(code: string, i: number, selection: PlatformSelection): Measur
   return { size: result.totalSize, align: result.struct.alignment ?? 0, offsets, bits };
 }
 
-const entries = Object.entries(CASES);
+/**
+ * A case as written, or packed in one syntax. A packed case is compiled from applyPacking's
+ * output, the source the Verification Code tool prints for Packed mode. `__packed` has no case:
+ * only Keil and IAR accept it, and neither can be run here.
+ */
+interface Entry {
+  label: string;
+  code: string;
+  packing?: PackingSyntax;
+}
+const source = (entry: Entry) => (entry.packing ? applyPacking(entry.code, entry.packing) : entry.code);
+
+const PACKED_VARIANTS: { syntax: PackingSyntax; label: string }[] = [
+  { syntax: "pragma", label: "#pragma pack(1)" },
+  { syntax: "attribute", label: "__attribute__((packed))" },
+];
+const entries: Entry[] = Object.entries(CASES).flatMap(([label, code]) => [
+  { label, code },
+  ...PACKED_VARIANTS.map((v) => ({ label: `${label} [${v.label}]`, code, packing: v.syntax })),
+]);
 // A case the engine cannot parse fails in its test rather than being sent to the compilers.
-const parsable = entries.flatMap(([, code], i) =>
-  analyzeStruct(code, TARGETS[0]!.selection).errors.length === 0 ? [i] : [],
+const parsable = entries.flatMap((entry, i) =>
+  analyzeStruct(entry.code, TARGETS[0]!.selection).errors.length === 0 ? [i] : [],
 );
+/** Whether the platform's compiler takes this case's packing syntax, as the app offers it. */
+const appliesTo = (entry: Entry, target: Target) =>
+  entry.packing === undefined ||
+  packingSyntaxesFor(target.selection.os, target.selection.dataModel).includes(entry.packing);
 
 for (const target of TARGETS) {
   if (!hasTool(target.cc)) {
@@ -312,7 +351,8 @@ for (const target of TARGETS) {
 
     beforeAll(async () => {
       const dir = mkdtempSync(join(tmpdir(), "sp-cc-"));
-      for (const i of parsable) writeFileSync(join(dir, `case_${i}.c`), probeSource(i));
+      const cases = parsable.filter((i) => appliesTo(entries[i]!, target));
+      for (const i of cases) writeFileSync(join(dir, `case_${i}.c`), probeSource(i));
       const quote = (args: string[]) => args.map((a) => `'${a}'`).join(" ");
       // Freestanding: GCC's own <stddef.h> and <stdint.h>, so no target C library is needed.
       const common = ["-std=gnu11", "-ffreestanding", "-w", "-O0", "-c", "-fdata-sections", "-fno-common"];
@@ -322,7 +362,7 @@ for (const target of TARGETS) {
         : `if ${target.cc} ${quote([...target.flags, ...common])} -o "$b.o" "$f" 2> "$b.err"; then ${objdump} -s "$b.o" > "$b.dump"; fi`;
       await tool("sh", ["-c", `for f in case_*.c; do b="\${f%.c}"; ${each}; done`], dir);
 
-      for (const i of parsable) {
+      for (const i of cases) {
         const output = join(dir, `case_${i}.${sdcc ? "asm" : "dump"}`);
         results.set(
           i,
@@ -333,12 +373,15 @@ for (const target of TARGETS) {
       }
     }, 600_000);
 
-    entries.forEach(([label, code], i) => {
+    entries.forEach((entry, i) => {
+      if (!appliesTo(entry, target)) return;
+      const { label } = entry;
+      const code = source(entry);
       it(label, (ctx) => {
         const symbols = results.get(i);
         if (symbols === undefined) {
           // Not parsable by the engine: report the parser's errors.
-          expect(analyzeStruct(code, target.selection).errors.map((e) => e.message)).toEqual([]);
+          expect(analyzeStruct(entry.code, target.selection).errors.map((e) => e.message)).toEqual([]);
           return;
         }
         if (typeof symbols === "string") {
@@ -348,7 +391,7 @@ for (const target of TARGETS) {
           ctx.skip(`${target.cc} rejects it: ${reason}`);
           return;
         }
-        const actual = modelled(code, i, target.selection);
+        const actual = modelled(entry, target.selection);
         let expected: Measured;
         try {
           expected = measured(symbols, code, i);

@@ -7,6 +7,8 @@ export { validateSupportedTypes } from './parser/validate-types';
 export { PaddingCalculator } from './layout/padding-calculator';
 export { CCodeGenerator } from './codegen/c-code-generator';
 export { analyzeStruct } from './analyze';
+export { applyPacking, packingSyntaxes, packingSyntaxesFor, resolvePackingSyntax } from './packing';
+export type { PackingSyntax, PackingSyntaxInfo } from './packing';
 export { memberDeclarator, memberLabel, memberTypeLabel } from './display';
 export type { StructAnalysis } from './analyze';
 export { examples } from './examples';

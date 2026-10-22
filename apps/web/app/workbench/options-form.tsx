@@ -43,21 +43,23 @@ function Select({
 }: {
   id: string;
   value: string;
-  choices: readonly { value: string; label: string }[];
+  choices: readonly { value: string; label: string; summary?: string }[];
   onChange: (v: string) => void;
   title?: string;
 }) {
+  // Hovering the closed dropdown explains the current choice; each option carries its own hint.
+  const current = choices.find((c) => c.value === value)?.summary;
   return (
     <div className="relative">
       <select
         id={id}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        title={title}
+        title={current ?? title}
         className="w-full appearance-none rounded-lg border border-gray-200 bg-white py-2 pl-3 pr-9 text-sm text-gray-900 shadow-sm transition-colors hover:border-gray-300 focus:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100"
       >
         {choices.map((c) => (
-          <option key={c.value} value={c.value}>
+          <option key={c.value} value={c.value} title={c.summary}>
             {c.label}
           </option>
         ))}
@@ -186,10 +188,11 @@ function OptionField({
 
   if (def.kind === "enum") {
     const choices = tool.choicesFor?.(spec, def.id) ?? def.choices ?? [];
+    const segmented = def.control !== "select" && choices.length <= SEGMENTED_MAX && choices.length > 1;
     return (
       <div className={wrapper}>
-        <FieldLabel htmlFor={choices.length > SEGMENTED_MAX ? id : undefined} def={def} suggested={suggested} />
-        {choices.length <= SEGMENTED_MAX && choices.length > 1 ? (
+        <FieldLabel htmlFor={segmented ? undefined : id} def={def} suggested={suggested} />
+        {segmented ? (
           <Segmented
             label={def.label}
             value={String(value ?? "")}

@@ -3,6 +3,7 @@ import {
   clampDataModel,
   clampOSType,
   getDefaultDataModelForArchitecture,
+  resolvePackingSyntax,
   targetArchitectures,
 } from "@sp/core";
 import type { DataModel, OSType, TargetArchitecture } from "@sp/core";
@@ -17,6 +18,7 @@ import {
   OPTION_LANGUAGE,
   OPTION_MODE,
   OPTION_OS,
+  OPTION_PACKING,
   OPTION_REFERENCE_MODEL,
   OPTION_TARGET,
   SPEC_VERSION,
@@ -30,6 +32,7 @@ export function defaultOptions(): OptionValues {
     [OPTION_DATA_MODEL]: getDefaultDataModelForArchitecture(DEFAULT_TARGET),
     [OPTION_OS]: DEFAULT_OS,
     [OPTION_MODE]: "natural",
+    [OPTION_PACKING]: "attribute",
     [OPTION_COMPARE]: false,
     [OPTION_EXPLAIN]: false,
     [OPTION_ENUM_SIZE]: "default",
@@ -44,12 +47,16 @@ export function readTarget(options: OptionValues): TargetArchitecture {
   return v in targetArchitectures ? (v as TargetArchitecture) : DEFAULT_TARGET;
 }
 
-/** Clamp model/OS to what the target supports, so every spec the UI holds is valid. */
+/**
+ * Clamp model/OS to what the target supports, and the packing syntax to what that compiler
+ * accepts (MSVC and the 8051 compilers: only #pragma pack), so every spec the UI holds is valid.
+ */
 export function normalizeOptions(options: OptionValues): OptionValues {
   const target = readTarget(options);
   const dataModel = clampDataModel(target, readString(options, OPTION_DATA_MODEL, "") as DataModel);
   const os = clampOSType(target, readString(options, OPTION_OS, DEFAULT_OS) as OSType);
-  return { ...options, [OPTION_TARGET]: target, [OPTION_DATA_MODEL]: dataModel, [OPTION_OS]: os };
+  const packing = resolvePackingSyntax(os, dataModel, readString(options, OPTION_PACKING, "attribute"));
+  return { ...options, [OPTION_TARGET]: target, [OPTION_DATA_MODEL]: dataModel, [OPTION_OS]: os, [OPTION_PACKING]: packing };
 }
 
 export function createSpec(options: Partial<OptionValues> = {}): LayoutSpec {

@@ -27,6 +27,11 @@ export interface OptionDef<TGroup extends string = string> {
   availableOn?: readonly string[];
   order: number;
   colSpan?: 1 | 2;
+  /**
+   * For `enum` options: `select` always renders a dropdown, for choices whose labels are too long
+   * for buttons. Left out, a few choices render as a segmented control and more as a dropdown.
+   */
+  control?: "select";
 }
 
 export interface OptionCatalogue<TGroup extends string = string> {

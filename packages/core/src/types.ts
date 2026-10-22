@@ -35,6 +35,12 @@ export interface StructMember {
   /** `__attribute__((packed))` on the member: alignment 1. */
   packed?: boolean;
   /**
+   * The alignment of the member's type, set by an aligned typedef (`typedef int a8
+   * __attribute__((aligned(8)));`). It replaces the type's natural alignment, smaller or larger,
+   * and packing lowers it like any natural alignment, unlike `alignAttribute` on the member.
+   */
+  typeAlignment?: AlignRequest;
+  /**
    * A pointer to a function (or an array of them). It holds a code address, which some targets
    * size apart from data pointers: 2 bytes on SDCC's 8051 against 3 for a generic data pointer.
    */

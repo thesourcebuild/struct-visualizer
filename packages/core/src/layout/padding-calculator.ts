@@ -2,11 +2,6 @@ import type { AlignRequest, Architecture, ParsedStruct, StructMember, Calculatio
 import { dataModels, getStandardTypeMap } from '../abi/data-models';
 import type { DataModel } from '../abi/data-models';
 
-/** The most alignment packing leaves a member of `struct`: 1 when packed, else #pragma pack's n. */
-function packingCap(struct: ParsedStruct): number | undefined {
-  return struct.packed ? 1 : struct.pragmaPack;
-}
-
 /** The fewest of 1, 2, 4 or 8 bytes whose integer holds every value: unsigned when none is negative. */
 function bytesForValues(values: readonly number[]): number {
   const lo = Math.min(0, ...values);
@@ -59,12 +54,11 @@ export class PaddingCalculator {
   }
 
   /**
-   * Lay out a struct or union. `packed` simulates `__attribute__((packed))` on every struct
-   * (alignment 1); otherwise the definition's own `#pragma pack` / attributes apply.
+   * Lay out a struct or union with its own `#pragma pack` and attributes. A packed layout is the
+   * layout of source with packing written into it (applyPacking), so it follows the same rules.
    */
-  calculate(struct: ParsedStruct, options?: { packed?: boolean }): CalculationResult {
-    const isPacked = options?.packed === true;
-    return struct.isUnion === true ? this.calculateUnion(struct, isPacked) : this.calculateStruct(struct, isPacked);
+  calculate(struct: ParsedStruct): CalculationResult {
+    return struct.isUnion === true ? this.calculateUnion(struct) : this.calculateStruct(struct);
   }
 
   /**
@@ -102,7 +96,7 @@ export class PaddingCalculator {
    * Padding is what no member occupies: the bytes between the end of one member's bits and the
    * byte where the next member starts, and the trailing bytes up to the struct's alignment.
    */
-  private calculateStruct(struct: ParsedStruct, isPacked: boolean): CalculationResult {
+  private calculateStruct(struct: ParsedStruct): CalculationResult {
     const members: CalculationResult['members'] = [];
     const rules = this.architecture.bitfieldLayout;
     /** Next free bit. */
@@ -127,9 +121,11 @@ export class PaddingCalculator {
         const width = Math.max(0, member.bitField);
         const typeInfo = this.bitfieldTypeInfo(member);
         const typeAlign = Math.max(1, typeInfo.alignment);
-        const packed = isPacked || struct.packed === true || member.packed === true;
+        const packed = struct.packed === true || member.packed === true;
         const pragma = struct.pragmaPack;
-        const explicit = member.alignAttribute !== undefined ? this.resolveAlignRequest(member.alignAttribute) : undefined;
+        const requested = member.alignAttribute !== undefined ? this.resolveAlignRequest(member.alignAttribute) : undefined;
+        // #pragma pack caps an alignment request too.
+        const explicit = requested !== undefined && struct.pragmaPack !== undefined ? Math.min(requested, struct.pragmaPack) : requested;
         /** The type's alignment under #pragma pack, which packed does not lower. */
         const pragmaAlign = pragma !== undefined ? Math.min(typeAlign, pragma) : typeAlign;
         let start: number;
@@ -137,7 +133,7 @@ export class PaddingCalculator {
 
         if (rules === 'ms') {
           // The unit's alignment, as for any member: 1 when packed, capped by #pragma pack.
-          alignment = this.effectiveAlignment(member, typeAlign, struct, isPacked);
+          alignment = this.effectiveAlignment(member, typeAlign, struct);
           if (width === 0) {
             // A zero-width bit-field only counts directly after a bit-field. It closes that unit,
             // moves what follows to its type's alignment unless packed, and raises the struct's
@@ -218,9 +214,12 @@ export class PaddingCalculator {
       }
 
       closeUnit();
-      const { size, alignment, nested } = this.memberLayout(member, struct, isPacked);
+      const { size, alignment, nested } = this.memberLayout(member, struct);
       maxAlignment = Math.max(maxAlignment, alignment);
-      if (member.alignAttribute !== undefined) maxExplicitAlignment = Math.max(maxExplicitAlignment, alignment);
+      // A request on the member, or an aligned typedef: neither is capped by the target ABI.
+      if (member.alignAttribute !== undefined || member.typeAlignment !== undefined) {
+        maxExplicitAlignment = Math.max(maxExplicitAlignment, alignment);
+      }
 
       const offset = Math.ceil(pos / 8) + this.calculatePadding(Math.ceil(pos / 8), alignment);
       members.push({ member, offset, size, padding: gapBefore(offset * 8), alignment, nested });
@@ -231,7 +230,7 @@ export class PaddingCalculator {
     closeUnit();
 
     // Trailing padding rounds the size up to the struct's alignment.
-    const structAlignment = this.structAlignment(struct, maxAlignment, maxExplicitAlignment, isPacked);
+    const structAlignment = this.structAlignment(struct, maxAlignment, maxExplicitAlignment);
     const used = Math.ceil(pos / 8);
     const totalSize = used + this.calculatePadding(used, structAlignment);
     const trailingPadding = totalSize - Math.ceil(end / 8);
@@ -256,7 +255,7 @@ export class PaddingCalculator {
     };
   }
 
-  private calculateUnion(struct: ParsedStruct, isPacked: boolean): CalculationResult {
+  private calculateUnion(struct: ParsedStruct): CalculationResult {
     // Every member starts at offset 0; the size is the largest member, rounded up.
     const members: CalculationResult['members'] = [];
     let maxSize = 0;
@@ -264,7 +263,7 @@ export class PaddingCalculator {
     let maxExplicitAlignment = 1;
 
     for (const member of struct.members) {
-      const { size, alignment, nested } = this.memberLayout(member, struct, isPacked);
+      const { size, alignment, nested } = this.memberLayout(member, struct);
 
       maxSize = Math.max(maxSize, size);
       // As in a struct, an unnamed bit-field adds no alignment under GCC's rules unless the
@@ -273,7 +272,10 @@ export class PaddingCalculator {
       if (!unnamedBitfield || this.architecture.bitfieldLayout === 'ms' || this.architecture.alignUnnamedBitfields) {
         maxAlignment = Math.max(maxAlignment, alignment);
       }
-      if (member.alignAttribute !== undefined) maxExplicitAlignment = Math.max(maxExplicitAlignment, alignment);
+      // A request on the member, or an aligned typedef: neither is capped by the target ABI.
+      if (member.alignAttribute !== undefined || member.typeAlignment !== undefined) {
+        maxExplicitAlignment = Math.max(maxExplicitAlignment, alignment);
+      }
 
       members.push({
         member,
@@ -286,9 +288,8 @@ export class PaddingCalculator {
       });
     }
 
-    let unionAlignment = isPacked ? 1 : Math.min(maxAlignment, this.architecture.maxAlignment || maxAlignment);
-    const cap = packingCap(struct);
-    if (!isPacked && cap !== undefined) unionAlignment = Math.min(unionAlignment, cap);
+    let unionAlignment = Math.min(maxAlignment, this.architecture.maxAlignment || maxAlignment);
+    if (struct.pragmaPack !== undefined) unionAlignment = Math.min(unionAlignment, struct.pragmaPack);
     unionAlignment = Math.max(unionAlignment, maxExplicitAlignment);
     if (struct.alignAttribute !== undefined) {
       unionAlignment = Math.max(unionAlignment, this.resolveAlignRequest(struct.alignAttribute));
@@ -319,31 +320,34 @@ export class PaddingCalculator {
   }
 
   /** Size and effective alignment of a member inside `struct`, plus a nested record's own layout. */
-  private memberLayout(member: StructMember, struct: ParsedStruct, isPacked: boolean): MemberInfo {
-    const info = this.getMemberSizeAndAlignment(member, isPacked);
-    return { ...info, alignment: this.effectiveAlignment(member, info.alignment, struct, isPacked) };
+  private memberLayout(member: StructMember, struct: ParsedStruct): MemberInfo {
+    const info = this.getMemberSizeAndAlignment(member);
+    // An aligned typedef sets the type's own alignment, smaller or larger, and packing lowers it
+    // like any natural alignment.
+    const natural = member.typeAlignment !== undefined ? this.resolveAlignRequest(member.typeAlignment) : info.alignment;
+    return { ...info, alignment: this.effectiveAlignment(member, natural, struct) };
   }
 
   /**
-   * A member's alignment after packing and alignment requests:
-   * packed (mode or attribute) makes it 1, `#pragma pack(n)` caps it at n, and an explicit
-   * aligned/alignas raises it again -- an explicit request is never lowered by packing.
+   * A member's alignment after packing and alignment requests, in the order GCC and MSVC apply
+   * them (tests/cross-compiler.test.ts): packed, on the member or the struct, makes it 1; an
+   * aligned/alignas request on the member raises it again, since packed never lowers a request;
+   * then `#pragma pack(n)` caps the result at n, requests included.
    */
-  private effectiveAlignment(member: StructMember, natural: number, struct: ParsedStruct, isPacked: boolean): number {
-    let alignment = natural;
-    const cap = packingCap(struct);
-    if (isPacked || member.packed) alignment = 1;
-    else if (cap !== undefined) alignment = Math.min(alignment, cap);
+  private effectiveAlignment(member: StructMember, natural: number, struct: ParsedStruct): number {
+    let alignment = struct.packed === true || member.packed === true ? 1 : natural;
     if (member.alignAttribute !== undefined) {
       alignment = Math.max(alignment, this.resolveAlignRequest(member.alignAttribute));
     }
+    if (struct.pragmaPack !== undefined) alignment = Math.min(alignment, struct.pragmaPack);
     return Math.max(1, alignment);
   }
 
-  private structAlignment(struct: ParsedStruct, maxMemberAlignment: number, maxExplicit: number, isPacked: boolean): number {
-    let alignment = isPacked ? 1 : this.getStructAlignment(maxMemberAlignment);
-    const cap = packingCap(struct);
-    if (!isPacked && cap !== undefined) alignment = Math.min(alignment, cap);
+  private structAlignment(struct: ParsedStruct, maxMemberAlignment: number, maxExplicit: number): number {
+    let alignment = this.getStructAlignment(maxMemberAlignment);
+    // Only #pragma pack caps the struct itself: packed has already set every member's alignment,
+    // and under a pragma a GCC bit-field of a packed struct still adds its pragma-capped type's.
+    if (struct.pragmaPack !== undefined) alignment = Math.min(alignment, struct.pragmaPack);
     alignment = Math.max(alignment, maxExplicit);
     if (struct.alignAttribute !== undefined) {
       alignment = Math.max(alignment, this.resolveAlignRequest(struct.alignAttribute));
@@ -361,7 +365,7 @@ export class PaddingCalculator {
    * Size and natural alignment, before packing and alignment requests. For a nested struct or
    * union (or an array of one), also the layout of one element.
    */
-  private getMemberSizeAndAlignment(member: StructMember, isPacked: boolean): MemberInfo {
+  private getMemberSizeAndAlignment(member: StructMember): MemberInfo {
     // Arrays, including the flexible array member (arraySize 0: no size, element alignment).
     if (member.arraySize !== undefined) {
       if (member.enumType) {
@@ -369,7 +373,7 @@ export class PaddingCalculator {
         return { size: enumInfo.size * member.arraySize, alignment: enumInfo.alignment };
       }
       if (member.isNested && member.nestedStruct) {
-        const nestedResult = this.calculate(member.nestedStruct, { packed: isPacked });
+        const nestedResult = this.calculate(member.nestedStruct);
         return {
           size: nestedResult.totalSize * member.arraySize,
           alignment: nestedResult.struct.alignment || this.architecture.defaultAlignment,
@@ -391,7 +395,7 @@ export class PaddingCalculator {
     }
 
     if (member.isNested && member.nestedStruct) {
-      const nestedResult = this.calculate(member.nestedStruct, { packed: isPacked });
+      const nestedResult = this.calculate(member.nestedStruct);
       return {
         size: nestedResult.totalSize,
         alignment: nestedResult.struct.alignment || this.architecture.defaultAlignment,
@@ -565,7 +569,7 @@ export class PaddingCalculator {
     const units: Array<{ members: StructMember[]; size: number; alignment: number }> = [];
     for (const member of optimizedMembers) {
       if (isFlexible(member)) continue;
-      const { size, alignment } = this.memberLayout(member, struct, false);
+      const { size, alignment } = this.memberLayout(member, struct);
       const last = units[units.length - 1];
       if (member.bitField !== undefined && last && last.members[last.members.length - 1].bitField !== undefined) {
         last.members.push(member);

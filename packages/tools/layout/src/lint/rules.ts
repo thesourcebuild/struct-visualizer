@@ -3,7 +3,7 @@ import type { LintContext } from "@sp/engine";
 import { analyzeStruct, bitfieldVerification, getSupportedOSTypes, osTypes } from "@sp/core";
 import type { CalculationResult, StructAnalysis, StructMember } from "@sp/core";
 import type { LayoutData } from "../compute";
-import { OPTION_MODE, OPTION_OS, withOption } from "../pure";
+import { OPTION_MODE, OPTION_OS, readPacking, withOption } from "../pure";
 import type { LayoutMode } from "../pure";
 import { selectionFromSpec } from "../resolve";
 import type { LayoutSpec } from "../spec";
@@ -118,7 +118,7 @@ const osDifference: Rule = {
     const out: Diag[] = [];
     for (const os of getSupportedOSTypes(platform.target)) {
       if (os === platform.os || os === "none") continue;
-      const there = layoutFor(analyzeStruct(input, { ...selectionFromSpec(spec), os }), data.mode);
+      const there = layoutFor(analyzeStruct(input, { ...selectionFromSpec(spec), os }, readPacking(spec.options)), data.mode);
       if (!there) continue;
       const moved = here.members
         .filter((m, i) => there.members[i]?.offset !== m.offset)
@@ -179,6 +179,27 @@ const parserWarnings: Rule = {
 
 // SP002 (packing directive not applied) and SP007 (enum default size) are retired: packing
 // pragmas and attributes are applied now, and the enum default is shown in the Enum settings.
+/**
+ * SP009 — Packed mode in Keil's and IAR's `__packed`, which is laid out like GCC's packed
+ * attribute. Neither compiler could be run, so this layout is the one not compiler-checked.
+ */
+const packedKeywordUnverified: Rule = {
+  code: "SP009",
+  check: ({ result }) => {
+    const data = result.data;
+    if (!data || data.mode !== "packed" || data.analysis.packing !== "keyword" || !data.analysis.packed) return [];
+    return [
+      {
+        code: "SP009",
+        level: "warning",
+        message: "__packed is laid out like GCC's packed attribute; this is not checked against Keil or IAR.",
+        detail:
+          "Without bit-fields every member simply loses its padding. Bit-field positions are where compilers differ most: confirm them with the Verification Code tool on your toolchain.",
+      },
+    ];
+  },
+};
+
 export const LAYOUT_RULES: readonly Rule[] = [
   parseErrors,
   reorderablePadding,
@@ -187,6 +208,7 @@ export const LAYOUT_RULES: readonly Rule[] = [
   osDifference,
   unusedDefinitions,
   parserWarnings,
+  packedKeywordUnverified,
 ];
 
 /** Verification-code tool only cares about errors and the parser's own warnings. */

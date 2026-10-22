@@ -15,6 +15,8 @@ export const OPTION_ENUM_SIZE = "enumSize";
 export const OPTION_ENUM_ALIGN = "enumAlign";
 export const OPTION_LANGUAGE = "language";
 export const OPTION_EXPLAIN = "explain";
+/** How Packed mode writes the packing: "attribute", "pragma" or "keyword" (see @sp/core packing). */
+export const OPTION_PACKING = "packing";
 /** Data-models reference tool: which model's type table to show (not clamped to a target). */
 export const OPTION_REFERENCE_MODEL = "referenceModel";
 
@@ -26,6 +28,7 @@ export type EnumOverride = "default" | "1" | "2" | "4" | "8";
 export const TAG_HAS_ENUM = "has-enum";
 export const TAG_OS_SELECTABLE = "os-selectable";
 export const TAG_OPTIMIZED = "optimized";
+export const TAG_PACKED = "packed";
 
 export const DEFAULT_TARGET = "intel-x64-amd";
 export const DEFAULT_OS = "linux";
@@ -47,6 +50,12 @@ export function readBoolean(options: OptionValues, id: string, fallback = false)
 export function readMode(options: OptionValues): LayoutMode {
   const v = readString(options, OPTION_MODE, "natural");
   return v === "packed" || v === "optimized" ? v : "natural";
+}
+
+/** The packing syntax asked for; the core clamps it to what the target's compiler accepts. */
+export function readPacking(options: OptionValues): "attribute" | "pragma" | "keyword" {
+  const v = readString(options, OPTION_PACKING, "attribute");
+  return v === "pragma" || v === "keyword" ? v : "attribute";
 }
 
 export function readLanguage(options: OptionValues): CodeLanguage {
