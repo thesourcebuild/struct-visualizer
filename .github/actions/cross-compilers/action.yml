@@ -1,0 +1,49 @@
+name: Cross compilers
+description: Installs the compilers the bit-field ground truth (tests/cross-compiler.test.ts) checks against.
+
+# The packages are 457 MB of downloads from Ubuntu's mirror, which some runs serve at under 1 MB/s
+# (a 40 s install became 9 min). The .deb files are cached, so a run downloads only packages that
+# have had an update since; the cache key changes with the runner image and the package list.
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      run: |
+        # The compilers only, without recommended extras such as the bare-metal ARM C++ library
+        # (2 GB): the probes are compiled freestanding and never linked.
+        packages="gcc-i686-linux-gnu gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu \
+          gcc-mipsel-linux-gnu gcc-mingw-w64-x86-64-win32 gcc-mingw-w64-i686-win32 gcc-arm-none-eabi \
+          gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc"
+        packages=$(echo $packages)
+        echo "packages=$packages" >> "$GITHUB_OUTPUT"
+        echo "key=cross-compilers-$ImageOS-$ImageVersion-$(echo "$packages" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+    - id: cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/apt-archives
+        key: ${{ steps.plan.outputs.key }}
+        # An older image's packages: most are still current, so only the updated ones download.
+        restore-keys: cross-compilers-
+
+    - shell: bash
+      run: |
+        sudo apt-get update
+        if compgen -G "$HOME/apt-archives/*.deb" > /dev/null; then
+          sudo cp "$HOME"/apt-archives/*.deb /var/cache/apt/archives/
+        fi
+        sudo apt-get install -y --no-install-recommends ${{ steps.plan.outputs.packages }}
+        # Drop superseded versions, so what is cached is only what this install used.
+        sudo apt-get autoclean
+        mkdir -p "$HOME/apt-archives"
+        rm -f "$HOME"/apt-archives/*.deb
+        if compgen -G "/var/cache/apt/archives/*.deb" > /dev/null; then
+          cp /var/cache/apt/archives/*.deb "$HOME/apt-archives/"
+        fi
+
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/apt-archives
+        key: ${{ steps.plan.outputs.key }}

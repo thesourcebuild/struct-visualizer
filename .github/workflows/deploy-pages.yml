@@ -25,14 +25,10 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # The compilers only, without recommended extras such as the bare-metal ARM C++ library
-      # (2 GB): the probes are compiled freestanding and never linked.
       - name: Install the compilers the bit-field ground truth checks against
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf \
-            gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-mipsel-linux-gnu gcc-mingw-w64-x86-64-win32 \
-            gcc-mingw-w64-i686-win32 gcc-arm-none-eabi gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
+        uses: ./.github/actions/cross-compilers
+        # A crawling mirror fails the run here, instead of holding it for the 6 h job limit.
+        timeout-minutes: 15
       - run: pnpm typecheck && pnpm lint && pnpm test
         env:
           SP_REQUIRE_COMPILERS: "1"

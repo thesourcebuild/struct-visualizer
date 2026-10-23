@@ -24,14 +24,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # On one Node version: the compilers' answers do not depend on it. See deploy-pages.yml.
+      # On one Node version: the compilers' answers do not depend on it.
       - name: Install the compilers the bit-field ground truth checks against
         if: matrix.node == 22
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf \
-            gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-mipsel-linux-gnu gcc-mingw-w64-x86-64-win32 \
-            gcc-mingw-w64-i686-win32 gcc-arm-none-eabi gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
+        uses: ./.github/actions/cross-compilers
+        # A crawling mirror fails the run here, instead of holding it for the 6 h job limit.
+        timeout-minutes: 15
       - run: pnpm typecheck
       - run: pnpm lint
       # TODO: add `pnpm format:check` after the one-off `pnpm format` commit
