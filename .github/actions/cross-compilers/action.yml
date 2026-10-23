@@ -1,5 +1,5 @@
 name: Cross compilers
-description: Installs the compilers the bit-field ground truth (tests/cross-compiler.test.ts) checks against.
+description: Installs the C and C++ compilers the layout ground truth (tests/cross-compiler.test.ts, tests/cpp-compiler.test.ts) checks against.
 
 # The packages are 457 MB of downloads from Ubuntu's mirror, which some runs serve at under 1 MB/s
 # (a 40 s install became 9 min). The .deb files are cached, so a run downloads only packages that
@@ -11,10 +11,12 @@ runs:
       shell: bash
       run: |
         # The compilers only, without recommended extras such as the bare-metal ARM C++ library
-        # (2 GB): the probes are compiled freestanding and never linked.
-        packages="gcc-i686-linux-gnu gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu \
-          gcc-mipsel-linux-gnu gcc-mingw-w64-x86-64-win32 gcc-mingw-w64-i686-win32 gcc-arm-none-eabi \
-          gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc"
+        # (2 GB): the probes are compiled freestanding and never linked. gcc-arm-none-eabi and
+        # gcc-avr bring their g++ too. Windows is MSVC's, checked on a Windows runner instead.
+        packages="g++ gcc-i686-linux-gnu g++-i686-linux-gnu gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
+          gcc-mipsel-linux-gnu g++-mipsel-linux-gnu gcc-arm-none-eabi gcc-riscv64-unknown-elf \
+          gcc-avr avr-libc sdcc"
         packages=$(echo $packages)
         echo "packages=$packages" >> "$GITHUB_OUTPUT"
         echo "key=cross-compilers-$ImageOS-$ImageVersion-$(echo "$packages" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"

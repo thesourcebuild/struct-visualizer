@@ -140,14 +140,15 @@ const ENUM_ALIGN: OptionDef<LayoutGroup> = {
 const LANGUAGE: OptionDef<LayoutGroup> = {
   id: OPTION_LANGUAGE,
   label: "Language",
-  group: "output",
+  group: "platform",
   kind: "enum",
   choices: [
-    { value: "c", label: "C" },
-    { value: "cpp", label: "C++" },
+    { value: "c", label: "C", summary: "Struct layout as a C compiler does it." },
+    { value: "c++17", label: "C++17", summary: "C++11 to C++17: base classes, virtual functions and virtual bases laid out by the target's C++ ABI (Itanium or MSVC)." },
+    { value: "c++20", label: "C++20", summary: "C++20 and later: as C++17, except that a class whose constructors are all defaulted or deleted lets a derived class reuse its tail padding (Itanium ABI)." },
   ],
-  summary: "Language of the generated verification program.",
-  order: 0,
+  summary: "The language the source is compiled as, and the generated program is written in.",
+  order: -1,
 };
 
 // The same three modes, with the same labels, as the Struct Layout tool.
@@ -164,7 +165,7 @@ const REFERENCE_MODEL: OptionDef<LayoutGroup> = {
 };
 
 const CATALOGUES: Record<string, readonly OptionDef<LayoutGroup>[]> = {
-  [TOOL_STRUCT_LAYOUT]: [TARGET, DATA_MODEL, OS, MODE, PACKING, COMPARE, EXPLAIN, ENUM_SIZE, ENUM_ALIGN],
+  [TOOL_STRUCT_LAYOUT]: [LANGUAGE, TARGET, DATA_MODEL, OS, MODE, PACKING, COMPARE, EXPLAIN, ENUM_SIZE, ENUM_ALIGN],
   [TOOL_VERIFICATION_CODE]: [LANGUAGE, VERIFY_MODE, PACKING, TARGET, DATA_MODEL, OS, ENUM_SIZE, ENUM_ALIGN],
   [TOOL_DATA_MODELS]: [REFERENCE_MODEL],
 };

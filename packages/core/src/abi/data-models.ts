@@ -1,6 +1,6 @@
 // Data Models for struct padding calculator
 // Defines Data Models (LP32, ILP32, LP64, etc), Target Architectures, and OS Types
-import type { Architecture, PackingRules } from '../types';
+import type { Architecture } from '../types';
 
 export type DataModel = 'LP32' | 'ILP32' | 'ILP32LL' | 'ILP32LL64' | 'LP64' | 'LLP64' | 'ILP64' | 'SILP64' | 'XC8' | 'XC16' | 'XC32' | 'C51' | 'SDCC';
 export type TargetArchitecture = 'intel-x86' | 'intel-x64-amd' | 'arm32' | 'arm64' | 'microchip-8bit' | 'microchip-16bit' | 'microchip-32bit' | '8051-8bit' | 'riscv32' | 'riscv64';
@@ -628,11 +628,10 @@ export function getStandardTypeMap(dataModel: DataModel): Record<string, { size:
 export type ResolvedArchitecture = Architecture & {
     pointerSize: number;
     defaultAlignment: number;
-    packingRules: PackingRules;
 };
 
 /**
- * Resolve layout settings (pointer size, alignments, packing rules) from
+ * Resolve layout settings (pointer size, alignments, bit-field and C++ rules) from
  * Data Model + Target + OS. This keeps ABI-oriented defaults in one place.
  */
 export function resolveArchitectureForSelection(
@@ -646,9 +645,6 @@ export function resolveArchitectureForSelection(
 
     let defaultAlignment = baseArchitecture.defaultAlignment ?? pointerSize;
     let maxAlignment = baseArchitecture.maxAlignment;
-    let packingRules: PackingRules = baseArchitecture.packingRules
-        ? { ...baseArchitecture.packingRules }
-        : { structAlignment: 'max', paddingAlignment: true };
     let dataTypes = baseArchitecture.dataTypes ? { ...baseArchitecture.dataTypes } : undefined;
     let preferredAlignment: Record<string, number> | undefined;
 
@@ -656,7 +652,6 @@ export function resolveArchitectureForSelection(
         case 'intel-x86':
             defaultAlignment = 4;
             maxAlignment = 8;
-            packingRules = { structAlignment: 'max', paddingAlignment: true };
             if (osType === 'linux') {
                 // i386 SysV ABI-style defaults: 64-bit scalar types commonly align to 4.
                 const linuxX86Overrides = {
@@ -690,7 +685,6 @@ export function resolveArchitectureForSelection(
         case 'intel-x64-amd':
             defaultAlignment = 8;
             maxAlignment = 16;
-            packingRules = { structAlignment: 'max', paddingAlignment: true };
             if (osType === 'windows') {
                 dataTypes = {
                     ...(dataTypes ?? {}),
@@ -707,34 +701,28 @@ export function resolveArchitectureForSelection(
         case 'riscv32':
             defaultAlignment = 4;
             maxAlignment = 8;
-            packingRules = { structAlignment: 'max', paddingAlignment: true };
             break;
         case 'arm64':
         case 'riscv64':
             defaultAlignment = 8;
             maxAlignment = 16;
-            packingRules = { structAlignment: 'max', paddingAlignment: true };
             break;
         case 'microchip-8bit':
             // AVR (avr-gcc, which XC8 for AVR is built on) aligns every type to 1.
             defaultAlignment = 1;
             maxAlignment = 1;
-            packingRules = { structAlignment: 'default', paddingAlignment: false };
             break;
         case 'microchip-16bit':
             defaultAlignment = 1;
             maxAlignment = 4;
-            packingRules = { structAlignment: 'default', paddingAlignment: false };
             break;
         case 'microchip-32bit':
             defaultAlignment = 4;
             maxAlignment = 8;
-            packingRules = { structAlignment: 'max', paddingAlignment: true };
             break;
         case '8051-8bit':
             defaultAlignment = 1;
             maxAlignment = 1;
-            packingRules = { structAlignment: 'default', paddingAlignment: false };
             break;
         default:
             break;
@@ -746,10 +734,20 @@ export function resolveArchitectureForSelection(
         pointerSize,
         defaultAlignment,
         maxAlignment,
-        packingRules,
         ...(preferredAlignment && { preferredAlignment }),
         ...bitfieldAndEnumRules(dataModel, targetArchitecture, osType),
+        ...cppAbiFor(dataModel, osType),
     };
+}
+
+/**
+ * The C++ ABI of the target's compiler: MSVC's on Windows, the Itanium C++ ABI for GCC (and
+ * Clang) elsewhere, including avr-g++ (XC8 for AVR) and PIC32's GCC (XC32). SDCC, Keil C51 and
+ * XC16 compile C only.
+ */
+function cppAbiFor(dataModel: DataModel, osType: OSType): Pick<ResolvedArchitecture, 'cppAbi'> {
+    if (dataModel === 'SDCC' || dataModel === 'C51' || dataModel === 'XC16') return {};
+    return { cppAbi: osType === 'windows' ? 'msvc' : 'itanium' };
 }
 
 /**
@@ -762,7 +760,7 @@ function bitfieldAndEnumRules(
     targetArchitecture: TargetArchitecture,
     osType: OSType,
 ): Pick<ResolvedArchitecture, 'bitfieldLayout' | 'bitfieldTypeMatters' | 'alignUnnamedBitfields' | 'shortEnums'> {
-    // MSVC, and MinGW with its default -mms-bitfields.
+    // MSVC (MinGW's -mms-bitfields comes close, but differs for unions and alignment requests).
     if (osType === 'windows') return { bitfieldLayout: 'ms' };
     // SDCC also sizes every enum like -fshort-enums.
     if (dataModel === 'SDCC') return { bitfieldLayout: 'sdcc', shortEnums: true };

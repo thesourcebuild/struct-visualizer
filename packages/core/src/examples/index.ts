@@ -1,4 +1,71 @@
 // Examples inlined to avoid Turbopack unknown module types
+import type { SourceLanguage } from '../types';
+
+// C++: the class laid out is the last one, as for C.
+const cppTailPadding = `// Header has a constructor, so it is not "POD for layout": under the
+// Itanium C++ ABI (GCC, Clang) Packet's members go into Header's tail
+// padding. MSVC never reuses it, so Packet is larger on Windows.
+struct Header
+{
+    Header();
+    uint32_t id;
+    uint8_t flags;
+};
+
+struct Packet : Header
+{
+    uint8_t kind;
+    uint16_t length;
+};`;
+
+const cppVirtualFunctions = `// A class with virtual functions starts with a pointer to its virtual
+// function table (vptr). Circle shares Shape's, as its primary base.
+struct Shape
+{
+    virtual ~Shape();
+    virtual double area() const = 0;
+    uint8_t layer;
+};
+
+struct Circle : Shape
+{
+    double area() const override;
+    float radius;
+};`;
+
+const cppDiamond = `// One Node subobject, shared by Left and Right. Each reaches it through
+// the vptr (Itanium) or a virtual base table pointer, vbptr (MSVC).
+struct Node
+{
+    int id;
+};
+
+struct Left : virtual Node
+{
+    char l;
+};
+
+struct Right : virtual Node
+{
+    short r;
+};
+
+struct Diamond : Left, Right
+{
+    char d;
+};`;
+
+const cppEmptyBases = `// Empty base classes take no space (the empty base optimization).
+// MSVC gives the second one a byte unless the class has
+// __declspec(empty_bases).
+struct Tag {};
+struct Allocator {};
+
+struct Vec : Tag, Allocator
+{
+    int *data;
+    unsigned size;
+};`;
 
 const basicStruct = `struct Example
 {
@@ -275,106 +342,100 @@ struct ComplexStruct {
 };`;
 export interface StructExample {
     name: string;
-    code: { c: string; cpp: string };
+    code: string;
+    /** C examples are also valid C++. */
+    language: SourceLanguage;
 }
 
 export const examples: readonly StructExample[] = [
     {
         name: 'Basic Struct',
-        code: {
-            c: basicStruct,
-            cpp: basicStruct,
-        },
+        code: basicStruct,
+        language: 'c',
     },
     {
         name: 'Optimized Struct',
-        code: {
-            c: optimizedStruct,
-            cpp: optimizedStruct,
-        },
+        code: optimizedStruct,
+        language: 'c',
     },
     {
         name: 'Nested Struct',
-        code: {
-            c: nestedStruct,
-            cpp: nestedStruct,
-        },
+        code: nestedStruct,
+        language: 'c',
     },
     {
         name: 'Array Members',
-        code: {
-            c: arrayMembers,
-            cpp: arrayMembers,
-        },
+        code: arrayMembers,
+        language: 'c',
     },
     {
         name: 'Pointer Members',
-        code: {
-            c: pointerMembers,
-            cpp: pointerMembers,
-        },
+        code: pointerMembers,
+        language: 'c',
     },
     {
         name: 'Advanced Pointers (Double + Function)',
-        code: {
-            c: advancedPointers,
-            cpp: advancedPointers,
-        },
+        code: advancedPointers,
+        language: 'c',
     },
     {
         name: 'Enum Members',
-        code: {
-            c: enumMembers,
-            cpp: enumMembers,
-        },
+        code: enumMembers,
+        language: 'c',
     },
     {
         name: 'Typedef Enum Members',
-        code: {
-            c: typedefEnumMembers,
-            cpp: typedefEnumMembers,
-        },
+        code: typedefEnumMembers,
+        language: 'c',
     },
     {
         name: 'Bitfield Complex',
-        code: {
-            c: bitfieldComplex,
-            cpp: bitfieldComplex,
-        },
+        code: bitfieldComplex,
+        language: 'c',
     },
     {
         name: 'Basic Union',
-        code: {
-            c: basicUnion,
-            cpp: basicUnion,
-        },
+        code: basicUnion,
+        language: 'c',
     },
     {
         name: 'Complex Union',
-        code: {
-            c: complexUnion,
-            cpp: complexUnion,
-        },
+        code: complexUnion,
+        language: 'c',
     },
     {
         name: 'Struct with Nested Struct & Union',
-        code: {
-            c: mixedStructUnion,
-            cpp: mixedStructUnion,
-        },
+        code: mixedStructUnion,
+        language: 'c',
     },
     {
         name: 'Advanced Mixed (Struct/Union/Arrays)',
-        code: {
-            c: mixedComplex,
-            cpp: mixedComplex,
-        },
+        code: mixedComplex,
+        language: 'c',
     },
     {
         name: 'Ultra-Complex Nested (Inline Struct/Union)',
-        code: {
-            c: complexNested,
-            cpp: complexNested,
-        },
+        code: complexNested,
+        language: 'c',
+    },
+    {
+        name: 'C++: Inheritance and Tail Padding',
+        code: cppTailPadding,
+        language: 'c++17',
+    },
+    {
+        name: 'C++: Virtual Functions',
+        code: cppVirtualFunctions,
+        language: 'c++17',
+    },
+    {
+        name: 'C++: Virtual Inheritance (Diamond)',
+        code: cppDiamond,
+        language: 'c++17',
+    },
+    {
+        name: 'C++: Empty Bases',
+        code: cppEmptyBases,
+        language: 'c++17',
     },
 ];

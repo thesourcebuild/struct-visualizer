@@ -6,7 +6,7 @@ export const OPTION_GROUP_META: Record<LayoutGroup, OptionGroupMeta> = {
   platform: {
     id: "platform",
     label: "Target platform",
-    summary: "CPU, data model and OS together pick the ABI the layout follows.",
+    summary: "Language, CPU, data model and OS together pick the ABI the layout follows.",
     order: 0,
   },
   layout: {

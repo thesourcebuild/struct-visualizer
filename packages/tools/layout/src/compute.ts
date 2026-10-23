@@ -25,7 +25,7 @@ export interface LayoutData {
 }
 
 export function buildLayoutData(spec: LayoutSpec, input: string): LayoutData {
-  const analysis = analyzeStruct(input, selectionFromSpec(spec), readPacking(spec.options));
+  const analysis = analyzeStruct(input, selectionFromSpec(spec), { packing: readPacking(spec.options), language: readLanguage(spec.options) });
   const mode = readMode(spec.options);
   const { result, packed, optimized, platform } = analysis;
 
@@ -88,29 +88,35 @@ export function computeVerificationCode(spec: LayoutSpec, input: string): ToolRe
   }
 
   const language = readLanguage(spec.options);
+  const cpp = language !== "c";
   const useOptimized = data.mode === "optimized" && optimized;
   // Packed: the very source the Struct Layout tool laid out for this mode, packing written in.
   const usePacked = data.mode === "packed" && data.analysis.packed;
   const { platform } = data.analysis;
+  const target = { architecture: platform.architecture, dataModel: platform.dataModel, language };
   const code = useOptimized
     ? CCodeGenerator.generateVerificationCode(
-        CCodeGenerator.generateOptimizedCode(result.struct, optimized.struct),
-        platform,
+        CCodeGenerator.generateOptimizedProgram(input, result.struct, optimized.struct),
+        target,
         CCodeGenerator.getOptimizedRootName(result.struct, optimized.struct),
-        language,
+        cpp ? "cpp" : "c",
       )
     : CCodeGenerator.generateVerificationCode(
         usePacked ? applyPacking(input, data.analysis.packing) : input,
-        platform,
+        target,
         result.struct.name,
-        language,
+        cpp ? "cpp" : "c",
       );
   const expected = useOptimized ? optimized : usePacked ? data.analysis.packed! : result;
 
-  const ext = language === "cpp" ? "cpp" : "c";
-  const filename = `${result.struct.name}_verify.${ext}`;
-  const compile =
-    language === "cpp" ? `g++ -std=c++17 -o test ${filename}` : `gcc -o test ${filename}`;
+  const filename = `${result.struct.name}_verify.${cpp ? "cpp" : "c"}`;
+  // The target's own compiler: MSVC on Windows, GCC (or Clang) elsewhere.
+  const msvc = platform.architecture.cppAbi === "msvc";
+  const compile = msvc
+    ? `cl /nologo /std:${cpp ? language : "c11"} ${cpp ? "/EHsc " : ""}/Fetest.exe ${filename}`
+    : cpp
+      ? `g++ -std=${language} -o test ${filename}`
+      : `gcc -o test ${filename}`;
 
   return {
     data,
@@ -120,12 +126,12 @@ export function computeVerificationCode(spec: LayoutSpec, input: string): ToolRe
         filename,
         content: code,
         mimeType: "text/x-c",
-        label: language === "cpp" ? "C++ verification program" : "C verification program",
+        label: cpp ? "C++ verification program" : "C verification program",
       },
     ],
     fields: [
       { label: "Compile", value: compile, mono: true },
-      { label: "Run", value: "./test   (test.exe on Windows)", mono: true },
+      { label: "Run", value: msvc ? "test.exe" : "./test", mono: true },
       {
         label: "Expected sizeof",
         value: `${expected.totalSize} bytes on ${data.platformLabel.architecture}`,

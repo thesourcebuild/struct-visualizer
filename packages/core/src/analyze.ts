@@ -1,5 +1,6 @@
-import type { CalculationResult, ParseError, ParsedStruct } from './types';
+import type { CalculationResult, ParseError, ParsedStruct, SourceLanguage } from './types';
 import { StructParser } from './parser/struct-parser';
+import type { ParserTarget } from './parser/struct-parser';
 import { validateSupportedTypes } from './parser/validate-types';
 import { PaddingCalculator } from './layout/padding-calculator';
 import { resolvePlatform } from './abi/resolve-selection';
@@ -9,6 +10,7 @@ import type { PackingSyntax } from './packing';
 
 export interface StructAnalysis {
   platform: ResolvedPlatform;
+  language: SourceLanguage;
   /** Parse + type-validation errors. When non-empty, the layout fields are null. */
   errors: ParseError[];
   warnings: ParseError[];
@@ -36,18 +38,32 @@ export interface StructAnalysis {
  * layout is that of the source with packing written into it in `packing`, so it is exactly what
  * a compiler given that source produces.
  */
-export function analyzeStruct(code: string, selection: PlatformSelection, packing?: PackingSyntax): StructAnalysis {
+export interface AnalyzeOptions {
+  /** The syntax Packed mode writes packing in (the target's compiler may not take every one). */
+  packing?: PackingSyntax;
+  /** C unless given. */
+  language?: SourceLanguage;
+}
+
+export function analyzeStruct(code: string, selection: PlatformSelection, options: AnalyzeOptions = {}): StructAnalysis {
   const platform = resolvePlatform(selection);
-  const syntax = resolvePackingSyntax(platform.os, platform.dataModel, packing);
-  const parser = new StructParser(platform);
+  const language = options.language ?? 'c';
+  const syntax = resolvePackingSyntax(platform.os, platform.dataModel, options.packing);
+  const target = { architecture: platform.architecture, dataModel: platform.dataModel, language };
+  // A target whose compiler has no C++ (SDCC, Keil C51, XC16) has no C++ layout to show.
+  const noCpp: ParseError[] = language !== 'c' && !platform.architecture.cppAbi
+    ? [{ message: `The ${platform.dataModel} compiler for this target compiles C only: choose C, or a target with a C++ compiler.`, type: 'semantic' }]
+    : [];
+  const parser = new StructParser(target);
   const validation = parser.parse(code);
   const typeErrors = validation.isValid
     ? validateSupportedTypes(parser, platform.dataModel, platform.architecture)
     : [];
-  const errors = [...validation.errors, ...typeErrors];
+  const errors = [...noCpp, ...validation.errors, ...typeErrors];
 
   const analysis: StructAnalysis = {
     platform,
+    language,
     errors,
     warnings: validation.warnings,
     definition: null,
@@ -73,18 +89,18 @@ export function analyzeStruct(code: string, selection: PlatformSelection, packin
     (name) => parser.resolveRecord(name),
   );
   analysis.result = calculator.calculate(definition);
-  analysis.packed = packedLayout(applyPacking(code, syntax), platform);
+  analysis.packed = packedLayout(applyPacking(code, syntax), target);
   analysis.optimized = calculator.compareLayouts(definition).optimized;
   analysis.unknownTypes = calculator.getUnknownTypes();
   return analysis;
 }
 
-/** The last definition of already-packed source, laid out on `platform`. */
-function packedLayout(code: string, platform: ResolvedPlatform): CalculationResult | null {
-  const parser = new StructParser(platform);
+/** The last definition of already-packed source, laid out for `target`. */
+function packedLayout(code: string, target: ParserTarget): CalculationResult | null {
+  const parser = new StructParser(target);
   if (!parser.parse(code).isValid) return null;
   const definition = parser.getLastDefinition();
-  return definition ? new PaddingCalculator(platform.architecture, platform.dataModel).calculate(definition) : null;
+  return definition ? new PaddingCalculator(target.architecture, target.dataModel).calculate(definition) : null;
 }
 
 const ANONYMOUS_PREFIX = '__anon_';

@@ -8,12 +8,14 @@ import { INPUT_COPY } from "./default-input";
 interface InputPanelProps {
   value: string;
   onChange: (value: string) => void;
+  /** A sample was picked: its input, and the options it needs. */
+  onSample: (sample: ToolSample) => void;
   samples?: readonly ToolSample[];
   pending: boolean;
   language: InputLanguage;
 }
 
-export function InputPanel({ value, onChange, samples, pending, language }: InputPanelProps) {
+export function InputPanel({ value, onChange, onSample, samples, pending, language }: InputPanelProps) {
   const copy = INPUT_COPY[language];
   return (
     <Panel
@@ -28,7 +30,7 @@ export function InputPanel({ value, onChange, samples, pending, language }: Inpu
               value=""
               onChange={(e) => {
                 const sample = samples.find((s) => s.id === e.target.value);
-                if (sample) onChange(sample.input);
+                if (sample) onSample(sample);
               }}
               className="rounded-md border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
             >

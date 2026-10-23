@@ -1,6 +1,7 @@
 import type { AlignRequest, Architecture, ParsedStruct, StructMember, CalculationResult, ParsedEnum } from '../types';
 import { dataModels, getStandardTypeMap } from '../abi/data-models';
 import type { DataModel } from '../abi/data-models';
+import { CppLayout } from './cpp-layout';
 
 /** The fewest of 1, 2, 4 or 8 bytes whose integer holds every value: unsigned when none is negative. */
 function bytesForValues(values: readonly number[]): number {
@@ -17,20 +18,49 @@ function roundUpBits(bit: number, alignment: number): number {
   return Math.ceil(bit / unit) * unit;
 }
 
-interface MemberInfo {
+export interface MemberInfo {
   size: number;
   alignment: number;
   nested?: CalculationResult;
 }
 
+/** Where the next member goes while a struct's members are placed in order. */
+export interface FieldState {
+  /** Next free bit. */
+  pos: number;
+  /** First bit after the last member placed: `pos` without the rest of an MS storage unit. */
+  end: number;
+  maxAlignment: number;
+  /**
+   * Alignment that neither #pragma pack, packed nor the target cap lowers: aligned/alignas
+   * requests, and what zero-width bit-fields add where the compiler exempts them from packing.
+   */
+  maxExplicitAlignment: number;
+  /** MSVC: the largest required alignment of the members so far (CalculationResult.requiredAlignment). */
+  required: number;
+  /** The open MS storage unit: where it starts, its size in bytes, and the bits used. */
+  unit: { start: number; bytes: number; used: number } | null;
+  members: CalculationResult['members'];
+}
+
+/**
+ * Chooses where a member that is not a bit-field goes, given the byte offset C would choose:
+ * returns the offset used and the byte where the member's data ends.
+ */
+export type FieldPlacement = (member: StructMember, layout: MemberInfo, at: number) => { offset: number; dataEnd: number };
+
 export class PaddingCalculator {
   private architecture: Architecture & {
     pointerSize: number;
     defaultAlignment: number;
-    packingRules: NonNullable<Architecture['packingRules']>;
   };
   private dataModel: DataModel;
   private unknownTypes = new Set<string>();
+
+  /** @internal */
+  get architectureName(): string {
+    return this.architecture.name;
+  }
 
   /** Types that fell back to the 4-byte size/alignment default during any calculation so far. */
   getUnknownTypes(): string[] {
@@ -42,15 +72,7 @@ export class PaddingCalculator {
     const modelPointerSize = dataModels[dataModel]?.dataTypes.pointerSize;
     const pointerSize = architecture.pointerSize ?? modelPointerSize ?? 8;
     const defaultAlignment = architecture.defaultAlignment ?? pointerSize;
-    this.architecture = {
-      ...architecture,
-      pointerSize,
-      defaultAlignment,
-      packingRules: architecture.packingRules ?? {
-        structAlignment: 'max',
-        paddingAlignment: true,
-      },
-    };
+    this.architecture = { ...architecture, pointerSize, defaultAlignment };
   }
 
   /**
@@ -71,7 +93,7 @@ export class PaddingCalculator {
    *   the field's type matters (GCC's PCC_BITFIELD_TYPE_MATTERS, all but AVR here) it moves to the
    *   next boundary of its type's alignment if it would otherwise span more of those units than
    *   its type has; `packed` or any `#pragma pack` lifts that rule.
-   * - 'ms' (MSVC, and MinGW's default -mms-bitfields): a field opens a storage unit of its type's
+   * - 'ms' (MSVC): a field opens a storage unit of its type's
    *   size, aligned like the type, unless the previous member is a bit-field of a type of the same
    *   size whose unit still has room.
    * - 'sdcc': a field goes at the next free bit if it fits in what is left of the current byte,
@@ -81,18 +103,34 @@ export class PaddingCalculator {
    * byte where the next member starts, and the trailing bytes up to the struct's alignment.
    */
   private calculateStruct(struct: ParsedStruct): CalculationResult {
-    const members: CalculationResult['members'] = [];
+    if (struct.cpp && this.architecture.cppAbi) return this.cppLayout.layout(struct);
+    const state = this.startFields(0);
+    for (const member of struct.members) this.placeMember(state, member, struct);
+    return this.finishStruct(struct, state);
+  }
+
+  /** The C++ class layouts, which place members with placeMember too. */
+  private get cppLayout(): CppLayout {
+    this.cpp ??= new CppLayout(this, this.architecture.cppAbi ?? 'itanium', this.architecture.pointerSize, Math.min(this.architecture.pointerSize, this.architecture.maxAlignment ?? this.architecture.defaultAlignment));
+    return this.cpp;
+  }
+  private cpp: CppLayout | undefined;
+
+  /** @internal Fields placed from bit `pos` on, as calculateStruct places them. */
+  startFields(pos: number): FieldState {
+    return { pos, end: pos, maxAlignment: 1, maxExplicitAlignment: 1, required: 0, unit: null, members: [] };
+  }
+
+  /**
+   * @internal Place one member at the end of `state`, by the target compiler's rules. `place`
+   * lets the C++ layouts move a member that is not a bit-field: it gets the byte offset C would
+   * choose, and returns the offset used and where the member's data ends (`state.pos` after it).
+   */
+  placeMember(state: FieldState, member: StructMember, struct: ParsedStruct, place?: FieldPlacement): void {
+    const members = state.members;
     const rules = this.architecture.bitfieldLayout;
-    /** Next free bit. */
-    let pos = 0;
-    /** First bit after the last member placed: `pos` without the rest of an MS storage unit. */
-    let end = 0;
-    let maxAlignment = 1;
-    // Alignment that neither #pragma pack, packed nor the target cap lowers: aligned/alignas
-    // requests, and what zero-width bit-fields add where the compiler exempts them from packing.
-    let maxExplicitAlignment = 1;
-    /** The open MS storage unit: where it starts, its size in bytes, and the bits used. */
-    let unit: { start: number; bytes: number; used: number } | null = null;
+    let { pos, end, maxAlignment, maxExplicitAlignment, unit } = state;
+    const save = () => Object.assign(state, { pos, end, maxAlignment, maxExplicitAlignment, unit });
 
     const closeUnit = () => {
       if (unit) pos = unit.start + unit.bytes * 8;
@@ -100,7 +138,7 @@ export class PaddingCalculator {
     };
     const gapBefore = (bit: number) => Math.max(0, Math.floor(bit / 8) - Math.ceil(end / 8));
 
-    for (const member of struct.members) {
+    {
       if (member.bitField !== undefined) {
         const width = Math.max(0, member.bitField);
         const typeInfo = this.bitfieldTypeInfo(member);
@@ -121,7 +159,7 @@ export class PaddingCalculator {
           if (width === 0) {
             // A zero-width bit-field only counts directly after a bit-field. It closes that unit,
             // moves what follows to its type's alignment unless packed, and raises the struct's
-            // alignment to it even when packed (MSVC; MinGW agrees).
+            // alignment to it even when packed (MSVC).
             const afterBitfield = unit !== null;
             closeUnit();
             if (afterBitfield) {
@@ -176,11 +214,9 @@ export class PaddingCalculator {
             if (typeMatters && !bitPacked && spans > Math.floor((typeInfo.size * 8) / unitBits)) {
               pos = roundUpBits(pos, typeAlign);
             }
-            // What the field adds to the struct's alignment: its type's, capped by #pragma pack, or
-            // 1 when packed; raised by an explicit request. Unnamed fields add nothing unless the
-            // target says so (ARM).
-            alignment = !typeMatters ? 1 : pragma !== undefined ? pragmaAlign : packed ? 1 : typeAlign;
-            if (explicit !== undefined) alignment = Math.max(alignment, explicit);
+            // What the field adds to the struct's alignment (gccBitfieldAlignment). Unnamed fields
+            // add nothing unless the target says so (ARM).
+            alignment = this.gccBitfieldAlignment(member, struct);
             if (member.name || this.architecture.alignUnnamedBitfields) {
               maxAlignment = Math.max(maxAlignment, alignment);
               if (explicit !== undefined) maxExplicitAlignment = Math.max(maxExplicitAlignment, alignment);
@@ -194,24 +230,41 @@ export class PaddingCalculator {
         const size = width === 0 ? 0 : Math.floor((start + width - 1) / 8) - offset + 1;
         members.push({ member, offset, size, padding: gapBefore(start), alignment, bitOffset: start });
         end = Math.max(end, start + width);
-        continue;
+        save();
+        return;
       }
 
       closeUnit();
-      const { size, alignment, nested } = this.memberLayout(member, struct);
+      const layout = this.memberLayout(member, struct);
+      const { size, alignment, nested } = layout;
       maxAlignment = Math.max(maxAlignment, alignment);
-      // A request on the member, or an aligned typedef: neither is capped by the target ABI.
-      if (member.alignAttribute !== undefined || member.typeAlignment !== undefined) {
+      // A request on the member, or an aligned typedef: neither is capped by the target ABI. Under
+      // MSVC, neither is one inside a record it is an object of, wherever that record goes.
+      const required = rules === 'ms' ? this.msRequired(member, nested) : 0;
+      if (member.alignAttribute !== undefined || member.typeAlignment !== undefined || required > 0) {
         maxExplicitAlignment = Math.max(maxExplicitAlignment, alignment);
       }
+      state.required = Math.max(state.required, required);
 
-      const offset = Math.ceil(pos / 8) + this.calculatePadding(Math.ceil(pos / 8), alignment);
-      members.push({ member, offset, size, padding: gapBefore(offset * 8), alignment, nested });
-      pos = (offset + size) * 8;
-      end = pos;
+      const at = Math.ceil(pos / 8) + this.calculatePadding(Math.ceil(pos / 8), alignment);
+      const placed = place ? place(member, layout, at) : { offset: at, dataEnd: at + size };
+      members.push({ member, offset: placed.offset, size, padding: gapBefore(placed.offset * 8), alignment, nested });
+      pos = Math.max(pos, placed.dataEnd * 8);
+      end = Math.max(end, placed.dataEnd * 8);
+      save();
     }
+  }
 
-    closeUnit();
+  /** @internal Close an open MS storage unit: what follows starts after it. */
+  closeFields(state: FieldState): void {
+    if (state.unit) state.pos = state.unit.start + state.unit.bytes * 8;
+    state.unit = null;
+  }
+
+  /** The struct laid out by `state`: its alignment, trailing padding and statistics. */
+  private finishStruct(struct: ParsedStruct, state: FieldState): CalculationResult {
+    this.closeFields(state);
+    const { pos, end, maxAlignment, maxExplicitAlignment, members } = state;
 
     // Trailing padding rounds the size up to the struct's alignment.
     const structAlignment = this.structAlignment(struct, maxAlignment, maxExplicitAlignment);
@@ -236,7 +289,15 @@ export class PaddingCalculator {
       wastedSpace: totalPadding,
       efficiency,
       architecture: this.architecture.name,
+      ...this.requiredAlignmentOf(struct, state.required),
     };
+  }
+
+  /** MSVC: the record's required alignment, from its members and its own request. */
+  private requiredAlignmentOf(struct: ParsedStruct, members: number): Pick<CalculationResult, 'requiredAlignment'> {
+    if (this.architecture.bitfieldLayout !== 'ms') return {};
+    const required = Math.max(members, struct.alignAttribute !== undefined ? this.resolveAlignRequest(struct.alignAttribute) : 0);
+    return required > 0 ? { requiredAlignment: required } : {};
   }
 
   private calculateUnion(struct: ParsedStruct): CalculationResult {
@@ -245,19 +306,31 @@ export class PaddingCalculator {
     let maxSize = 0;
     let maxAlignment = 1;
     let maxExplicitAlignment = 1;
+    let required = 0;
 
+    const ms = this.architecture.bitfieldLayout === 'ms';
+    const gcc = this.architecture.bitfieldLayout === 'gcc' || this.architecture.bitfieldLayout === undefined;
     for (const member of struct.members) {
-      const { size, alignment, nested } = this.memberLayout(member, struct);
+      const layout = this.memberLayout(member, struct);
+      const { nested } = layout;
+      // A GCC bit-field aligns the union as it would a struct (gccBitfieldAlignment).
+      const alignment = gcc && member.bitField !== undefined && member.bitField > 0 ? this.gccBitfieldAlignment(member, struct) : layout.alignment;
+      // MSVC gives a bit-field in a union the whole of its type, and none of its alignment.
+      const msBitfield = ms && member.bitField !== undefined;
+      const size = msBitfield ? (member.bitField! > 0 ? this.bitfieldTypeInfo(member).size : 0) : layout.size;
 
       maxSize = Math.max(maxSize, size);
       // As in a struct, an unnamed bit-field adds no alignment under GCC's rules unless the
-      // target says so; under MSVC's it does.
+      // target says so.
       const unnamedBitfield = member.bitField !== undefined && !member.name;
-      if (!unnamedBitfield || this.architecture.bitfieldLayout === 'ms' || this.architecture.alignUnnamedBitfields) {
+      if (!msBitfield && (!unnamedBitfield || this.architecture.alignUnnamedBitfields)) {
         maxAlignment = Math.max(maxAlignment, alignment);
       }
-      // A request on the member, or an aligned typedef: neither is capped by the target ABI.
-      if (member.alignAttribute !== undefined || member.typeAlignment !== undefined) {
+      // A request on the member, or an aligned typedef: neither is capped by the target ABI; nor,
+      // under MSVC, one inside a record the member is an object of.
+      const memberRequired = ms && !msBitfield ? this.msRequired(member, nested) : 0;
+      required = Math.max(required, memberRequired);
+      if (member.alignAttribute !== undefined || member.typeAlignment !== undefined || memberRequired > 0) {
         maxExplicitAlignment = Math.max(maxExplicitAlignment, alignment);
       }
 
@@ -272,13 +345,16 @@ export class PaddingCalculator {
       });
     }
 
-    let unionAlignment = Math.min(maxAlignment, this.architecture.maxAlignment || maxAlignment);
+    // As for a struct (structAlignment): members are capped already.
+    let unionAlignment = maxAlignment;
     if (struct.pragmaPack !== undefined) unionAlignment = Math.min(unionAlignment, struct.pragmaPack);
     unionAlignment = Math.max(unionAlignment, maxExplicitAlignment);
     if (struct.alignAttribute !== undefined) {
       unionAlignment = Math.max(unionAlignment, this.resolveAlignRequest(struct.alignAttribute));
     }
 
+    // A C++ object is at least one byte.
+    if (struct.cpp && this.architecture.cppAbi && maxSize === 0) maxSize = 1;
     const trailingPadding = this.calculatePadding(maxSize, unionAlignment);
     const totalSize = maxSize + trailingPadding;
 
@@ -295,7 +371,28 @@ export class PaddingCalculator {
       wastedSpace: trailingPadding,
       efficiency: maxSize > 0 ? (maxSize / totalSize) * 100 : 0,
       architecture: this.architecture.name,
+      // A C++ union is the same object wherever it is (it cannot be a base).
+      ...(struct.cpp && this.architecture.cppAbi && { baseSize: totalSize, baseAlignment: unionAlignment }),
+      ...this.requiredAlignmentOf(struct, required),
     };
+  }
+
+  /**
+   * What a non-zero-width bit-field adds to its record's alignment under GCC's rules: its type's
+   * alignment capped by #pragma pack, which `packed` does not lower further; without a pragma, 1
+   * when packed; raised by an explicit request (itself capped by the pragma). Where the type does
+   * not matter (AVR) only the request counts.
+   */
+  private gccBitfieldAlignment(member: StructMember, struct: ParsedStruct): number {
+    const typeAlign = Math.max(1, this.bitfieldTypeInfo(member).alignment);
+    const pragma = struct.pragmaPack;
+    const packed = struct.packed === true || member.packed === true;
+    let alignment = this.architecture.bitfieldTypeMatters === false ? 1 : pragma !== undefined ? Math.min(typeAlign, pragma) : packed ? 1 : typeAlign;
+    if (member.alignAttribute !== undefined) {
+      const requested = this.resolveAlignRequest(member.alignAttribute);
+      alignment = Math.max(alignment, pragma !== undefined ? Math.min(requested, pragma) : requested);
+    }
+    return alignment;
   }
 
   /** Size and natural alignment of a bit-field's declared type, which may be an enum. */
@@ -309,16 +406,35 @@ export class PaddingCalculator {
     // An aligned typedef sets the type's own alignment, smaller or larger, and packing lowers it
     // like any natural alignment.
     const natural = member.typeAlignment !== undefined ? this.resolveAlignRequest(member.typeAlignment) : info.alignment;
-    return { ...info, alignment: this.effectiveAlignment(member, natural, struct) };
+    return { ...info, alignment: this.effectiveAlignment(member, natural, struct, info.nested) };
   }
 
   /**
-   * A member's alignment after packing and alignment requests, in the order GCC and MSVC apply
-   * them (tests/cross-compiler.test.ts): packed, on the member or the struct, makes it 1; an
-   * aligned/alignas request on the member raises it again, since packed never lowers a request;
-   * then `#pragma pack(n)` caps the result at n, requests included.
+   * MSVC's required alignment of a member: what alignas or __declspec(align) asks for on it or its
+   * type, or inside the record it is an object of. 0 when nothing is asked.
    */
-  private effectiveAlignment(member: StructMember, natural: number, struct: ParsedStruct): number {
+  private msRequired(member: StructMember, nested: CalculationResult | undefined): number {
+    return Math.max(
+      member.alignAttribute !== undefined ? this.resolveAlignRequest(member.alignAttribute) : 0,
+      member.typeAlignment !== undefined ? this.resolveAlignRequest(member.typeAlignment) : 0,
+      nested?.requiredAlignment ?? 0,
+    );
+  }
+
+  /**
+   * A member's alignment after packing and alignment requests, in the order each compiler applies
+   * them (tests/cross-compiler.test.ts). GCC: packed, on the member or the struct, makes it 1; an
+   * aligned/alignas request on the member raises it again, since packed never lowers a request;
+   * then `#pragma pack(n)` caps the result at n, requests included. MSVC: `#pragma pack(n)` caps
+   * the natural alignment only; a request (`alignas`, `__declspec(align)`, also on a typedef) is a
+   * required alignment, which nothing lowers.
+   */
+  private effectiveAlignment(member: StructMember, natural: number, struct: ParsedStruct, nested?: CalculationResult): number {
+    if (this.architecture.bitfieldLayout === 'ms') {
+      let alignment = member.typeAlignment === undefined ? this.measureNatural(member) : 1;
+      if (struct.pragmaPack !== undefined) alignment = Math.min(alignment, struct.pragmaPack);
+      return Math.max(1, alignment, this.msRequired(member, nested));
+    }
     let alignment = struct.packed === true || member.packed === true ? 1 : natural;
     if (member.alignAttribute !== undefined) {
       alignment = Math.max(alignment, this.resolveAlignRequest(member.alignAttribute));
@@ -327,8 +443,19 @@ export class PaddingCalculator {
     return Math.max(1, alignment);
   }
 
-  private structAlignment(struct: ParsedStruct, maxMemberAlignment: number, maxExplicit: number): number {
-    let alignment = this.getStructAlignment(maxMemberAlignment);
+  /** The alignment of a member's type before any request: what an aligned typedef replaces. */
+  private measureNatural(member: StructMember): number {
+    return this.getMemberSizeAndAlignment(member).alignment;
+  }
+
+  /**
+   * @internal The alignment of `struct`: its strictest member's (also for the C++ layouts). The
+   * target's largest alignment is not applied again here: it already capped each type, and what
+   * exceeds it is an explicit request, which a nested record or a base keeps (measured with GCC
+   * on ARM32 and AVR in tests/cpp-compiler.test.ts and tests/cross-compiler.test.ts).
+   */
+  structAlignment(struct: ParsedStruct, maxMemberAlignment: number, maxExplicit: number): number {
+    let alignment = maxMemberAlignment;
     // Only #pragma pack caps the struct itself: packed has already set every member's alignment,
     // and under a pragma a GCC bit-field of a packed struct still adds its pragma-capped type's.
     if (struct.pragmaPack !== undefined) alignment = Math.min(alignment, struct.pragmaPack);
@@ -339,7 +466,8 @@ export class PaddingCalculator {
     return alignment;
   }
 
-  private resolveAlignRequest(request: AlignRequest): number {
+  /** @internal */
+  resolveAlignRequest(request: AlignRequest): number {
     if (typeof request === 'number') return request;
     if (request === 'max') return this.architecture.maxAlignment ?? this.architecture.defaultAlignment;
     return request.alignment;
@@ -521,27 +649,6 @@ export class PaddingCalculator {
     return remainder === 0 ? 0 : alignment - remainder;
   }
 
-  private getStructAlignment(maxMemberAlignment: number): number {
-    const { packingRules, maxAlignment } = this.architecture;
-
-    if (typeof packingRules.structAlignment === 'number') {
-      return packingRules.structAlignment;
-    }
-
-    if (packingRules.structAlignment === 'default') {
-      return this.architecture.defaultAlignment;
-    }
-
-    // 'max' alignment - use the maximum member alignment
-    let alignment = maxMemberAlignment;
-
-    // Cap at max alignment if specified
-    if (maxAlignment !== undefined) {
-      alignment = Math.min(alignment, maxAlignment);
-    }
-
-    return alignment;
-  }
 
   /**
    * Reorder members for minimal padding: by alignment, then size, both descending.

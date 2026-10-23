@@ -21,7 +21,8 @@ export const OPTION_PACKING = "packing";
 export const OPTION_REFERENCE_MODEL = "referenceModel";
 
 export type LayoutMode = "natural" | "packed" | "optimized";
-export type CodeLanguage = "c" | "cpp";
+/** The source language: C, or C++ by the standard whose layout rules apply. */
+export type CodeLanguage = "c" | "c++17" | "c++20";
 export type EnumOverride = "default" | "1" | "2" | "4" | "8";
 
 /** Variant tags driving option visibility (OptionDef.availableOn). */
@@ -59,7 +60,8 @@ export function readPacking(options: OptionValues): "attribute" | "pragma" | "ke
 }
 
 export function readLanguage(options: OptionValues): CodeLanguage {
-  return readString(options, OPTION_LANGUAGE, "c") === "cpp" ? "cpp" : "c";
+  const v = readString(options, OPTION_LANGUAGE, "c");
+  return v === "c++17" || v === "c++20" ? v : "c";
 }
 
 export function readEnumOverride(options: OptionValues, id: string): EnumOverride {

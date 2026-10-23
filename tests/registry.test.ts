@@ -44,7 +44,8 @@ describe("registry", () => {
 
       const samples = tool.samples ?? [{ id: "empty", label: "empty", input: "" }];
       for (const sample of samples) {
-        const result = tool.compute(spec, sample.input);
+        // A sample comes with the options it needs (a C++ example selects C++).
+        const result = tool.compute(sample.options ? tool.createSpec({ ...spec.options, ...sample.options }) : spec, sample.input);
         expect(result.error, `${manifest.id}/${sample.id}`).toBeUndefined();
       }
     });

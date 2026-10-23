@@ -101,14 +101,24 @@ export function PaddingProcess({ result, explain }: PaddingProcessProps) {
                     </>
                   ) : (
                     <>
-                  {m.padding > 0 && m.padding !== alignPadding && (
+                  {m.note && (
+                    <p>
+                      {m.padding > 0 && (
+                        <>
+                          <strong>Padding before it:</strong> {m.padding} byte{m.padding > 1 ? "s" : ""}.{" "}
+                        </>
+                      )}
+                      {m.note}
+                    </p>
+                  )}
+                  {!m.note && m.padding > 0 && m.padding !== alignPadding && (
                     <p>
                       <strong>Padding inserted:</strong> {m.padding} byte{m.padding > 1 ? "s" : ""} before this member: the
                       unused rest of the previous bit-fields&apos; storage unit, which MSVC&apos;s rules close before it
                       {alignPadding > 0 && <>, then alignment to a {m.alignment}-byte boundary</>}.
                     </p>
                   )}
-                  {m.padding > 0 && m.padding === alignPadding && (
+                  {!m.note && m.padding > 0 && m.padding === alignPadding && (
                     <div>
                       <p>
                         <strong>Padding inserted:</strong> {m.padding} byte{m.padding > 1 ? "s" : ""} before this member,
@@ -129,15 +139,21 @@ export function PaddingProcess({ result, explain }: PaddingProcessProps) {
                       )}
                     </div>
                   )}
-                  {explain && m.padding === 0 && !result.struct.isUnion && (
+                  {!m.note && explain && m.padding === 0 && !result.struct.isUnion && (
                     <p className="font-mono text-xs text-gray-600 dark:text-gray-400">
                       Already aligned: ({m.alignment} - ({currentOffset} % {m.alignment})) % {m.alignment} = 0
                     </p>
                   )}
                   <p>
                     <strong>Placed at</strong>{" "}
-                    <code className="rounded bg-blue-100 px-2 py-0.5 font-mono dark:bg-blue-900">{hex(m.offset)}</code>, occupying{" "}
-                    {hex(m.offset)}–{hex(m.offset + m.size - 1)}.
+                    <code className="rounded bg-blue-100 px-2 py-0.5 font-mono dark:bg-blue-900">{hex(m.offset)}</code>
+                    {m.size > 0 ? (
+                      <>
+                        , occupying {hex(m.offset)}–{hex(m.offset + m.size - 1)}.
+                      </>
+                    ) : (
+                      <>, taking no space.</>
+                    )}
                   </p>
                     </>
                   )}

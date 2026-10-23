@@ -48,8 +48,8 @@ export function LimitationsGuide() {
                 </p>
                 <ul className={UL}>
                     <li>
-                        Checked against the compilers: GCC for x86, x86-64, ARM, AArch64 Linux, RISC-V, MIPS and AVR; MinGW for Windows (it follows
-                        MSVC&apos;s rules by default); SDCC for the 8051.
+                        Checked against the compilers: GCC for x86, x86-64, ARM, AArch64 Linux, RISC-V, MIPS and AVR; MSVC for Windows (x64 and
+                        x86); SDCC for the 8051.
                     </li>
                     <li>
                         Not checked: XC16, Keil C51 and bare-metal AArch64 use GCC&apos;s rules for their kind of target, and the calculator says so
@@ -78,16 +78,22 @@ export function LimitationsGuide() {
             </section>
 
             <section className={`${CARD} border-green-500`}>
-                <h2 className={H2}>C++ Class Features</h2>
+                <h2 className={H2}>C++ Classes</h2>
                 <p className={P}>
-                    Methods, constructors, static members, access specifiers, nested types and default member initializers are understood: they
-                    take no space and do not change the layout. Not simulated:
+                    With C++17 or C++20 selected, classes are laid out by the target&apos;s C++ ABI: the Itanium C++ ABI (GCC and Clang) everywhere
+                    but Windows, MSVC&apos;s on Windows. Both are checked against g++ and MSVC.
                 </p>
                 <ul className={UL}>
-                    <li>Inheritance, single or multiple, including the empty base optimization (reported as an error)</li>
-                    <li>The hidden vtable pointer of classes with virtual functions (reported as a warning)</li>
-                    <li>Templates, which have no layout until instantiated</li>
-                    <li><code className={CODE}>[[no_unique_address]]</code> members (reported as a warning)</li>
+                    <li>Base classes, single, multiple and virtual; the empty base optimization; the vptr (MSVC&apos;s vfptr), vbptr and vtordisp.</li>
+                    <li>Tail padding: under the Itanium ABI a derived class uses the tail padding of a base that is not POD for layout, by the rules g++ applies (C++20 differs for classes whose constructors are all defaulted or deleted).</li>
+                    <li><code className={CODE}>[[no_unique_address]]</code> (Itanium) and <code className={CODE}>[[msvc::no_unique_address]]</code> (MSVC), <code className={CODE}>__declspec(empty_bases)</code>.</li>
+                    <li>Methods, constructors, static members, access specifiers and nested types take no space; which virtual functions override which is worked out from their signatures.</li>
+                </ul>
+                <p className={`${P} mt-3`}>Not modelled:</p>
+                <ul className={UL}>
+                    <li>Templates, which have no layout until instantiated, and template base classes.</li>
+                    <li>MSVC&apos;s <code className={CODE}>#pragma vtordisp</code> and the <code className={CODE}>/vd</code> options: the default, <code className={CODE}>/vd1</code>, is used.</li>
+                    <li>The 8051 compilers and XC16 compile C only, so they have no C++ layout.</li>
                 </ul>
             </section>
 

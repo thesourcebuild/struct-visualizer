@@ -1,11 +1,10 @@
-import { execFile, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import { beforeAll, describe, expect, it } from "vitest";
 import { analyzeStruct, applyPacking, examples, packingSyntaxesFor } from "@sp/core";
 import type { PackingSyntax, PlatformSelection } from "@sp/core";
+import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compilers";
 
 /**
  * Ground truth on every target: each case (the bit-field, enum and pointer cases below, and every C
@@ -18,61 +17,31 @@ import type { PackingSyntax, PlatformSelection } from "@sp/core";
  * only that field set to all ones: the bits that come out set are the field's. Bits are numbered
  * from the least significant bit of each byte; every target here is little-endian.
  *
- * The compilers are looked up on the PATH, or inside WSL when the tests run on Windows. A target
- * whose compiler is missing is skipped, or fails when SP_REQUIRE_COMPILERS is set (as in CI). On
- * Ubuntu:
+ * The GCC-family compilers and SDCC are looked up on the PATH, or inside WSL when the tests run on
+ * Windows; MSVC is found with vswhere on Windows, and its object files are read directly. A
+ * target whose compiler is missing is skipped, or fails when SP_REQUIRE_COMPILERS is set (as in
+ * CI), except MSVC, which only SP_REQUIRE_MSVC requires. On Ubuntu:
  *   apt install --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf \
- *     gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-mipsel-linux-gnu gcc-mingw-w64-x86-64-win32 \
- *     gcc-mingw-w64-i686-win32 gcc-arm-none-eabi gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
+ *     gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-mipsel-linux-gnu gcc-arm-none-eabi \
+ *     gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
+ * The Windows targets model MSVC and are checked against it, not against MinGW, whose GCC lays
+ * out some bit-field unions and alignment requests under #pragma pack differently.
  */
 const requireCompilers = Boolean(process.env.SP_REQUIRE_COMPILERS);
-
-const run = promisify(execFile);
-
-const viaWsl =
-  process.platform === "win32" &&
-  (() => {
-    try {
-      execFileSync("wsl.exe", ["-e", "true"], { stdio: "ignore", timeout: 60_000 });
-      return true;
-    } catch {
-      return false;
-    }
-  })();
-
-const toWsl = (p: string) => p.replace(/^([A-Za-z]):[\\/]/, (_, d: string) => `/mnt/${d.toLowerCase()}/`).replace(/\\/g, "/");
-
-function hasTool(cmd: string): boolean {
-  if (process.platform === "win32" && !viaWsl) return false;
-  try {
-    const argv = ["-c", `command -v ${cmd}`];
-    if (viaWsl) execFileSync("wsl.exe", ["-e", "sh", ...argv], { stdio: "ignore" });
-    else execFileSync("sh", argv, { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function tool(cmd: string, args: string[], cwd: string): Promise<string> {
-  const { stdout } = viaWsl
-    ? await run("wsl.exe", ["--cd", toWsl(cwd), "-e", cmd, ...args], { maxBuffer: 64 * 1024 * 1024 })
-    : await run(cmd, args, { cwd, maxBuffer: 64 * 1024 * 1024 });
-  return stdout;
-}
+const requireMsvc = Boolean(process.env.SP_REQUIRE_MSVC);
 
 interface Target {
   name: string;
   selection: PlatformSelection;
+  /** A GCC-family driver or `sdcc`, or MSVC for `msvc`'s architecture. */
   cc: string;
   flags: string[];
+  msvc?: "x64" | "x86";
 }
 
 const TARGETS: Target[] = [
   { name: "x86-64 Linux (gcc)", selection: { target: "intel-x64-amd", dataModel: "LP64", os: "linux" }, cc: "gcc", flags: [] },
   { name: "i386 Linux (gcc)", selection: { target: "intel-x86", dataModel: "ILP32", os: "linux" }, cc: "i686-linux-gnu-gcc", flags: [] },
-  { name: "x86-64 Windows (MinGW)", selection: { target: "intel-x64-amd", dataModel: "LLP64", os: "windows" }, cc: "x86_64-w64-mingw32-gcc", flags: [] },
-  { name: "i386 Windows (MinGW)", selection: { target: "intel-x86", dataModel: "ILP32", os: "windows" }, cc: "i686-w64-mingw32-gcc", flags: [] },
   { name: "ARM32 Linux (gcc)", selection: { target: "arm32", dataModel: "ILP32", os: "linux" }, cc: "arm-linux-gnueabihf-gcc", flags: [] },
   { name: "ARM32 bare metal (arm-none-eabi)", selection: { target: "arm32", dataModel: "ILP32", os: "none" }, cc: "arm-none-eabi-gcc", flags: ["-mcpu=cortex-m4", "-mthumb"] },
   { name: "ARM64 Linux (gcc)", selection: { target: "arm64", dataModel: "LP64", os: "linux" }, cc: "aarch64-linux-gnu-gcc", flags: [] },
@@ -83,6 +52,8 @@ const TARGETS: Target[] = [
   { name: "AVR, XC8 model (avr-gcc)", selection: { target: "microchip-8bit", dataModel: "XC8", os: "none" }, cc: "avr-gcc", flags: ["-mmcu=atmega328p"] },
   { name: "PIC32 MIPS, XC32 model (mipsel gcc)", selection: { target: "microchip-32bit", dataModel: "XC32", os: "none" }, cc: "mipsel-linux-gnu-gcc", flags: ["-mno-abicalls", "-fno-pic"] },
   { name: "8051 (SDCC)", selection: { target: "8051-8bit", dataModel: "SDCC", os: "none" }, cc: "sdcc", flags: ["-mmcs51", "--std-c11"] },
+  { name: "x86-64 Windows (MSVC)", selection: { target: "intel-x64-amd", dataModel: "LLP64", os: "windows" }, cc: "cl", flags: ["/std:c11"], msvc: "x64" },
+  { name: "i386 Windows (MSVC)", selection: { target: "intel-x86", dataModel: "ILP32", os: "windows" }, cc: "cl", flags: ["/std:c11"], msvc: "x86" },
 ];
 
 /** Cases name their types S, T and E; each gets a unique suffix in the generated file. */
@@ -171,6 +142,15 @@ const CASES: Record<string, string> = {
   "pragma pack 4, no bit-fields": "#pragma pack(push, 4)\nstruct S { char a; int b; double c; };\n#pragma pack(pop)",
   "pragma pack 2, nested struct": "struct T { char x; int y; };\n#pragma pack(push, 2)\nstruct S { char a; struct T t; double d; };\n#pragma pack(pop)",
   "typedef'd array of pointers": "typedef int *A3[3]; struct S { char c; A3 p; char d; };",
+  // A requested alignment above the target's largest carries over to a struct that contains it.
+  "nested struct aligned beyond the target": "struct A { int a; } __attribute__((aligned(16))); struct S { char c; struct A a; };",
+  "nested _Alignas beyond the target": "struct A { _Alignas(16) char x; }; struct S { char c; struct A a; };",
+  // MSVC's own alignment requests, which #pragma pack does not lower there (GCC rejects __declspec).
+  "declspec align member": "struct S { char a; __declspec(align(8)) char b; char c; };",
+  "declspec align member under pragma pack 1": "#pragma pack(push, 1)\nstruct S { char a; __declspec(align(8)) char b; char c; };\n#pragma pack(pop)",
+  "declspec align typedef under pragma pack 1": "typedef __declspec(align(8)) int a8;\n#pragma pack(push, 1)\nstruct S { char a; a8 b; char c; };\n#pragma pack(pop)",
+  "declspec align struct under pragma pack 2": "#pragma pack(push, 2)\nstruct __declspec(align(8)) S { char a; int b; };\n#pragma pack(pop)",
+  "union of bit-fields under pragma pack 2": "#pragma pack(push, 2)\nunion S { char a; long long b : 40; };\n#pragma pack(pop)",
   "alignas of a struct": "struct T { char c; double d; }; struct S { char a; _Alignas(struct T) char b; char c; };",
   // Constant expressions that need the target's types: each size below differs between targets.
   "sizeof in array sizes":
@@ -193,18 +173,19 @@ const CASES: Record<string, string> = {
     "#define ROUND_UP(x, a) (((x) + (a) - 1) / (a) * (a))\nstruct T { char a; short b; char c; };\nstruct S { char raw[ROUND_UP(sizeof(struct T), 8)]; long tail; };",
   "variadic macro": "#define DECL(type, ...) type __VA_ARGS__;\nstruct S { DECL(char, a, b, c) DECL(int, d) DECL(short, e) };",
   // Every C example: nested structs, unions, arrays, pointers and enums on every target.
-  ...Object.fromEntries(examples.map((e) => [`example: ${e.name}`, e.code.c])),
+  ...Object.fromEntries(examples.filter((e) => e.language === "c").map((e) => [`example: ${e.name}`, e.code])),
 };
 
-/** Named top-level members of the case's last definition: [name, is a bit-field]. */
-function membersOf(code: string): { kind: "struct" | "union"; tag: string; members: [string, boolean][] } {
+/** Named top-level members of the case's last definition: [name, bit-field width or undefined]. */
+function membersOf(code: string): { kind: "struct" | "union"; tag: string; members: [string, number | undefined][] } {
   const def = analyzeStruct(code, TARGETS[0]!.selection).definition!;
   return {
     kind: def.isUnion ? "union" : "struct",
     tag: def.name,
-    members: def.members.filter((m) => m.name).map((m) => [m.name, m.bitField !== undefined]),
+    members: def.members.filter((m) => m.name).map((m) => [m.name, m.bitField]),
   };
 }
+const isBitfield = ([, width]: [string, number | undefined]) => width !== undefined;
 
 /**
  * The translation unit for case i. Each case is compiled on its own, since the examples reuse
@@ -214,7 +195,7 @@ function probeSource(i: number): string {
   const code = source(entries[i]!);
   const { kind, tag, members } = membersOf(code);
   const t = `${kind} ${tag}`;
-  const values = [`sizeof(${t})`, `_Alignof(${t})`, ...members.filter(([, bf]) => !bf).map(([m]) => `offsetof(${t}, ${m})`)];
+  const values = [`sizeof(${t})`, `_Alignof(${t})`, ...members.filter((m) => !isBitfield(m)).map(([m]) => `offsetof(${t}, ${m})`)];
   const out = [
     "#include <stddef.h>",
     "#include <stdint.h>",
@@ -222,7 +203,7 @@ function probeSource(i: number): string {
     "#define HI(v) ((unsigned char)(((v) >> 8) & 0xff))",
     code,
     `const unsigned char sv_${i}[] = { 0xA5, ${values.map((v) => `LO(${v}), HI(${v})`).join(", ")} };`,
-    ...members.filter(([, bf]) => bf).map(([m]) => `const ${t} bi_${i}_${m} = { .${m} = -1 };`),
+    ...members.filter(isBitfield).map(([m]) => `const ${t} bi_${i}_${m} = { .${m} = -1 };`),
   ];
   return `${out.join("\n")}\n`;
 }
@@ -274,10 +255,10 @@ function measured(symbols: Map<string, number[]>, code: string, i: number): Meas
   const sv = symbols.get(`sv_${i}`);
   if (!sv || sv[0] !== 0xa5) throw new Error(`sv_${i} not found in the object file`);
   const word = (k: number) => sv[1 + 2 * k]! | (sv[2 + 2 * k]! << 8);
-  const plain = members.filter(([, bf]) => !bf).map(([m]) => m);
+  const plain = members.filter((m) => !isBitfield(m)).map(([m]) => m);
   const bits: Measured["bits"] = {};
-  for (const [m, bf] of members) {
-    if (!bf) continue;
+  for (const [m, declared] of members) {
+    if (declared === undefined) continue;
     const section = symbols.get(`bi_${i}_${m}`);
     if (!section) throw new Error(`bi_${i}_${m} not found in the object file`);
     // A section may be padded out to its alignment; one shorter than the type was truncated.
@@ -285,17 +266,18 @@ function measured(symbols: Map<string, number[]>, code: string, i: number): Meas
       throw new Unmeasurable(`the compiler emitted ${section.length} bytes for '${m}'s ${word(0)}-byte initializer`);
     }
     const image = section.slice(0, word(0));
-    let first = -1;
-    let width = 0;
+    const set: number[] = [];
     image.forEach((byte, b) => {
-      for (let k = 0; k < 8; k += 1) {
-        if ((byte >> k) & 1) {
-          if (first < 0) first = b * 8 + k;
-          width += 1;
-        }
-      }
+      for (let k = 0; k < 8; k += 1) if ((byte >> k) & 1) set.push(b * 8 + k);
     });
-    bits[m] = [first, width];
+    // The field's bits are the run from the first set bit. A store of fewer than all of them
+    // (MSVC's C compiler converts the value to _Bool when the field shares a _Bool's unit) still
+    // starts the run where the field starts; anything else means the probe misread the object.
+    const first = set[0] ?? -1;
+    if (set.length === 0 || set.length > declared || set.some((bit, k) => bit !== first + k)) {
+      throw new Error(`bi_${i}_${m}: bits ${JSON.stringify(set)} are not a run of at most ${declared} bits`);
+    }
+    bits[m] = [first, declared];
   }
   return {
     size: word(0),
@@ -310,7 +292,7 @@ function measured(symbols: Map<string, number[]>, code: string, i: number): Meas
  * works out in that syntax, exactly as the Struct Layout tool asks for it.
  */
 function modelled(entry: Entry, selection: PlatformSelection): Measured {
-  const analysis = analyzeStruct(entry.code, selection, entry.packing);
+  const analysis = analyzeStruct(entry.code, selection, { packing: entry.packing });
   expect(analysis.errors.map((e) => e.message)).toEqual([]);
   if (entry.packing) expect(analysis.packing).toBe(entry.packing);
   const result = (entry.packing ? analysis.packed : analysis.result)!;
@@ -354,8 +336,9 @@ const appliesTo = (entry: Entry, target: Target) =>
   packingSyntaxesFor(target.selection.os, target.selection.dataModel).includes(entry.packing);
 
 for (const target of TARGETS) {
-  if (!hasTool(target.cc)) {
-    if (requireCompilers) {
+  const installed = target.msvc ? vcvarsall !== null : hasTool(target.cc);
+  if (!installed) {
+    if (target.msvc ? requireMsvc : requireCompilers) {
       it(`${target.cc} is installed for ${target.name}`, () => {
         throw new Error(`${target.cc} not found, and SP_REQUIRE_COMPILERS is set`);
       });
@@ -375,6 +358,17 @@ for (const target of TARGETS) {
       const dir = mkdtempSync(join(tmpdir(), "sp-cc-"));
       const cases = parsable.filter((i) => appliesTo(entries[i]!, target));
       for (const i of cases) writeFileSync(join(dir, `case_${i}.c`), probeSource(i));
+      if (target.msvc) {
+        // One cl run compiles every case; a case it rejects leaves no .obj and its errors in the output.
+        writeFileSync(join(dir, "cases.rsp"), cases.map((i) => `case_${i}.c`).join("\n"));
+        const { output } = await msvc(target.msvc, ["/c", "/w", "/TC", ...target.flags, "@cases.rsp"], dir);
+        for (const i of cases) {
+          const obj = join(dir, `case_${i}.obj`);
+          const errors = output.split(/\r?\n/).filter((l) => l.startsWith(`case_${i}.c(`) && /error/.test(l));
+          results.set(i, existsSync(obj) && errors.length === 0 ? readCoffSymbols(readFileSync(obj)) : errors.join("\n") || output.trim());
+        }
+        return;
+      }
       const quote = (args: string[]) => args.map((a) => `'${a}'`).join(" ");
       // Freestanding: GCC's own <stddef.h> and <stdint.h>, so no target C library is needed.
       const common = ["-std=gnu11", "-ffreestanding", "-w", "-O0", "-c", "-fdata-sections", "-fno-common"];

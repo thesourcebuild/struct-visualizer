@@ -282,13 +282,13 @@ export function PaddingRulesGuide() {
               <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">__attribute__((packed))</code> can override natural alignment.
             </p>
             <p className="text-sm text-orange-800 dark:text-orange-200 mt-2">
-              This tool applies <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">#pragma pack(n)</code> (with push/pop), the packed and aligned attributes, and <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">alignas</code> as GCC and MSVC do: pack caps each member&apos;s alignment at n, and an explicit alignment request is never lowered by packing.
+              This tool applies <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">#pragma pack(n)</code> (with push/pop), the packed and aligned attributes, and <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">alignas</code> as each compiler does. GCC: packed never lowers an alignment request, and <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">#pragma pack(n)</code> caps every alignment at n, requests included. MSVC: <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">#pragma pack(n)</code> caps natural alignments only; <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">alignas</code> and <code className="bg-orange-100 dark:bg-orange-900 px-1 rounded text-xs">__declspec(align(n))</code> are never lowered, also inside a struct used as a member.
             </p>
           </div>
           <div className="bg-purple-50 dark:bg-purple-900/20 p-4 rounded border border-purple-200 dark:border-purple-800">
             <h3 className="font-semibold text-purple-900 dark:text-purple-100 mb-2">C++ Object Model Cases</h3>
             <p className="text-sm text-purple-800 dark:text-purple-200">
-              Inheritance-related optimizations (for example empty base class optimization) can produce layouts that differ from simple C-style formulas.
+              In C++ the C rules apply to the members, and the ABI adds more: base classes come first; a class with virtual functions starts with a vptr unless a base shares one; an empty base takes no space; under the Itanium ABI a derived class may use a base&apos;s tail padding; virtual bases go after everything else. The step-by-step walkthrough says which of these placed each subobject.
             </p>
           </div>
         </div>

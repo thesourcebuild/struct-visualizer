@@ -84,6 +84,8 @@ export interface ToolSample {
   id: string;
   label: string;
   input: string;
+  /** Options the sample needs, applied with its input (a C++ example selects C++). */
+  options?: OptionValues;
 }
 
 export interface ToolResult<TData = unknown> {

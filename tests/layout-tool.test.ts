@@ -219,9 +219,10 @@ describe("verification-code tool", () => {
     expect(result.text).toContain("offsetof(");
   });
 
-  it("emits C++ when asked", () => {
-    const result = verify.compute(verify.createSpec({ language: "cpp" }), PADDED);
+  it("emits C++ when asked, with the compiler's -std", () => {
+    const result = verify.compute(verify.createSpec({ language: "c++20" }), PADDED);
     expect(result.files?.[0]?.filename).toBe("Example_verify.cpp");
     expect(result.text).toContain("#include <iostream>");
+    expect(result.fields?.find((f) => f.label === "Compile")?.value).toContain("-std=c++20");
   });
 });

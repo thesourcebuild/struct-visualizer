@@ -3,7 +3,7 @@ import type { LintContext } from "@sp/engine";
 import { analyzeStruct, bitfieldVerification, getSupportedOSTypes, osTypes } from "@sp/core";
 import type { CalculationResult, StructAnalysis, StructMember } from "@sp/core";
 import type { LayoutData } from "../compute";
-import { OPTION_MODE, OPTION_OS, readPacking, withOption } from "../pure";
+import { OPTION_MODE, OPTION_OS, readLanguage, readPacking, withOption } from "../pure";
 import type { LayoutMode } from "../pure";
 import { selectionFromSpec } from "../resolve";
 import type { LayoutSpec } from "../spec";
@@ -118,7 +118,7 @@ const osDifference: Rule = {
     const out: Diag[] = [];
     for (const os of getSupportedOSTypes(platform.target)) {
       if (os === platform.os || os === "none") continue;
-      const there = layoutFor(analyzeStruct(input, { ...selectionFromSpec(spec), os }, readPacking(spec.options)), data.mode);
+      const there = layoutFor(analyzeStruct(input, { ...selectionFromSpec(spec), os }, { packing: readPacking(spec.options), language: readLanguage(spec.options) }), data.mode);
       if (!there) continue;
       const moved = here.members
         .filter((m, i) => there.members[i]?.offset !== m.offset)

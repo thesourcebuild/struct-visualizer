@@ -106,15 +106,7 @@ function platformInfo(spec: LayoutSpec): ToolResultField[] {
     { label: "Pointer size", value: `${a.pointerSize} bytes`, mono: true },
     { label: "Default alignment", value: `${a.defaultAlignment} bytes`, mono: true },
     { label: "Max alignment", value: `${a.maxAlignment ?? a.defaultAlignment} bytes`, mono: true },
-    {
-      label: "Struct alignment rule",
-      value:
-        typeof a.packingRules.structAlignment === "number"
-          ? `fixed ${a.packingRules.structAlignment}`
-          : a.packingRules.structAlignment === "max"
-            ? "largest member (capped)"
-            : "target default",
-    },
+    { label: "C++ ABI", value: a.cppAbi === "msvc" ? "MSVC" : a.cppAbi === "itanium" ? "Itanium C++ ABI" : "none (C only)" },
     { label: "Enum default", value: `${p.defaultEnumSize} bytes`, mono: true },
   ];
 }
@@ -138,7 +130,7 @@ export function layoutToolDefinition(toolId: string): ToolDefinition<LayoutSpec,
         lintRules: LAYOUT_RULES,
         describe: describeLayout,
         info: platformInfo,
-        samples: layoutSamples("c"),
+        samples: layoutSamples(),
         compute: computeLayout,
         variants: layoutVariants,
         variantTag: variantTags,
@@ -148,7 +140,7 @@ export function layoutToolDefinition(toolId: string): ToolDefinition<LayoutSpec,
         ...base,
         lintRules: VERIFICATION_RULES,
         describe: describeVerification,
-        samples: layoutSamples("c"),
+        samples: layoutSamples(),
         compute: computeVerificationCode,
         variantTag: variantTags,
       };

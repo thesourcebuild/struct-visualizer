@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { AnyToolDefinition, ToolManifest, ToolSpecBase } from "@sp/engine";
+import type { AnyToolDefinition, ToolManifest, ToolSample, ToolSpecBase } from "@sp/engine";
 import type { OptionValue, OptionValues } from "@sp/contracts";
 import { platform } from "@sp/platform";
 import { Button, Panel } from "@sp/ui";
@@ -78,6 +78,14 @@ export function ToolWorkbench({
     [tool],
   );
 
+  const loadSample = useCallback(
+    (sample: ToolSample) => {
+      onInputChange(sample.input);
+      if (sample.options) applyOptions(sample.options);
+    },
+    [onInputChange, applyOptions],
+  );
+
   const applyFix = useCallback(
     (apply: (s: ToolSpecBase) => ToolSpecBase) => {
       // Re-normalise through createSpec so fixes can't leave an invalid combination.
@@ -144,6 +152,7 @@ export function ToolWorkbench({
             <InputPanel
               value={input}
               onChange={onInputChange}
+              onSample={loadSample}
               samples={tool.samples}
               pending={compute.status === "pending"}
               language={manifest.inputLanguage ?? "c"}

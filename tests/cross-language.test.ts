@@ -7,7 +7,7 @@ import { analyzeGo, analyzeRust, analyzeStruct, examples, goExamples, rustExampl
  * GCC): Go keeps declaration order like C, and Rust's repr(C) is C's layout.
  */
 const LP64 = { target: "intel-x64-amd", dataModel: "LP64", os: "linux" } as const;
-const cByName = new Map(examples.map((e) => [e.name, e.code.c]));
+const cByName = new Map(examples.map((e) => [e.name, e.code]));
 
 /** Go ports that replace a C feature Go lacks are not the same layout. */
 const NOT_EQUIVALENT = new Set(["Bit Flags (instead of bit-fields)"]);
@@ -28,7 +28,7 @@ describe("C examples ported to Go and Rust", () => {
       "Typedef Enum Members",
     ]);
     // Every C example except bit-fields, which have a separate flags example.
-    expect(rustPorts.length).toBe(examples.length - 1);
+    expect(rustPorts.length).toBe(examples.filter((e) => e.language === "c").length - 1);
   });
 
   for (const port of goPorts) {

@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { CCodeGenerator, StructParser, analyzeStruct, resolvePlatform } from "@sp/core";
-import type { PlatformSelection } from "@sp/core";
+import type { PlatformSelection, SourceLanguage } from "@sp/core";
 
 // Expected values are what GCC produces for x86-64 Linux (System V, LP64) unless noted.
 const X64: PlatformSelection = { target: "intel-x64-amd", dataModel: "LP64", os: "linux" };
 
-function layout(code: string, platform: PlatformSelection = X64) {
-  const a = analyzeStruct(code, platform);
+function layout(code: string, platform: PlatformSelection = X64, language: SourceLanguage = "c") {
+  const a = analyzeStruct(code, platform, { language });
   return {
     errors: a.errors.map((e) => e.message),
     warnings: a.warnings.map((w) => w.message),
@@ -178,8 +178,11 @@ describe("preprocessor", () => {
   });
 });
 
-describe("C++ members", () => {
-  it("skips methods, statics, access labels and nested types; warns about virtual", () => {
+describe("C++ classes", () => {
+  // Layouts are checked against g++ and MSVC in tests/cpp-compiler.test.ts; these check parsing.
+  const cpp = (code: string, platform: PlatformSelection = X64) => layout(code, platform, "c++17");
+
+  it("takes no space for methods, statics, access labels and nested types, and adds the vptr", () => {
     const code = `struct S {
 public:
   S();
@@ -192,10 +195,42 @@ private:
   int a = 0;
   char b{};
 };`;
-    const r = layout(code);
+    const r = cpp(code);
     expect(r.errors).toEqual([]);
-    expect(r.offsets).toEqual({ a: 0, b: 4 });
-    expect(r.warnings[0]).toMatch(/vtable pointer is not included/);
+    expect(r.analysis.result!.members.map((m) => [m.member.role ?? m.member.name, m.offset])).toEqual([["vptr", 0], ["a", 8], ["b", 12]]);
+    expect(r.size).toBe(16);
+  });
+
+  it("lays out base classes before the members", () => {
+    const r = cpp("struct A { int a; char c; A(); }; struct B { short b; }; struct S : public A, private B { char s; };");
+    expect(r.errors).toEqual([]);
+    expect(r.analysis.result!.members.map((m) => [m.member.role ? `${m.member.role} ${m.member.name}` : m.member.name, m.offset])).toEqual([
+      ["base A", 0],
+      ["base B", 6],
+      ["s", 8],
+    ]);
+    expect(r.analysis.definition!.cpp!.bases.map((b) => b.access)).toEqual(["public", "private"]);
+  });
+
+  it("finds overrides by signature, ignoring parameter names, typedefs and top-level const", () => {
+    const r = cpp("typedef int I; struct A { virtual void f(const I x, char *p); }; struct S : A { void f(int y, char *q); int s; };");
+    expect(r.errors).toEqual([]);
+    // S overrides A::f, so it adds no vptr of its own and shares A's.
+    expect(r.analysis.result!.members.map((m) => [m.member.role ? `${m.member.role} ${m.member.name}` : m.member.name, m.offset])).toEqual([
+      ["base A", 0],
+      ["s", 8],
+    ]);
+  });
+
+  it("reports C++ in C source, and a base class that is not defined yet", () => {
+    expect(layout("struct A { int a; }; struct S : A { int b; };").errors[0]).toMatch(/A base class list is C\+\+, not C: choose C\+\+/);
+    expect(layout("struct S { int f(); int a; };").errors[0]).toMatch(/The member function 'f' is C\+\+, not C/);
+    expect(layout("struct T { int x; }; struct S { T t; };").errors[0]).toMatch(/'T' is not a type name in C: write 'struct T'/);
+    expect(cpp("struct S : B { int b; };").errors[0]).toMatch(/Base class 'B' of 'struct S' has no definition before it/);
+  });
+
+  it("has no C++ on targets whose compiler is C only", () => {
+    expect(cpp("struct S { int a; };", { target: "8051-8bit", dataModel: "SDCC", os: "none" }).errors[0]).toMatch(/compiles C only/);
   });
 });
 

@@ -11,7 +11,7 @@ export { analyzeStruct } from './analyze';
 export { applyPacking, packingSyntaxes, packingSyntaxesFor, resolvePackingSyntax } from './packing';
 export type { PackingSyntax, PackingSyntaxInfo } from './packing';
 export { memberDeclarator, memberLabel, memberTypeLabel } from './display';
-export type { StructAnalysis } from './analyze';
+export type { AnalyzeOptions, StructAnalysis } from './analyze';
 export { examples } from './examples';
 export type { StructExample } from './examples';
 export * from './go';

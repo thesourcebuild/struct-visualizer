@@ -46,8 +46,81 @@ export interface StructMember {
    * size apart from data pointers: 2 bytes on SDCC's 8051 against 3 for a generic data pointer.
    */
   functionPointer?: boolean;
+  /** A C++ reference member: laid out as a pointer. */
+  reference?: boolean;
+  /** A C++ member that is not public. */
+  access?: 'private' | 'protected';
+  /**
+   * The declaration as written, as tokens: its specifiers and its own declarator (with bit-field
+   * width, attributes and initializer), so it can be written out again in another order.
+   * `inlineType` when the specifiers define the member's record type in place.
+   */
+  source?: { spec: string[]; declarator: string[]; inlineType?: boolean };
+  /**
+   * C++ `[[no_unique_address]]` (honoured by the Itanium ABI) or `[[msvc::no_unique_address]]`
+   * (honoured by MSVC): the member may share its address with other members.
+   */
+  noUniqueAddress?: 'std' | 'msvc';
+  /**
+   * Set on what a C++ layout adds besides the declared members: a base class subobject, the
+   * pointer to the virtual function table (vptr, MSVC's vfptr), MSVC's pointer to the virtual
+   * base table (vbptr), and MSVC's vtordisp before a virtual base.
+   */
+  role?: 'base' | 'virtual-base' | 'vptr' | 'vbptr' | 'vtordisp';
   /** 1-based source line of the declaration. */
   line?: number;
+}
+
+/** The C++ facts about a class that decide its layout, besides its members. */
+export interface CppClass {
+  key: 'struct' | 'class' | 'union';
+  /** The standard it was parsed as: what counts as an aggregate differs (userDeclaredConstructor). */
+  standard: 'c++17' | 'c++20';
+  bases: CppBase[];
+  /** The member functions it declares, to work out which are virtual and what they override. */
+  methods: CppMethod[];
+  /** `__declspec(empty_bases)` (MSVC): empty bases get the optimization the Itanium ABI gives them. */
+  emptyBases?: boolean;
+  /**
+   * What makes a class not "POD for the purpose of layout" in the Itanium ABI, and so lets a
+   * derived class reuse its tail padding. Measured with g++ (tests/cpp-compiler.test.ts).
+   */
+  userProvidedConstructor: boolean;
+  /** Including `= default` and `= delete`: C++20 makes such a class a non-aggregate. */
+  userDeclaredConstructor: boolean;
+  explicitConstructor: boolean;
+  userProvidedDestructor: boolean;
+  userDeclaredDestructor: boolean;
+  userProvidedCopyAssignment: boolean;
+  nonPublicData: boolean;
+  defaultMemberInitializer: boolean;
+  referenceMember: boolean;
+}
+
+/**
+ * The language the source is compiled as. C++17 stands for C++11 to C++17 and C++20 for C++20
+ * and later: g++ lays out classes alike within each (tests/cpp-compiler.test.ts), and differently
+ * across them for a class whose only constructors are defaulted or deleted.
+ */
+export type SourceLanguage = 'c' | 'c++17' | 'c++20';
+
+export interface CppBase {
+  def: ParsedStruct;
+  virtual: boolean;
+  /** As written, or the default: private for a class, public for a struct. */
+  access: 'public' | 'protected' | 'private';
+  line?: number;
+}
+
+export interface CppMethod {
+  /** As declared: `f`, `~S`, `operator=`. */
+  name: string;
+  /** The parameter types and the method's own qualifiers, normalized: `(int,char*) const`. */
+  signature: string;
+  /** Declared `virtual`, `override` or `final`; one that overrides a base's is virtual too. */
+  declaredVirtual: boolean;
+  pure: boolean;
+  destructor: boolean;
 }
 
 export interface ParsedStruct {
@@ -72,6 +145,18 @@ export interface ParsedStruct {
    * code must write `Name`, not `struct Name`.
    */
   nameIsTypedef?: boolean;
+  /** Set for every class, struct and union parsed as C++. */
+  cpp?: CppClass;
+  /**
+   * The definition as written, as tokens: everything before its body (keyword, attributes, tag,
+   * base classes) and the attributes after it.
+   */
+  source?: { head: string[]; tail: string[] };
+  /**
+   * What the body declares besides data members, as written: member functions, constructors,
+   * nested types, typedefs, static members, static assertions. With the access in effect (C++).
+   */
+  declarations?: Array<{ tokens: string[]; access?: 'public' | 'protected' | 'private' }>;
 }
 
 export interface EnumMember {
@@ -97,11 +182,11 @@ export interface Architecture {
   dataTypes?: Record<string, DataType>;
   pointerSize?: number;
   defaultAlignment?: number;
+  /** The largest alignment a type gets on its own; alignment requests may exceed it. */
   maxAlignment?: number;
-  packingRules?: PackingRules;
   /**
    * How the target's compiler allocates bit-fields: 'gcc' bit by bit (GCC and Clang outside
-   * Windows), 'ms' in storage units of each field's type (MSVC, and MinGW by default), 'sdcc'
+   * Windows), 'ms' in storage units of each field's type (MSVC), 'sdcc'
    * bit by bit but never splitting a field that would fit in a byte. See
    * PaddingCalculator.calculateStruct.
    */
@@ -121,15 +206,11 @@ export interface Architecture {
    * Measured in tests/cross-compiler.test.ts.
    */
   preferredAlignment?: Record<string, number>;
-}
-
-export interface PackingRules {
-  structAlignment: 'max' | 'default' | number;
-  paddingAlignment: boolean;
-  bitfieldRules?: {
-    crossBoundary: boolean;
-    unnamedPadding: boolean;
-  };
+  /**
+   * How C++ classes are laid out: the Itanium C++ ABI (GCC and Clang everywhere but Windows) or
+   * MSVC's. Unset where the target's compiler has no C++ (SDCC, Keil C51, XC16).
+   */
+  cppAbi?: 'itanium' | 'msvc';
 }
 
 export interface Compiler {
@@ -159,12 +240,30 @@ export interface CalculationResult {
     alignment: number;
     /** Layout of a nested struct/union/enum member, computed by the same language engine. */
     nested?: CalculationResult;
+    /**
+     * Why it is where it is, when C's rule (the next offset its alignment allows) does not say:
+     * C++ base subobjects, vptrs, tail padding reuse, the empty base optimization.
+     */
+    note?: string;
   }>;
   totalSize: number;
   totalPadding: number;
   wastedSpace: number;
   efficiency: number;
   architecture: string;
+  /**
+   * C++: the size of the class as a base subobject, without its virtual bases (nvsize). Under the
+   * Itanium ABI it excludes the tail padding a derived class may reuse, unless the class is POD
+   * for layout; under MSVC an empty class has 0.
+   */
+  baseSize?: number;
+  /** C++: the alignment of the class as a base subobject, without its virtual bases. */
+  baseAlignment?: number;
+  /**
+   * MSVC: the alignment requested in the record (alignas or __declspec(align) on it or any of its
+   * members, at any depth), which #pragma pack does not lower wherever the record is used.
+   */
+  requiredAlignment?: number;
 }
 
 export interface ParseError {

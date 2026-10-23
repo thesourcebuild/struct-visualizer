@@ -2,7 +2,9 @@ import type {
   AlignRequest,
   Architecture,
   CalculationResult,
+  CppBase,
   EnumMember,
+  SourceLanguage,
   ParseError,
   ParsedEnum,
   ParsedStruct,
@@ -35,6 +37,8 @@ import type { Token } from './tokens';
 export interface ParserTarget {
   architecture: Architecture;
   dataModel: DataModel;
+  /** C unless given. C++ constructs are an error in C, as they are for a C compiler. */
+  language?: SourceLanguage;
 }
 
 /** The <stddef.h>, <stdint.h> and <stdbool.h> typedef names, which are built in like the headers. */
@@ -50,6 +54,8 @@ const QUALIFIERS = new Set([
   'auto', 'inline', '__inline', '__inline__', 'explicit', 'extern', 'thread_local', '_Thread_local',
   '__thread', '__extension__', '_Noreturn',
 ]);
+/** Specifiers C does not have. */
+const CPP_ONLY_SPECIFIERS = new Set(['virtual', 'friend', 'explicit', 'mutable', 'consteval', 'constinit', 'typename', 'class']);
 /** The qualifiers a type-name (in sizeof, a cast) may start with. */
 const TYPE_NAME_QUALIFIERS = new Set(['const', 'volatile', 'restrict', '__restrict', '__restrict__', '_Atomic']);
 const BUILTIN_WORDS = new Set([
@@ -62,14 +68,17 @@ const KEYWORDS = new Set([
   'using', 'template', 'typename', 'operator', 'namespace', 'sizeof', 'alignas', '_Alignas',
   '__attribute__', '__attribute', '__declspec', '__packed', 'static_assert', '_Static_assert',
 ]);
-/** GNU attributes that change layout but are not modelled; anything else has no layout effect. */
 /** Keywords that start an attribute or alignment specifier (`[[...]]` is handled separately). */
 const ATTRIBUTE_KEYWORDS: readonly string[] = ['__attribute__', '__attribute', '__declspec', 'alignas', '_Alignas', '__packed'];
+/** GNU attributes that change layout but are not modelled; anything else has no layout effect. */
 const UNMODELLED_LAYOUT_ATTRIBUTES = new Set(['mode', 'vector_size', 'ms_struct', 'gcc_struct', 'scalar_storage_order', 'designated_init']);
 
 interface Attributes {
   packed?: boolean;
   aligned?: AlignRequest;
+  noUniqueAddress?: 'std' | 'msvc';
+  /** `__declspec(empty_bases)`. */
+  emptyBases?: boolean;
 }
 
 type RecordKeyword = 'struct' | 'union';
@@ -87,13 +96,21 @@ interface Specifiers {
   isStatic: boolean;
   isVirtual: boolean;
   isFriend: boolean;
+  isExplicit: boolean;
+  /** `const` or `volatile` among the specifiers. */
+  cv: string[];
   attrs: Attributes;
   line: number;
   /** The specifiers as written, for display (e.g. "const char"). */
   written: string;
 }
 
-type Derivation = { kind: 'ptr' } | { kind: 'array'; size: number | null } | { kind: 'func'; params: string };
+type Derivation =
+  /** A pointer, or a C++ reference (`&`, `&&`); `cv` are the qualifiers written after it. */
+  | { kind: 'ptr'; ref?: '&' | '&&'; cv?: string[] }
+  | { kind: 'array'; size: number | null }
+  /** `quals`: what follows the parameters: const, volatile, &, &&, override, final, noexcept. */
+  | { kind: 'func'; params: string; paramTokens: Token[]; quals: string[] };
 
 interface Declarator {
   name?: string;
@@ -133,6 +150,10 @@ export class StructParser {
   private enumAliases: Map<string, string> = new Map();
   private structAliases: Map<string, string> = new Map();
   private typeAliases: Map<string, TypeInfo> = new Map();
+  /** Every name declared by a typedef, including `typedef struct S S;`. */
+  private typedefNames: Set<string> = new Set();
+  /** What each typedef stands for, spelled as spellType spells types, to compare signatures. */
+  private typedefSpellings: Map<string, string> = new Map();
   /** Alignment set by an aligned typedef of a struct, union or enum, by alias name. */
   private aliasAlignments: Map<string, AlignRequest> = new Map();
   private enumConstants: Map<string, number> = new Map();
@@ -159,6 +180,8 @@ export class StructParser {
     this.enumAliases.clear();
     this.structAliases.clear();
     this.typeAliases.clear();
+    this.typedefNames.clear();
+    this.typedefSpellings.clear();
     this.aliasAlignments.clear();
     this.enumConstants.clear();
     this.definitionOrder = [];
@@ -216,6 +239,24 @@ export class StructParser {
   private fail(message: string, line = this.currentLine()): never {
     this.errors.push({ message, line, type: 'syntax' });
     throw new Recover();
+  }
+
+  /** The tokens from..to (exclusive) as written, macros expanded. */
+  private spell(from: number, to: number): string[] {
+    return this.tokens.slice(from, to).map((t) => t.value);
+  }
+
+  private get language(): SourceLanguage {
+    return this.target.language ?? 'c';
+  }
+
+  private get isCpp(): boolean {
+    return this.language !== 'c';
+  }
+
+  /** A C++ construct in C source is an error, as it is for a C compiler. */
+  private requireCpp(what: string, line = this.currentLine()): void {
+    if (!this.isCpp) this.fail(`${what} is C++, not C: choose C++ as the language to lay this out.`, line);
   }
 
   private expectPunct(value: string, context: string): void {
@@ -286,11 +327,13 @@ export class StructParser {
     }
     if (t.kind === 'id' && t.value === 'extern' && this.peek(1)?.kind === 'str') {
       // extern "C" { ... } or extern "C" decl: parse the contents as top level.
+      this.requireCpp(`extern ${this.peek(1)!.value}`, t.line);
       this.pos += 2;
       if (this.isPunct('{')) this.pos += 1;
       return;
     }
     if (t.kind === 'id' && t.value === 'namespace') {
+      this.requireCpp('A namespace', t.line);
       this.pos += 1;
       while (this.peek()?.kind === 'id' || this.isPunct('::')) this.pos += 1;
       if (this.isPunct('{')) this.pos += 1;
@@ -301,6 +344,7 @@ export class StructParser {
       return;
     }
     if (t.kind === 'id' && (t.value === 'using' || t.value === 'template')) {
+      this.requireCpp(`'${t.value}'`, t.line);
       if (t.value === 'template') {
         this.warnings.push({ message: 'Templates are not laid out: a template has no layout until it is instantiated.', line: t.line, type: 'warning' });
       }
@@ -444,6 +488,8 @@ export class StructParser {
   private registerTypedef(spec: Specifiers, decl: Declarator): void {
     const name = decl.name!;
     const base = spec.base!;
+    this.typedefNames.add(name);
+    this.typedefSpellings.set(name, this.spellType(spec, decl.derivations, false));
     // `typedef int a8 __attribute__((aligned(8)));` gives the new type its own alignment.
     const aligned = decl.attrs.aligned ?? spec.attrs.aligned;
     if (decl.derivations.length === 0 && base.kind === 'record') {
@@ -476,6 +522,8 @@ export class StructParser {
       isStatic: false,
       isVirtual: false,
       isFriend: false,
+      isExplicit: false,
+      cv: [],
       attrs: {},
       line: this.currentLine(),
       written: '',
@@ -501,8 +549,13 @@ export class StructParser {
         this.parseAttribute(spec.attrs);
         continue;
       }
+      if (CPP_ONLY_SPECIFIERS.has(v)) this.requireCpp(`'${v}'`, t.line);
       if (QUALIFIERS.has(v)) {
-        if (v === 'const' || v === 'volatile') written.push(v);
+        if (v === 'const' || v === 'volatile') {
+          written.push(v);
+          spec.cv.push(v);
+        }
+        if (v === 'explicit') spec.isExplicit = true;
         this.pos += 1;
         continue;
       }
@@ -542,6 +595,7 @@ export class StructParser {
         let name = v;
         this.pos += 1;
         while (this.isPunct('::') && this.peek(1)?.kind === 'id') {
+          this.requireCpp(`The qualified name '${name}::${this.peek(1)!.value}'`);
           name = this.peek(1)!.value;
           this.pos += 2;
         }
@@ -561,6 +615,7 @@ export class StructParser {
 
   private parseRecordSpecifier(ownerName: string | null, topLevel: boolean): Extract<BaseSpec, { kind: 'record' }> {
     const kwToken = this.peek()!;
+    const kwIndex = this.pos;
     const keyword: RecordKeyword = kwToken.value === 'union' ? 'union' : 'struct';
     this.pos += 1;
     const attrs: Attributes = {};
@@ -571,17 +626,20 @@ export class StructParser {
       tag = this.peek()!.value;
       this.pos += 1;
       while (this.isPunct('::') && this.peek(1)?.kind === 'id') {
+        this.requireCpp(`The qualified name '${tag}::${this.peek(1)!.value}'`);
         tag = this.peek(1)!.value;
         this.pos += 2;
       }
     }
     this.parseAttributes(attrs);
-    if (this.isId('final')) this.pos += 1;
-
-    if (this.isPunct(':') && tag) {
-      this.fail(`Inheritance is not modelled: '${keyword} ${tag}' has base classes.`);
+    if (this.isId('final') && (this.isPunct(':', 1) || this.isPunct('{', 1))) {
+      this.requireCpp("'final'");
+      this.pos += 1;
     }
+
+    const bases = this.isPunct(':') ? this.parseBaseClause(keyword, tag, kwToken.value === 'class') : [];
     if (!this.isPunct('{')) {
+      if (bases.length > 0) this.fail(`Expected the body of '${keyword} ${tag ?? ''}' after its base classes.`);
       return { kind: 'record', keyword, tag };
     }
 
@@ -596,6 +654,24 @@ export class StructParser {
     const def: ParsedStruct = { name, members: [], line: kwToken.line };
     if (keyword === 'union') def.isUnion = true;
     if (pragmaPack !== undefined) def.pragmaPack = pragmaPack;
+    if (this.isCpp) {
+      def.cpp = {
+        key: kwToken.value === 'class' ? 'class' : keyword,
+        standard: this.language === 'c++20' ? 'c++20' : 'c++17',
+        bases,
+        methods: [],
+        ...(attrs.emptyBases && { emptyBases: true }),
+        userProvidedConstructor: false,
+        userDeclaredConstructor: false,
+        explicitConstructor: false,
+        userProvidedDestructor: false,
+        userDeclaredDestructor: false,
+        userProvidedCopyAssignment: false,
+        nonPublicData: false,
+        defaultMemberInitializer: false,
+        referenceMember: false,
+      };
+    }
 
     this.pos = open + 1;
     def.members = this.parseBody(close, def.name || `${keyword} (anonymous)`, def);
@@ -604,12 +680,51 @@ export class StructParser {
     this.parseAttributes(attrs);
     if (attrs.packed) def.packed = true;
     if (attrs.aligned !== undefined) def.alignAttribute = attrs.aligned;
+    def.source = { head: this.spell(kwIndex, open), tail: this.spell(close + 1, this.pos) };
 
     // Tagged definitions are visible by tag immediately; anonymous top-level ones are named by
     // their typedef in finishTopLevelRecord.
     if (tag) this.registerRecord(def, false);
     else if (!topLevel) this.registerRecord(def, false);
     return { kind: 'record', keyword, tag, def };
+  }
+
+  /** `: public A, virtual B, ...`: each base must be a class defined before this point. */
+  private parseBaseClause(keyword: RecordKeyword, tag: string | undefined, isClass: boolean): CppBase[] {
+    const what = `${keyword} ${tag ?? '(anonymous)'}`;
+    this.requireCpp('A base class list');
+    if (keyword === 'union') this.fail(`'${what}' is a union, which cannot have base classes.`);
+    this.pos += 1;
+    const bases: CppBase[] = [];
+    for (;;) {
+      const line = this.currentLine();
+      let isVirtual = false;
+      let access: CppBase['access'] = isClass ? 'private' : 'public';
+      for (;;) {
+        const v = this.peek()?.value;
+        if (v === 'virtual') isVirtual = true;
+        else if (v === 'public' || v === 'protected' || v === 'private') access = v;
+        else break;
+        this.pos += 1;
+      }
+      this.parseAttributes({});
+      if (this.isPunct('::')) this.pos += 1;
+      let name = this.peek()?.kind === 'id' ? this.peek()!.value : this.fail(`Expected a base class name in '${what}'.`);
+      this.pos += 1;
+      while (this.isPunct('::') && this.peek(1)?.kind === 'id') {
+        name = this.peek(1)!.value;
+        this.pos += 2;
+      }
+      if (this.isPunct('<')) this.fail(`Base class '${name}<...>' of '${what}' is a template, which is not supported.`, line);
+      const def = this.resolveStructTypeByName(name);
+      if (!def) this.fail(`Base class '${name}' of '${what}' has no definition before it.`, line);
+      if (def!.isUnion) this.fail(`Base class '${name}' of '${what}' is a union, which cannot be a base class.`, line);
+      if (bases.some((b) => b.def === def)) this.fail(`'${name}' is a direct base of '${what}' more than once.`, line);
+      bases.push({ def: def!, virtual: isVirtual, access, line });
+      if (!this.isPunct(',')) break;
+      this.pos += 1;
+    }
+    return bases;
   }
 
   private registerRecord(def: ParsedStruct, ordered: boolean): void {
@@ -628,7 +743,10 @@ export class StructParser {
   private parseEnumSpecifier(ownerName: string | null): Extract<BaseSpec, { kind: 'enum' }> {
     const kwToken = this.peek()!;
     this.pos += 1;
-    if (this.isId('class') || this.isId('struct')) this.pos += 1;
+    if (this.isId('class') || this.isId('struct')) {
+      this.requireCpp(`'enum ${this.peek()!.value}'`);
+      this.pos += 1;
+    }
     const attrs: Attributes = {};
     this.parseAttributes(attrs);
 
@@ -732,6 +850,9 @@ export class StructParser {
 
   private parseAttribute(attrs: Attributes): void {
     const t = this.peek()!;
+    if (this.target.architecture.bitfieldLayout === 'ms' && (t.value === '__attribute__' || t.value === '__attribute' || t.value === '__packed')) {
+      this.fail(`MSVC does not accept '${t.value}': on Windows use #pragma pack, alignas or __declspec(align(n)).`, t.line);
+    }
     this.pos += 1;
     if (t.value === '__packed') {
       attrs.packed = true;
@@ -748,12 +869,13 @@ export class StructParser {
       return;
     }
     if (t.value === '__declspec') {
-      // __declspec(align(n)); other declspecs (dllexport, novtable...) have no layout effect.
+      // __declspec(align(n)) and (empty_bases); others (dllexport, novtable...) have no layout effect.
       for (let i = 0; i < inner.length; i++) {
         if (inner[i].value === 'align' && inner[i + 1]?.value === '(') {
           const end = findClosing(inner, i + 1);
           attrs.aligned = this.evaluate(inner.slice(i + 2, end), 'Alignment', t.line);
         }
+        if (inner[i].value === 'empty_bases') attrs.emptyBases = true;
       }
       return;
     }
@@ -783,15 +905,20 @@ export class StructParser {
     }
   }
 
-  /** C++11 / C23 [[...]] attributes. Only [[no_unique_address]] affects layout. */
+  /**
+   * C++11 / C23 [[...]] attributes. Only [[no_unique_address]], which the Itanium ABI honours,
+   * and [[msvc::no_unique_address]], which MSVC honours instead, affect layout.
+   */
   private parseStdAttributes(attrs: Attributes): void {
     const close = findClosing(this.tokens, this.pos);
     const inner = this.tokens.slice(this.pos + 2, close - 1);
     this.pos = close + 1;
-    if (inner.some((t) => t.value === 'no_unique_address' || t.value === 'msvc::no_unique_address')) {
-      this.warnings.push({ message: '[[no_unique_address]] is not modelled: the member is laid out normally.', line: inner[0]?.line, type: 'warning' });
+    for (let i = 0; i < inner.length; i++) {
+      if (inner[i].value !== 'no_unique_address') continue;
+      const msvc = inner[i - 1]?.value === '::' && inner[i - 2]?.value === 'msvc';
+      this.requireCpp(`[[${msvc ? 'msvc::' : ''}no_unique_address]]`, inner[i].line);
+      attrs.noUniqueAddress = msvc ? 'msvc' : 'std';
     }
-    void attrs;
   }
 
   /** `alignas(type)` (the type's alignment) or `alignas(constant-expression)`. */
@@ -817,15 +944,20 @@ export class StructParser {
   private parseDeclarator(allowAbstract: boolean): Declarator {
     const line = this.currentLine();
     const attrs: Attributes = {};
-    let pointers = 0;
+    /** Pointers and references as written, left to right; each takes the qualifiers after it. */
+    const prefix: Array<Extract<Derivation, { kind: 'ptr' }>> = [];
     for (;;) {
       if (this.isPunct('*') || this.isPunct('&') || this.isPunct('&&') || this.isPunct('^')) {
-        pointers += 1;
+        const v = this.peek()!.value;
+        if (v === '&' || v === '&&') this.requireCpp(`A reference ('${v}')`);
+        prefix.push(v === '&' || v === '&&' ? { kind: 'ptr', ref: v } : { kind: 'ptr' });
         this.pos += 1;
         continue;
       }
       const t = this.peek();
       if (t?.kind === 'id' && QUALIFIERS.has(t.value)) {
+        const last = prefix[prefix.length - 1];
+        if (last && (t.value === 'const' || t.value === 'volatile')) last.cv = [...(last.cv ?? []), t.value];
         this.pos += 1;
         continue;
       }
@@ -846,13 +978,20 @@ export class StructParser {
       this.pos += 1;
       // C++ out-of-line names (A::b) and operator names are not members; keep the last part.
       while (this.isPunct('::') && this.peek(1)?.kind === 'id') {
+        this.requireCpp(`The qualified name '${inner.name}::${this.peek(1)!.value}'`);
         inner.name = this.peek(1)!.value;
         this.pos += 2;
       }
     } else if (this.isId('operator')) {
-      inner.name = 'operator';
+      this.requireCpp("'operator'");
       this.pos += 1;
-      this.takeUntil(['(']);
+      // `operator()` names itself with parentheses; any other operator runs up to its '('.
+      if (this.isPunct('(') && this.isPunct(')', 1)) {
+        inner.name = 'operator()';
+        this.pos += 2;
+      } else {
+        inner.name = `operator${this.takeUntil(['(']).map((t) => t.value).join(' ')}`;
+      }
     } else if (!allowAbstract) {
       const found = this.peek();
       this.fail(`Expected a member name${found ? ` but found '${found.value}'` : ''}.`);
@@ -877,14 +1016,25 @@ export class StructParser {
       if (this.isPunct('(')) {
         const close = findClosing(this.tokens, this.pos);
         if (close === -1) this.fail("Missing ')' in function declarator.");
-        const params = this.tokens.slice(this.pos + 1, close).map((t) => t.value).join(' ').replace(/ ([,)])/g, '$1');
+        const paramTokens = this.tokens.slice(this.pos + 1, close);
+        const params = paramTokens.map((t) => t.value).join(' ').replace(/ ([,)])/g, '$1');
         this.pos = close + 1;
-        suffixes.push({ kind: 'func', params });
-        // Trailing method qualifiers and specifiers.
-        while (this.peek()?.kind === 'id' && ['const', 'volatile', 'override', 'final', 'noexcept', 'throw'].includes(this.peek()!.value)) {
-          this.pos += 1;
-          if (this.isPunct('(')) this.pos = findClosing(this.tokens, this.pos) + 1;
+        // Trailing method qualifiers, ref-qualifiers and specifiers.
+        const quals: string[] = [];
+        for (;;) {
+          const q = this.peek();
+          if (q?.kind === 'id' && ['const', 'volatile', 'override', 'final', 'noexcept', 'throw'].includes(q.value)) {
+            quals.push(q.value);
+            this.pos += 1;
+            if (this.isPunct('(')) this.pos = findClosing(this.tokens, this.pos) + 1;
+          } else if (q?.kind === 'punct' && (q.value === '&' || q.value === '&&') && inner.name !== undefined) {
+            quals.push(q.value);
+            this.pos += 1;
+          } else {
+            break;
+          }
         }
+        suffixes.push({ kind: 'func', params, paramTokens, quals });
         if (this.isPunct('->')) {
           this.pos += 1;
           this.takeUntil([';', '{', '=', ',']);
@@ -897,7 +1047,8 @@ export class StructParser {
 
     const result: Declarator = {
       name: inner.name,
-      derivations: [...inner.derivations, ...suffixes, ...Array.from({ length: pointers }, () => ({ kind: 'ptr' as const }))],
+      // The pointer written last is the one nearest the name.
+      derivations: [...inner.derivations, ...suffixes, ...prefix.reverse()],
       attrs: { ...inner.attrs, ...attrs },
       line,
     };
@@ -951,6 +1102,11 @@ export class StructParser {
         if (alias) return { ...alias, dims: [...alias.dims] };
         const aligned = this.aliasAlignments.get(base.name);
         const typeAlignment = aligned !== undefined ? { typeAlignment: aligned } : {};
+        // In C a tag is not a type name: `struct S` or a typedef is needed. C++ makes it one.
+        if (!this.isCpp && !this.typedefNames.has(base.name)) {
+          const tag = this.structs.has(base.name) ? 'struct' : this.unions.has(base.name) ? 'union' : this.enums.has(base.name) ? 'enum' : undefined;
+          if (tag) this.fail(`'${base.name}' is not a type name in C: write '${tag} ${base.name}', or choose C++.`, spec.line);
+        }
         if (this.structAliases.has(base.name) || this.structs.has(base.name) || this.unions.has(base.name)) {
           return { type: base.name, isPointer: false, dims: [], recordRef: { keyword: 'struct', name: base.name }, ...typeAlignment };
         }
@@ -1006,10 +1162,13 @@ export class StructParser {
   private parseBody(close: number, ownerName: string, owner: ParsedStruct): StructMember[] {
     const members: StructMember[] = [];
     const seen = new Set<string>();
-    let warnedVirtual = false;
+    const cpp = owner.cpp;
+    /** C++ access in effect: a class starts private, a struct or union public. */
+    let access = cpp?.key === 'class' ? 'private' : 'public';
 
     while (this.pos < close) {
       const start = this.pos;
+      const membersBefore = members.length;
       try {
         const t = this.peek()!;
         if (t.kind === 'punct' && t.value === ';') {
@@ -1018,6 +1177,8 @@ export class StructParser {
         }
         // C++ access labels.
         if (t.kind === 'id' && ['public', 'private', 'protected'].includes(t.value) && this.isPunct(':', 1)) {
+          this.requireCpp(`The access label '${t.value}:'`, t.line);
+          access = t.value;
           this.pos += 2;
           continue;
         }
@@ -1025,23 +1186,41 @@ export class StructParser {
           this.checkStaticAssert();
           continue;
         }
-        if (t.kind === 'id' && ['using', 'template', 'friend'].includes(t.value)) {
+        if (t.kind === 'id' && (t.value === 'using' || t.value === 'friend')) {
+          this.requireCpp(`'${t.value}'`, t.line);
+          this.skipMember(close);
+          continue;
+        }
+        let templated = false;
+        if (t.kind === 'id' && t.value === 'template') {
+          // A member template: only a constructor template affects layout (it is user-provided).
+          this.requireCpp("'template'", t.line);
+          this.skipTemplateHeader();
+          templated = true;
+        }
+
+        if (cpp && this.parseConstructorOrDestructor(owner, close)) continue;
+        if (templated) {
           this.skipMember(close);
           continue;
         }
 
         const spec = this.parseSpecifiers(ownerName, false);
         if (!spec.base) {
-          // Constructors and destructors: Name(...) or ~Name(...).
-          if ((t.kind === 'id' && this.isPunct('(', 1)) || (t.value === '~')) {
-            this.skipMember(close);
-            continue;
+          if (this.isPunct('~') || (this.peek()?.kind === 'id' && this.isPunct('(', 1))) {
+            this.requireCpp('A constructor or destructor');
           }
-          this.fail(`Unexpected '${t.value}' in member declaration of '${ownerName}'.`, t.line);
+          if (this.isId('operator')) {
+            // A conversion function, `operator int() const`: a member function with no return type.
+            spec.base = { kind: 'builtin', words: ['void'] };
+          } else {
+            this.fail(`Unexpected '${this.peek()?.value ?? t.value}' in member declaration of '${ownerName}'.`, t.line);
+          }
         }
 
         if (spec.isTypedef) {
           // Member typedef (C++): declares a type name, takes no space.
+          this.requireCpp('A typedef inside a struct', spec.line);
           for (;;) {
             const decl = this.parseDeclarator(false);
             if (decl.name) this.registerTypedef(spec, decl);
@@ -1052,6 +1231,7 @@ export class StructParser {
           continue;
         }
 
+        const specEnd = this.pos;
         if (this.isPunct(';') || this.pos >= close) {
           // No declarator: a C11 anonymous struct/union member, or just a nested type declaration.
           if (spec.base!.kind === 'record' && spec.base!.def && !spec.base!.tag) {
@@ -1061,6 +1241,7 @@ export class StructParser {
               isNested: true,
               nestedStruct: spec.base!.def,
               line: spec.line,
+              source: { spec: this.spell(start, specEnd), declarator: [], inlineType: true },
             });
           } else if (spec.base!.kind !== 'record' && spec.base!.kind !== 'enum') {
             this.warnings.push({ message: `Declaration in '${ownerName}' does not declare a member.`, line: spec.line, type: 'warning' });
@@ -1070,30 +1251,43 @@ export class StructParser {
         }
 
         let lastName: string | undefined;
+        // A record type defined in the specifiers: the first declarator carries the definition, the
+        // others refer to it by tag (an anonymous one is defined again, with the same layout).
+        const inlineRecord = spec.base!.kind === 'record' && spec.base!.def ? spec.base! : undefined;
+        let first = true;
+        let member: StructMember | null = null;
         for (;;) {
+          const declStart = this.pos;
           const decl = this.parseDeclarator(true);
           lastName = decl.name ?? lastName;
-          const isFunction = decl.derivations[0]?.kind === 'func';
+          const func = decl.derivations[0]?.kind === 'func' ? decl.derivations[0] : undefined;
 
-          if (isFunction) {
-            if (spec.isVirtual && !warnedVirtual) {
-              warnedVirtual = true;
-              this.warnings.push({
-                message: `'${ownerName}' has virtual functions: the hidden vtable pointer is not included in this layout.`,
-                line: decl.line,
-                type: 'warning',
-              });
+          if (func) {
+            this.requireCpp(decl.name ? `The member function '${decl.name}'` : 'A constructor', decl.line);
+            const tail = this.parseFunctionTail();
+            if (cpp && decl.name && !spec.isStatic && !spec.isFriend) {
+              const declaredVirtual = spec.isVirtual || func.quals.includes('override') || func.quals.includes('final');
+              cpp.methods.push({ name: decl.name, signature: this.methodSignature(func), declaredVirtual, pure: tail.pure, destructor: false });
+              if (decl.name === 'operator=' && !tail.defaulted && !tail.deleted && this.isCopyAssignmentParameter(func.paramTokens, owner.name)) {
+                cpp.userProvidedCopyAssignment = true;
+              }
             }
-            // Inline method body, pure-virtual "= 0", "= default" / "= delete".
-            if (this.isPunct('{')) {
-              this.pos = findClosing(this.tokens, this.pos) + 1;
+            if (tail.body) {
               lastName = undefined;
               break;
             }
-            if (this.isPunct('=')) { this.pos += 1; this.takeUntil([',', ';']); }
-          } else if (!spec.isStatic && !spec.isFriend) {
-            const member = this.buildMember(spec, decl, ownerName);
+          } else if (spec.isStatic || spec.isFriend) {
+            if (spec.isStatic) this.requireCpp('A static member', decl.line);
+          } else {
+            member = this.buildMember(spec, decl, ownerName);
             if (member) {
+              if (cpp) {
+                if (access === 'private' || access === 'protected') {
+                  cpp.nonPublicData = true;
+                  member.access = access;
+                }
+                if (member.reference) cpp.referenceMember = true;
+              }
               if (member.name && seen.has(member.name)) {
                 this.errors.push({
                   message: `Duplicate member name '${member.name}' in struct '${ownerName}'. Member names must be unique.`,
@@ -1105,12 +1299,27 @@ export class StructParser {
                 members.push(member);
               }
             }
+            // Default member initializer: `= expr` or `{ ... }`.
+            if (this.isPunct('=') || this.isPunct('{')) {
+              this.requireCpp(`The default member initializer of '${decl.name ?? ''}'`, decl.line);
+              if (cpp) cpp.defaultMemberInitializer = true;
+            }
           }
 
-          // Default member initializer (C++): `= expr` or `{ ... }`.
+          // A static member's initializer, or a default member initializer: no layout effect.
           if (this.isPunct('=')) { this.pos += 1; this.takeUntil([',', ';']); }
           else if (this.isPunct('{')) { this.pos = findClosing(this.tokens, this.pos) + 1; }
 
+          if (member) {
+            const tagged = inlineRecord?.tag;
+            member.source = {
+              spec: !first && tagged ? [inlineRecord!.keyword, tagged] : this.spell(start, specEnd),
+              declarator: this.spell(declStart, this.pos),
+              ...(inlineRecord && (first || !tagged) && { inlineType: true }),
+            };
+          }
+          member = null;
+          first = false;
           if (this.isPunct(',')) { this.pos += 1; continue; }
           break;
         }
@@ -1119,6 +1328,13 @@ export class StructParser {
       } catch (err) {
         if (!(err instanceof Recover)) throw err;
         this.skipMember(close);
+      } finally {
+        // What declared no data member, as written: a member function, a nested type, a typedef...
+        const tokens = this.spell(start, Math.min(this.pos, close));
+        const label = tokens.length === 2 && ['public', 'private', 'protected'].includes(tokens[0]!) && tokens[1] === ':';
+        if (members.length === membersBefore && tokens.length > 0 && !(tokens.length === 1 && tokens[0] === ';') && !label) {
+          (owner.declarations ??= []).push({ tokens, ...(cpp && { access: access as 'public' | 'protected' | 'private' }) });
+        }
       }
       if (this.pos === start) this.pos += 1;
     }
@@ -1135,6 +1351,184 @@ export class StructParser {
     });
 
     return members;
+  }
+
+  /** `template < ... >`, nested angle brackets and parentheses included. */
+  private skipTemplateHeader(): void {
+    this.pos += 1;
+    if (!this.isPunct('<')) this.fail("Expected '<' after 'template'.");
+    let depth = 0;
+    while (this.pos < this.tokens.length) {
+      const t = this.tokens[this.pos];
+      if (t.kind === 'punct' && (t.value === '(' || t.value === '[')) {
+        this.pos = findClosing(this.tokens, this.pos) + 1;
+        continue;
+      }
+      if (t.kind === 'punct' && t.value === '<') depth += 1;
+      if (t.kind === 'punct' && t.value === '>') depth -= 1;
+      if (t.kind === 'punct' && t.value === '>>') depth -= 2;
+      this.pos += 1;
+      if (depth <= 0) return;
+    }
+  }
+
+  /**
+   * A constructor or destructor of `owner`, if one starts here: record what it makes of the class
+   * (user-declared, user-provided, explicit, virtual destructor) and skip it.
+   */
+  private parseConstructorOrDestructor(owner: ParsedStruct, close: number): boolean {
+    const cpp = owner.cpp!;
+    let k = 0;
+    let isExplicit = false;
+    let isVirtual = false;
+    for (;;) {
+      const t = this.peek(k);
+      if (t?.kind !== 'id') break;
+      if (t.value === 'explicit') {
+        isExplicit = true;
+        // C++20 conditional explicit: explicit(expr).
+        if (this.isPunct('(', k + 1)) {
+          k = findClosing(this.tokens, this.pos + k + 1) - this.pos + 1;
+          continue;
+        }
+      } else if (t.value === 'virtual') {
+        isVirtual = true;
+      } else if (!['inline', 'constexpr', 'consteval', '__inline', '__forceinline'].includes(t.value)) {
+        break;
+      }
+      k += 1;
+    }
+    const destructor = this.isPunct('~', k);
+    const nameAt = destructor ? k + 1 : k;
+    if (this.peek(nameAt)?.kind !== 'id' || this.peek(nameAt)!.value !== owner.name || !this.isPunct('(', nameAt + 1)) return false;
+
+    const line = this.peek(nameAt)!.line;
+    this.pos += nameAt + 1;
+    const closeParen = findClosing(this.tokens, this.pos);
+    if (closeParen === -1 || closeParen > close) this.fail(`Missing ')' in the ${destructor ? 'destructor' : 'constructor'} of '${owner.name}'.`, line);
+    this.pos = closeParen + 1;
+    while (this.peek()?.kind === 'id' && ['noexcept', 'throw', 'override', 'final'].includes(this.peek()!.value)) {
+      this.pos += 1;
+      if (this.isPunct('(')) this.pos = findClosing(this.tokens, this.pos) + 1;
+    }
+    const tail = this.parseFunctionTail();
+    const provided = !tail.defaulted && !tail.deleted;
+    if (destructor) {
+      cpp.userDeclaredDestructor = true;
+      if (provided) cpp.userProvidedDestructor = true;
+      cpp.methods.push({ name: `~${owner.name}`, signature: '()', declaredVirtual: isVirtual, pure: tail.pure, destructor: true });
+    } else {
+      cpp.userDeclaredConstructor = true;
+      if (provided) cpp.userProvidedConstructor = true;
+      if (isExplicit) cpp.explicitConstructor = true;
+    }
+    if (!tail.body) this.endMember(close, owner.name, undefined);
+    return true;
+  }
+
+  /**
+   * What follows a function's declarator: `= default`, `= delete`, `= 0`, a body (after a
+   * constructor's member initializers, or as a function-try-block), or nothing before its ';'.
+   */
+  private parseFunctionTail(): { defaulted: boolean; deleted: boolean; pure: boolean; body: boolean } {
+    const tail = { defaulted: false, deleted: false, pure: false, body: false };
+    if (this.isPunct('=')) {
+      const v = this.peek(1)?.value;
+      tail.defaulted = v === 'default';
+      tail.deleted = v === 'delete';
+      tail.pure = v === '0';
+      this.pos += 1;
+      this.takeUntil([',', ';']);
+      return tail;
+    }
+    const tryBlock = this.isId('try');
+    if (tryBlock) this.pos += 1;
+    if (this.isPunct(':')) this.takeUntil(['{']);
+    if (this.isPunct('{')) {
+      this.pos = findClosing(this.tokens, this.pos) + 1;
+      tail.body = true;
+      while (tryBlock && this.isId('catch')) {
+        this.pos += 1;
+        if (this.isPunct('(')) this.pos = findClosing(this.tokens, this.pos) + 1;
+        if (this.isPunct('{')) this.pos = findClosing(this.tokens, this.pos) + 1;
+      }
+    }
+    return tail;
+  }
+
+  /**
+   * A member function's parameter types and its own qualifiers, normalized as overriding compares
+   * them: parameter names and default arguments dropped, typedefs resolved, arrays and functions
+   * adjusted to pointers, top-level const dropped.
+   */
+  private methodSignature(func: Extract<Derivation, { kind: 'func' }>): string {
+    const quals = func.quals.filter((q) => q === 'const' || q === 'volatile' || q === '&' || q === '&&').sort();
+    return `(${this.parameterTypes(func.paramTokens).join(',')})${quals.length > 0 ? ` ${quals.join(' ')}` : ''}`;
+  }
+
+  private parameterTypes(tokens: readonly Token[]): string[] {
+    const params: Token[][] = [[]];
+    let depth = 0;
+    for (const t of tokens) {
+      if (t.kind === 'punct' && (t.value === '(' || t.value === '[' || t.value === '{' || t.value === '<')) depth += 1;
+      if (t.kind === 'punct' && (t.value === ')' || t.value === ']' || t.value === '}' || t.value === '>')) depth -= 1;
+      if (t.kind === 'punct' && t.value === ',' && depth === 0) params.push([]);
+      else params[params.length - 1].push(t);
+    }
+    if (params.length === 1 && (params[0].length === 0 || (params[0].length === 1 && params[0][0].value === 'void'))) return [];
+    return params.map((p) => this.parameterType(p));
+  }
+
+  private parameterType(tokens: readonly Token[]): string {
+    if (tokens.length === 1 && tokens[0].value === '...') return '...';
+    // A default argument does not change the type.
+    let depth = 0;
+    const end = tokens.findIndex((t) => {
+      if (t.kind === 'punct' && (t.value === '(' || t.value === '[' || t.value === '<')) depth += 1;
+      if (t.kind === 'punct' && (t.value === ')' || t.value === ']' || t.value === '>')) depth -= 1;
+      return depth === 0 && t.kind === 'punct' && t.value === '=';
+    });
+    const savedTokens = this.tokens;
+    const savedPos = this.pos;
+    this.tokens = (end >= 0 ? tokens.slice(0, end) : tokens) as Token[];
+    this.pos = 0;
+    try {
+      const spec = this.parseSpecifiers(null, false);
+      const decl = this.parseDeclarator(true);
+      return this.spellType(spec, decl.derivations, true);
+    } finally {
+      this.tokens = savedTokens;
+      this.pos = savedPos;
+    }
+  }
+
+  /** A type written as specifiers and derivations (from the name outward), in one spelling per type. */
+  private spellType(spec: Specifiers, derivations: readonly Derivation[], parameter: boolean): string {
+    const base = spec.base;
+    let name: string;
+    if (!base) name = '?';
+    else if (base.kind === 'builtin') name = canonicalBuiltin(base.words);
+    else if (base.kind === 'record' || base.kind === 'enum') name = base.def?.name ?? base.tag ?? '';
+    else name = this.typedefSpellings.get(base.name) ?? base.name;
+    const spell = (k: number, topLevel: boolean): string => {
+      const d = derivations[k];
+      if (!d) return `${topLevel && parameter ? '' : [...spec.cv].sort().map((q) => `${q} `).join('')}${name}`;
+      if (d.kind === 'ptr') {
+        const cv = topLevel && parameter ? '' : (d.cv ?? []).slice().sort().map((q) => ` ${q}`).join('');
+        return `${d.ref ?? '*'}${cv}(${spell(k + 1, false)})`;
+      }
+      // A parameter of array or function type is a pointer (C11 6.7.6.3p7-8).
+      if (d.kind === 'array') return `${topLevel && parameter ? '*' : `[${d.size ?? ''}]`}(${spell(k + 1, false)})`;
+      return `${topLevel && parameter ? '*' : ''}fn(${this.parameterTypes(d.paramTokens).join(',')})(${spell(k + 1, false)})`;
+    };
+    return spell(0, true);
+  }
+
+  /** `operator=`'s parameter makes it the copy assignment of `className`: X, X&, const X&, volatile X&. */
+  private isCopyAssignmentParameter(tokens: readonly Token[], className: string): boolean {
+    const params = this.parameterTypes(tokens);
+    if (params.length !== 1) return false;
+    return new RegExp(`^(&\\()?((const |volatile )*)${className.replace(/\W/g, '\\$&')}\\)?$`).test(params[0]) && !params[0].startsWith('&&');
   }
 
   private endMember(close: number, ownerName: string, memberName: string | undefined): void {
@@ -1187,6 +1581,10 @@ export class StructParser {
     const aligned = decl.attrs.aligned ?? spec.attrs.aligned;
     if (aligned !== undefined) member.alignAttribute = aligned;
     if (decl.attrs.packed || spec.attrs.packed) member.packed = true;
+    const first = decl.derivations[0];
+    if (first?.kind === 'ptr' && first.ref) member.reference = true;
+    const noUniqueAddress = decl.attrs.noUniqueAddress ?? spec.attrs.noUniqueAddress;
+    if (noUniqueAddress) member.noUniqueAddress = noUniqueAddress;
     return member;
   }
 
@@ -1247,7 +1645,7 @@ export class StructParser {
       STANDARD_TYPEDEFS.has(v) ||
       this.typeAliases.has(v) || this.structAliases.has(v) || this.enumAliases.has(v) ||
       // C++: a class or enum is a type name without its keyword.
-      this.structs.has(v) || this.unions.has(v) || this.enums.has(v)
+      (this.isCpp && (this.structs.has(v) || this.unions.has(v) || this.enums.has(v)))
     );
   }
 

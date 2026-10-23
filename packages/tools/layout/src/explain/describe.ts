@@ -20,7 +20,7 @@ export function describeLayout(spec: LayoutSpec): string {
 }
 
 export function describeVerification(spec: LayoutSpec): string {
-  const lang = readLanguage(spec.options) === "cpp" ? "C++" : "C";
+  const lang = { c: "C", "c++17": "C++17", "c++20": "C++20" }[readLanguage(spec.options)];
   const which = readMode(spec.options) === "optimized" ? "optimized" : "original";
   return `${lang} program printing sizeof/offsetof for the ${which} definition; compare with ${platformPhrase(spec)}.`;
 }

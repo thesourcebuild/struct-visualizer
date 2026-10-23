@@ -25,11 +25,11 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # On one Node version: the compilers' answers do not depend on it.
-      - name: Install the compilers the bit-field ground truth checks against
+      - name: Install the compilers the layout ground truth checks against
         if: matrix.node == 22
         uses: ./.github/actions/cross-compilers
         # A crawling mirror fails the run here, instead of holding it for the 6 h job limit.
-        timeout-minutes: 15
+        timeout-minutes: 60
       - run: pnpm typecheck
       - run: pnpm lint
       # TODO: add `pnpm format:check` after the one-off `pnpm format` commit
@@ -40,3 +40,19 @@ jobs:
           SP_REQUIRE_COMPILERS: ${{ matrix.node == 22 && '1' || '' }}
       - name: Static export builds
         run: pnpm --filter @sp/web build
+
+  # The Windows targets model MSVC: their ground truth needs MSVC, which only Windows runners have.
+  msvc:
+    name: MSVC ground truth
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec vitest run tests/cross-compiler.test.ts tests/cpp-compiler.test.ts tests/compiler.test.ts tests/verification-program.test.ts
+        env:
+          SP_REQUIRE_MSVC: "1"
