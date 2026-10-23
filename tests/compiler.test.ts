@@ -69,7 +69,7 @@ describe.skipIf(!host || !hasGcc())(`layouts match GCC on this ${process.platfor
       // A separate executable per case: Windows can keep the previous one locked while scanning it.
       const src = join(dir, `case${index}.c`);
       const exe = join(dir, `case${index}${process.platform === "win32" ? ".exe" : ""}`);
-      writeFileSync(src, CCodeGenerator.generateVerificationCode(code, result.struct.name, "c"));
+      writeFileSync(src, CCodeGenerator.generateVerificationCode(code, analysis.platform, result.struct.name, "c"));
       await run("gcc", ["-std=gnu11", "-o", exe, src]);
       const { stdout: out } = await run(exe, []);
 

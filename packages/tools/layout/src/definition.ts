@@ -53,7 +53,7 @@ function variantTags(spec: LayoutSpec, input: string): string[] {
   if (readMode(spec.options) === "packed") tags.push(TAG_PACKED);
   // Cheap: parse only to see whether any enum is declared.
   if (/\benum\b/.test(input)) {
-    const parser = new StructParser();
+    const parser = new StructParser(resolveSpec(spec));
     parser.parse(input);
     if (parser.getAllEnums().length > 0) tags.push(TAG_HAS_ENUM);
   }

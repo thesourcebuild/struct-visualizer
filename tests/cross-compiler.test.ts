@@ -170,6 +170,28 @@ const CASES: Record<string, string> = {
   "pragma pack 2, aligned member": "#pragma pack(push, 2)\nstruct S { char a; int b __attribute__((aligned(8))); char c; };\n#pragma pack(pop)",
   "pragma pack 4, no bit-fields": "#pragma pack(push, 4)\nstruct S { char a; int b; double c; };\n#pragma pack(pop)",
   "pragma pack 2, nested struct": "struct T { char x; int y; };\n#pragma pack(push, 2)\nstruct S { char a; struct T t; double d; };\n#pragma pack(pop)",
+  "typedef'd array of pointers": "typedef int *A3[3]; struct S { char c; A3 p; char d; };",
+  "alignas of a struct": "struct T { char c; double d; }; struct S { char a; _Alignas(struct T) char b; char c; };",
+  // Constant expressions that need the target's types: each size below differs between targets.
+  "sizeof in array sizes":
+    "struct T { char c; long l; }; struct S { char pad[64 - sizeof(struct T)]; char a[sizeof(long)]; char b[sizeof(void *)]; char d[sizeof(double)]; short e; };",
+  "_Alignof in array sizes": "struct S { char a[_Alignof(long long)]; char b[_Alignof(double)]; char c[_Alignof(void *)]; int d; };",
+  "__alignof__ in array sizes":
+    "struct T { double d; }; struct S { char a[__alignof__(long long)]; char b[__alignof__(double)]; char c[__alignof__(int64_t)]; char d[__alignof__(double[2])]; char e[__alignof__(struct T)]; int f; };",
+  "offsetof in array sizes":
+    "struct T { char a; int b; short c[3]; union { long i; char u[6]; }; }; struct S { char x[offsetof(struct T, c[2])]; char y[offsetof(struct T, u[3])]; char z; };",
+  "member address idioms":
+    "struct T { char a; long b[3]; }; struct S { char x[sizeof(((struct T *)0)->b)]; char y[(int)(unsigned long)&((struct T *)0)->b[1]]; char z; };",
+  "casts in array sizes": "struct S { char a[(unsigned char)300]; char b[(short)70000 > 0 ? 1 : 2]; char c[(_Bool)7]; int d; };",
+  "sizeof in a bit-field width": "struct S { unsigned a : sizeof(short) * 4; unsigned b : 3; char c; };",
+  "enum value from sizeof": "struct T { char c; int i; }; enum E { E_SIZE = sizeof(struct T) * 100 }; struct S { char a; enum E e; char b; };",
+  "static assertion": "_Static_assert(sizeof(long) >= 4, \"long has 32 bits\"); struct S { char a; long b; };",
+  // Function-like macros, as headers use them.
+  "function-like macros":
+    "#define FIELD(t, n) t n;\n#define PAD(n) unsigned char pad_##n[n];\nstruct S { FIELD(char, a) PAD(3) FIELD(int, b) PAD(5) FIELD(long, c) };",
+  "macro with sizeof":
+    "#define ROUND_UP(x, a) (((x) + (a) - 1) / (a) * (a))\nstruct T { char a; short b; char c; };\nstruct S { char raw[ROUND_UP(sizeof(struct T), 8)]; long tail; };",
+  "variadic macro": "#define DECL(type, ...) type __VA_ARGS__;\nstruct S { DECL(char, a, b, c) DECL(int, d) DECL(short, e) };",
   // Every C example: nested structs, unions, arrays, pointers and enums on every target.
   ...Object.fromEntries(examples.map((e) => [`example: ${e.name}`, e.code.c])),
 };

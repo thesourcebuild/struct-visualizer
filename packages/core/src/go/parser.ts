@@ -149,7 +149,7 @@ export function parseGo(code: string): GoFile {
   const constValue = (exprTokens: Token[], iota: number): number | undefined => {
     if (exprTokens.length === 0) return undefined;
     try {
-      return evaluateConstExpr(toCExpression(exprTokens), (name) => (name === 'iota' ? iota : file.consts.get(name)));
+      return evaluateConstExpr(toCExpression(exprTokens), { identifier: (name) => (name === 'iota' ? iota : file.consts.get(name)) });
     } catch (err) {
       // Non-integer constants (strings, floats) are fine as long as no array length uses them.
       if (!(err instanceof ConstExprError)) throw err;

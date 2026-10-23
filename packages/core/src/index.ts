@@ -3,6 +3,7 @@ export * from './abi/data-models';
 export * from './abi/architectures';
 export * from './abi/resolve-selection';
 export { StructParser } from './parser/struct-parser';
+export type { ParserTarget } from './parser/struct-parser';
 export { validateSupportedTypes } from './parser/validate-types';
 export { PaddingCalculator } from './layout/padding-calculator';
 export { CCodeGenerator } from './codegen/c-code-generator';

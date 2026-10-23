@@ -10,6 +10,8 @@ export interface Token {
   value: string;
   /** 1-based source line, for error messages. */
   line: number;
+  /** Whitespace came before it: `#` in a macro keeps one space there when it stringizes. */
+  space?: boolean;
 }
 
 // Longest first, so '<<=' wins over '<<' and '<'.
@@ -27,6 +29,11 @@ export function tokenize(text: string): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   let line = 1;
+  let space = false;
+  const push = (kind: TokenKind, value: string) => {
+    tokens.push(space ? { kind, value, line, space } : { kind, value, line });
+    space = false;
+  };
 
   while (i < text.length) {
     const c = text[i];
@@ -34,17 +41,19 @@ export function tokenize(text: string): Token[] {
     if (c === '\n') {
       line += 1;
       i += 1;
+      space = true;
       continue;
     }
     if (/\s/.test(c)) {
       i += 1;
+      space = true;
       continue;
     }
 
     if (isIdentStart(c)) {
       let j = i + 1;
       while (j < text.length && isIdentPart(text[j])) j += 1;
-      tokens.push({ kind: 'id', value: text.slice(i, j), line });
+      push('id', text.slice(i, j));
       i = j;
       continue;
     }
@@ -62,7 +71,7 @@ export function tokenize(text: string): Token[] {
           break;
         }
       }
-      tokens.push({ kind: 'num', value: text.slice(i, j), line });
+      push('num', text.slice(i, j));
       i = j;
       continue;
     }
@@ -74,7 +83,7 @@ export function tokenize(text: string): Token[] {
         if (text[j] === '\n') line += 1;
         j += 1;
       }
-      tokens.push({ kind: 'str', value: text.slice(i, j + 1), line });
+      push('str', text.slice(i, j + 1));
       i = j + 1;
       continue;
     }
@@ -84,21 +93,21 @@ export function tokenize(text: string): Token[] {
       while (j < text.length && text[j] !== c && text[j] !== '\n') {
         j += text[j] === '\\' ? 2 : 1;
       }
-      tokens.push({ kind: c === '"' ? 'str' : 'char', value: text.slice(i, j + 1), line });
+      push(c === '"' ? 'str' : 'char', text.slice(i, j + 1));
       i = j + 1;
       continue;
     }
 
     const punct = PUNCTUATORS.find((p) => text.startsWith(p, i));
     if (punct) {
-      tokens.push({ kind: 'punct', value: punct, line });
+      push('punct', punct);
       i += punct.length;
       continue;
     }
 
     // Anything else (stray characters such as '@' or '$') is kept as a punctuator so the
     // parser can report it with its line instead of silently dropping it.
-    tokens.push({ kind: 'punct', value: c, line });
+    push('punct', c);
     i += 1;
   }
 

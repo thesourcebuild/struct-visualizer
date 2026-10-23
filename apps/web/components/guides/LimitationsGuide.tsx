@@ -66,11 +66,12 @@ export function LimitationsGuide() {
                 <ul className={UL}>
                     <li><code className={CODE}>#pragma pack(n)</code> with <code className={CODE}>push</code>/<code className={CODE}>pop</code>, and <code className={CODE}>__attribute__((packed))</code>, including packed enums.</li>
                     <li><code className={CODE}>__attribute__((aligned(n)))</code>, <code className={CODE}>alignas</code> / <code className={CODE}>_Alignas</code> and <code className={CODE}>__declspec(align(n))</code>, on structs and members.</li>
-                    <li><code className={CODE}>#define</code> constants and <code className={CODE}>#if</code> / <code className={CODE}>#ifdef</code> blocks. <code className={CODE}>#include</code> is skipped; the standard fixed-width and size types are built in.</li>
+                    <li><code className={CODE}>#define</code> macros, object-like and function-like, with <code className={CODE}>#</code>, <code className={CODE}>##</code> and <code className={CODE}>__VA_ARGS__</code>, and <code className={CODE}>#if</code> / <code className={CODE}>#ifdef</code> blocks. <code className={CODE}>#include</code> is skipped; the standard fixed-width and size types are built in.</li>
+                    <li><code className={CODE}>sizeof</code>, <code className={CODE}>_Alignof</code>, <code className={CODE}>offsetof</code> and casts in array sizes, bit-field widths and enum values, worked out for the selected target; <code className={CODE}>_Static_assert</code> is checked.</li>
                 </ul>
                 <p className={`${P} mt-3`}>Not modelled, and reported when they appear:</p>
                 <ul className={UL}>
-                    <li>Function-like macros (they are not expanded) and <code className={CODE}>sizeof</code> in array sizes, which depends on the target.</li>
+                    <li>No macro is predefined: <code className={CODE}>#ifdef _WIN32</code> or <code className={CODE}>#if __SIZEOF_LONG__ == 8</code> takes the branch for an undefined macro on every target.</li>
                     <li><code className={CODE}>__attribute__((mode))</code>, <code className={CODE}>vector_size</code> and <code className={CODE}>ms_struct</code>.</li>
                     <li>Pragmas other than <code className={CODE}>pack</code> and <code className={CODE}>once</code>, which are ignored.</li>
                 </ul>

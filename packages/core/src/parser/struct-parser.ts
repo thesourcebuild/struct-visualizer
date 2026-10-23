@@ -1,5 +1,7 @@
 import type {
   AlignRequest,
+  Architecture,
+  CalculationResult,
   EnumMember,
   ParseError,
   ParsedEnum,
@@ -7,7 +9,10 @@ import type {
   StructMember,
   ValidationResult,
 } from '../types';
+import type { DataModel } from '../abi/data-models';
+import { PaddingCalculator } from '../layout/padding-calculator';
 import { ConstExprError, evaluateConstExpr } from './const-expr';
+import type { ConstExprContext, TypeOracle } from './const-expr';
 import { expandMacros, packAt, preprocess } from './preprocess';
 import type { Preprocessed } from './preprocess';
 import { findClosing, tokenize } from './tokens';
@@ -18,17 +23,35 @@ import type { Token } from './tokens';
  * declarations.
  *
  * Pipeline: preprocess (comments, #if, #define, #pragma pack) -> tokenize -> expand
- * object-like macros -> recursive-descent declaration parsing with real C declarators, so
- * arrays of pointers, pointers to arrays, function pointers, constant-expression sizes,
- * flexible array members, bit-fields (named, unnamed, zero-width), attributes and typedefs
- * all parse the way a compiler reads them.
+ * macros -> recursive-descent declaration parsing with real C declarators, so arrays of
+ * pointers, pointers to arrays, function pointers, constant-expression sizes, flexible array
+ * members, bit-fields (named, unnamed, zero-width), attributes and typedefs all parse the way a
+ * compiler reads them.
+ *
+ * Parsing is for one target, as compiling is: `sizeof`, `_Alignof` and `offsetof` in a constant
+ * expression are worked out as they are reached, from the target's types and the definitions
+ * before them, so `char pad[64 - sizeof(struct Head)]` has the size it has on that target.
  */
+export interface ParserTarget {
+  architecture: Architecture;
+  dataModel: DataModel;
+}
+
+/** The <stddef.h>, <stdint.h> and <stdbool.h> typedef names, which are built in like the headers. */
+const STANDARD_TYPEDEFS: ReadonlyMap<string, 'signed' | 'unsigned'> = new Map([
+  ['int8_t', 'signed'], ['int16_t', 'signed'], ['int32_t', 'signed'], ['int64_t', 'signed'],
+  ['uint8_t', 'unsigned'], ['uint16_t', 'unsigned'], ['uint32_t', 'unsigned'], ['uint64_t', 'unsigned'],
+  ['intptr_t', 'signed'], ['uintptr_t', 'unsigned'], ['ptrdiff_t', 'signed'], ['size_t', 'unsigned'],
+  ['ssize_t', 'signed'],
+]);
 
 const QUALIFIERS = new Set([
   'const', 'volatile', 'restrict', '__restrict', '__restrict__', '_Atomic', 'mutable', 'register',
   'auto', 'inline', '__inline', '__inline__', 'explicit', 'extern', 'thread_local', '_Thread_local',
   '__thread', '__extension__', '_Noreturn',
 ]);
+/** The qualifiers a type-name (in sizeof, a cast) may start with. */
+const TYPE_NAME_QUALIFIERS = new Set(['const', 'volatile', 'restrict', '__restrict', '__restrict__', '_Atomic']);
 const BUILTIN_WORDS = new Set([
   'void', 'char', 'short', 'int', 'long', 'float', 'double', 'signed', 'unsigned', '__signed__',
   '__signed', '_Bool', 'bool', '_Complex', '__int128', 'wchar_t', 'char8_t', 'char16_t', 'char32_t',
@@ -95,6 +118,8 @@ interface TypeInfo {
   enumType?: ParsedEnum;
   /** Set by an aligned typedef: the type's own alignment (see StructMember.typeAlignment). */
   typeAlignment?: AlignRequest;
+  /** For a data pointer: what it points to, for `->` and `*` in constant expressions. */
+  pointee?: TypeInfo;
 }
 
 class Recover extends Error {}
@@ -116,6 +141,14 @@ export class StructParser {
   private pre: Preprocessed | null = null;
   private tokens: Token[] = [];
   private pos = 0;
+  /** Measures types for `sizeof` and friends, with the definitions parsed so far. */
+  private readonly calculator: PaddingCalculator;
+  private readonly oracle: TypeOracle<TypeInfo>;
+
+  constructor(private readonly target: ParserTarget) {
+    this.calculator = new PaddingCalculator(target.architecture, target.dataModel);
+    this.oracle = this.createOracle();
+  }
 
   parse(code: string): ValidationResult {
     this.errors = [];
@@ -134,7 +167,7 @@ export class StructParser {
     this.pre = preprocess(code);
     this.errors.push(...this.pre.errors);
     this.warnings.push(...this.pre.warnings);
-    this.tokens = expandMacros(tokenize(this.pre.text), this.pre.objectMacros, this.pre.functionMacros, this.errors);
+    this.tokens = expandMacros(tokenize(this.pre.text), this.pre.macros, this.errors);
     this.pos = 0;
 
     while (this.pos < this.tokens.length) {
@@ -211,9 +244,13 @@ export class StructParser {
     }
   }
 
+  private exprContext(): ConstExprContext<TypeInfo> {
+    return { identifier: (name) => this.enumConstants.get(name), types: this.oracle };
+  }
+
   private evaluate(tokens: Token[], what: string, line: number): number {
     try {
-      return evaluateConstExpr(tokens, (name) => this.enumConstants.get(name));
+      return evaluateConstExpr(tokens, this.exprContext());
     } catch (err) {
       const reason = err instanceof ConstExprError ? err.message : String(err);
       return this.fail(`${what} '${tokens.map((t) => t.value).join(' ')}' is not an integer constant: ${reason}.`, line);
@@ -259,7 +296,11 @@ export class StructParser {
       if (this.isPunct('{')) this.pos += 1;
       return;
     }
-    if (t.kind === 'id' && (t.value === 'using' || t.value === 'static_assert' || t.value === '_Static_assert' || t.value === 'template')) {
+    if (t.kind === 'id' && (t.value === 'static_assert' || t.value === '_Static_assert')) {
+      this.checkStaticAssert();
+      return;
+    }
+    if (t.kind === 'id' && (t.value === 'using' || t.value === 'template')) {
       if (t.value === 'template') {
         this.warnings.push({ message: 'Templates are not laid out: a template has no layout until it is instantiated.', line: t.line, type: 'warning' });
       }
@@ -313,6 +354,43 @@ export class StructParser {
       throw new Recover();
     }
     this.pos += 1;
+  }
+
+  /**
+   * `static_assert(condition, "message")` or `_Static_assert(...)`, evaluated as the compiler
+   * evaluates it. A false one is an error, as it is for the compiler; one this evaluator cannot
+   * work out (C++ type traits, say) is reported as not checked.
+   */
+  private checkStaticAssert(): void {
+    const kw = this.peek()!;
+    this.pos += 1;
+    if (!this.isPunct('(')) this.fail(`Expected '(' after '${kw.value}'.`);
+    const close = findClosing(this.tokens, this.pos);
+    if (close === -1) this.fail(`Unterminated '${kw.value}(...)'.`);
+    const inner = this.tokens.slice(this.pos + 1, close);
+    this.pos = close + 1;
+
+    let depth = 0;
+    const comma = inner.findIndex((t) => {
+      if (t.kind === 'punct' && (t.value === '(' || t.value === '[')) depth += 1;
+      if (t.kind === 'punct' && (t.value === ')' || t.value === ']')) depth -= 1;
+      return depth === 0 && t.kind === 'punct' && t.value === ',';
+    });
+    const condition = comma >= 0 ? inner.slice(0, comma) : inner;
+    const message = comma >= 0 ? inner.slice(comma + 1).filter((t) => t.kind === 'str').map((t) => t.value.slice(1, -1)).join('') : '';
+    const spelled = condition.map((t) => t.value).join(' ');
+    try {
+      if (evaluateConstExpr(condition, this.exprContext()) === 0) {
+        this.errors.push({
+          message: `Static assertion failed${message ? `: "${message}"` : ''} (${spelled}).`,
+          line: kw.line,
+          type: 'semantic',
+        });
+      }
+    } catch (err) {
+      if (!(err instanceof ConstExprError)) throw err;
+      this.warnings.push({ message: `${kw.value}(${spelled}) is not checked: ${err.message}.`, line: kw.line, type: 'warning' });
+    }
   }
 
   /** Name, register and order a top-level struct/union/enum, and record typedef aliases. */
@@ -612,10 +690,16 @@ export class StructParser {
         while (this.pos < close && !this.isPunct(',')) exprTokens.push(this.tokens[this.pos++]);
         member.valueRaw = exprTokens.map((x) => x.value).join(' ');
         try {
-          next = evaluateConstExpr(exprTokens, (n) => this.enumConstants.get(n));
+          next = evaluateConstExpr(exprTokens, this.exprContext());
           member.value = next;
-        } catch {
-          // A value the evaluator cannot compute (e.g. sizeof) does not affect layout.
+        } catch (err) {
+          if (!(err instanceof ConstExprError)) throw err;
+          // The values decide the enum's size, so one that cannot be worked out is an error.
+          this.errors.push({
+            message: `Value of '${t.value}' in '${enumName}', '${member.valueRaw}', is not an integer constant: ${err.message}.`,
+            line: t.line,
+            type: 'syntax',
+          });
           member.value = undefined;
         }
       } else {
@@ -710,18 +794,16 @@ export class StructParser {
     void attrs;
   }
 
+  /** `alignas(type)` (the type's alignment) or `alignas(constant-expression)`. */
   private alignRequestFrom(inner: Token[], at: Token): AlignRequest {
-    // alignas(type) or alignas(constant-expression)
-    const isType = inner.length > 0 && inner.every((t) => t.kind === 'id') && (BUILTIN_WORDS.has(inner[0].value) || this.typeAliases.has(inner[0].value) || /_t$/.test(inner[0].value) || ['struct', 'union', 'enum'].includes(inner[0].value));
-    if (isType) {
-      const saved = this.pos;
-      const savedTokens = this.tokens;
-      this.tokens = inner;
-      this.pos = 0;
-      const spec = this.parseSpecifiers(null, false);
-      this.tokens = savedTokens;
-      this.pos = saved;
-      return { ofType: this.baseTypeInfo(spec).type };
+    const parsed = this.oracle.typeName(inner, 0);
+    if (parsed && parsed.end === inner.length) {
+      try {
+        return { ofType: this.oracle.describe(parsed.type), alignment: this.oracle.alignOf(parsed.type, false) };
+      } catch (err) {
+        if (!(err instanceof ConstExprError)) throw err;
+        this.fail(`alignas(${inner.map((t) => t.value).join(' ')}): ${err.message}.`, at.line);
+      }
     }
     return this.evaluate(inner, 'Alignment', at.line);
   }
@@ -896,7 +978,8 @@ export class StructParser {
     const rest = d.slice(i);
 
     if (rest.length === 0) {
-      return { ...base, dims: base.isPointer ? dims : [...dims, ...base.dims] };
+      // An array of the type, which may itself be an array (or an array of pointers) by typedef.
+      return { ...base, dims: [...dims, ...base.dims] };
     }
     if (rest[0].kind === 'func') {
       this.fail(`'${name}' is declared as a function returning ${base.type}; only pointers to functions can be members.`, decl.line);
@@ -906,12 +989,14 @@ export class StructParser {
     // One '*' per pointer level before any function/array derivation: char** stays char**.
     let levels = 0;
     while (rest[levels]?.kind === 'ptr') levels += 1;
+    // One pointer straight onto a function; a pointer to a function pointer points at data.
+    const functionPointer = levels === 1 && rest[1]?.kind === 'func';
     return {
       type: `${base.type}${'*'.repeat(Math.max(1, levels))}`,
       declaredType: func ? `${base.declaredType ?? base.type} (*)(${func.params})` : base.declaredType ? `${base.declaredType}*` : undefined,
       isPointer: true,
-      // One pointer straight onto a function; a pointer to a function pointer points at data.
-      ...(levels === 1 && rest[1]?.kind === 'func' && { functionPointer: true }),
+      ...(functionPointer && { functionPointer: true }),
+      ...(!functionPointer && { pointee: this.applyDeclarator(base, { ...decl, derivations: rest.slice(1) }, name) }),
       dims,
     };
   }
@@ -936,7 +1021,11 @@ export class StructParser {
           this.pos += 2;
           continue;
         }
-        if (t.kind === 'id' && ['using', 'static_assert', '_Static_assert', 'template', 'friend'].includes(t.value)) {
+        if (t.kind === 'id' && (t.value === 'static_assert' || t.value === '_Static_assert')) {
+          this.checkStaticAssert();
+          continue;
+        }
+        if (t.kind === 'id' && ['using', 'template', 'friend'].includes(t.value)) {
           this.skipMember(close);
           continue;
         }
@@ -1083,38 +1172,178 @@ export class StructParser {
     const base = this.baseTypeInfo(spec);
     const info = this.applyDeclarator(base, decl, name || 'bit-field');
 
-    const member: StructMember = { name, type: info.type, line: decl.line };
-    if (info.functionPointer) member.functionPointer = true;
+    const member = this.memberOfType(info, name, false);
+    member.line = decl.line;
     const declared = spec.base!.kind === 'name' ? (info.isPointer ? info.declaredType ?? undefined : spec.base!.name) : info.declaredType;
     if (declared && declared !== info.type) member.declaredType = declared;
 
-    if (info.dims.length > 0) {
-      member.arrayDims = info.dims;
-      member.arraySize = info.dims.reduce((a, b) => a * b, 1);
-    }
     if (decl.bitWidth !== undefined) {
       if (info.dims.length > 0 || info.isPointer) {
         this.fail(`Bit-field '${name || '(unnamed)'}' must have an integer type.`, decl.line);
       }
       member.bitField = decl.bitWidth;
     }
+
+    const aligned = decl.attrs.aligned ?? spec.attrs.aligned;
+    if (aligned !== undefined) member.alignAttribute = aligned;
+    if (decl.attrs.packed || spec.attrs.packed) member.packed = true;
+    return member;
+  }
+
+  /**
+   * A member of type `info`. Records and enums are linked to their definitions now when `resolve`
+   * is set, as measuring needs; members are linked at the end (resolveReferences), so a typedef
+   * may name a record defined after it.
+   */
+  private memberOfType(info: TypeInfo, name: string, resolve: boolean): StructMember {
+    const member: StructMember = { name, type: info.type };
+    if (info.functionPointer) member.functionPointer = true;
+    if (info.dims.length > 0) {
+      member.arrayDims = info.dims;
+      member.arraySize = info.dims.reduce((a, b) => a * b, 1);
+    }
     if (!info.isPointer) {
       if (info.recordRef) {
         member.isNested = true;
-        if (info.nestedStruct) member.nestedStruct = info.nestedStruct;
+        const def = info.nestedStruct ?? (resolve ? this.resolveStructTypeByName(info.recordRef.name) : undefined);
+        if (def) member.nestedStruct = def;
       }
       if (info.enumRef !== undefined) {
         const enumType = info.enumType ?? this.resolveEnumTypeByName(info.enumRef);
         if (enumType) member.enumType = enumType;
       }
+      // A pointer to an aligned typedef is an ordinary pointer.
+      if (info.typeAlignment !== undefined) member.typeAlignment = info.typeAlignment;
     }
-
-    const aligned = decl.attrs.aligned ?? spec.attrs.aligned;
-    if (aligned !== undefined) member.alignAttribute = aligned;
-    // A pointer to an aligned typedef is an ordinary pointer.
-    if (!info.isPointer && info.typeAlignment !== undefined) member.typeAlignment = info.typeAlignment;
-    if (decl.attrs.packed || spec.attrs.packed) member.packed = true;
     return member;
+  }
+
+  /** The type of a laid-out member, to go on from it in `offsetof(T, a.b[2])`. */
+  private typeOfMember(m: StructMember): TypeInfo {
+    const isPointer = m.type.includes('*');
+    return {
+      type: m.type,
+      ...(m.declaredType !== undefined && { declaredType: m.declaredType }),
+      isPointer,
+      ...(m.functionPointer && { functionPointer: true }),
+      dims: m.arrayDims ?? [],
+      ...(!isPointer && m.isNested && { recordRef: { keyword: m.nestedStruct?.isUnion ? 'union' as const : 'struct' as const, name: m.nestedStruct?.name ?? m.type.replace(/^(struct|union)\s+/, '') } }),
+      ...(m.nestedStruct && { nestedStruct: m.nestedStruct }),
+      ...(m.enumType && { enumRef: m.enumType.name, enumType: m.enumType }),
+      ...(m.typeAlignment !== undefined && { typeAlignment: m.typeAlignment }),
+    };
+  }
+
+  // ------------------------------------------------------------------ types in constant expressions
+
+  /** Whether `t` can start a type-name: a type keyword or qualifier, or a name declared as a type. */
+  private startsTypeName(t: Token | undefined): boolean {
+    if (t?.kind !== 'id') return false;
+    const v = t.value;
+    return (
+      BUILTIN_WORDS.has(v) ||
+      TYPE_NAME_QUALIFIERS.has(v) ||
+      v === 'struct' || v === 'union' || v === 'enum' || v === 'class' ||
+      STANDARD_TYPEDEFS.has(v) ||
+      this.typeAliases.has(v) || this.structAliases.has(v) || this.enumAliases.has(v) ||
+      // C++: a class or enum is a type name without its keyword.
+      this.structs.has(v) || this.unions.has(v) || this.enums.has(v)
+    );
+  }
+
+  /** A record or enum type that has no definition yet, which `sizeof` and friends cannot measure. */
+  private requireComplete(info: TypeInfo): void {
+    if (info.isPointer) return;
+    if (info.dims.includes(0)) throw new ConstExprError(`'${this.describeType(info)}' is an array of unknown size`);
+    if (info.type === 'void') throw new ConstExprError("'void' has no size");
+    if (info.recordRef && !(info.nestedStruct ?? this.resolveStructTypeByName(info.recordRef.name))) {
+      throw new ConstExprError(`'${this.describeType(info)}' is incomplete here: it has no definition before this point`);
+    }
+    if (info.enumRef !== undefined && !(info.enumType ?? this.resolveEnumTypeByName(info.enumRef))) {
+      throw new ConstExprError(`'${this.describeType(info)}' is incomplete here: it has no definition before this point`);
+    }
+  }
+
+  /** The type measured as it is so far: records defined before this point, linked to their members. */
+  private measurable(info: TypeInfo): StructMember {
+    this.requireComplete(info);
+    this.resolveReferences();
+    return this.memberOfType(info, '', true);
+  }
+
+  private describeType(info: TypeInfo): string {
+    return info.dims.length > 0 ? `${info.declaredType ?? info.type}[${info.dims.join('][')}]` : info.declaredType ?? info.type;
+  }
+
+  /** Whether a value of the integer type is signed: undefined where the target decides and it is not modelled. */
+  private signedness(info: TypeInfo): 'signed' | 'unsigned' | undefined {
+    if (info.enumType || info.enumRef !== undefined) return undefined;
+    const type = info.type;
+    if (type.startsWith('unsigned ') || ['char8_t', 'char16_t', 'char32_t'].includes(type)) return 'unsigned';
+    if (['signed char', 'short', 'int', 'long', 'long long', '__int128'].includes(type)) return 'signed';
+    return STANDARD_TYPEDEFS.get(type);
+  }
+
+  private createOracle(): TypeOracle<TypeInfo> {
+    return {
+      typeName: (tokens, start) => {
+        if (!this.startsTypeName(tokens[start])) return undefined;
+        const savedTokens = this.tokens;
+        const savedPos = this.pos;
+        this.tokens = tokens as Token[];
+        this.pos = start;
+        try {
+          const spec = this.parseSpecifiers(null, false);
+          if (!spec.base || spec.isTypedef || spec.isStatic) return undefined;
+          const decl = this.parseDeclarator(true);
+          if (decl.name !== undefined || decl.bitWidth !== undefined) return undefined;
+          return { type: this.applyDeclarator(this.baseTypeInfo(spec), decl, 'type name'), end: this.pos };
+        } finally {
+          this.tokens = savedTokens;
+          this.pos = savedPos;
+        }
+      },
+      sizeOf: (info) => this.calculator.measure(this.measurable(info)).size,
+      alignOf: (info, preferred) => {
+        const member = this.measurable(info);
+        return preferred ? this.calculator.preferredAlignment(member) : this.calculator.measure(member).alignment;
+      },
+      member: (info, name) => {
+        const def = info.isPointer || info.dims.length > 0 || !info.recordRef ? undefined : info.nestedStruct ?? this.resolveStructTypeByName(info.recordRef.name);
+        if (!def) {
+          if (info.recordRef && !info.isPointer && info.dims.length === 0) this.requireComplete(info);
+          throw new ConstExprError(`'${name}' is looked up in '${this.describeType(info)}', which is not a struct or union`);
+        }
+        this.resolveReferences();
+        const found = findLaidOutMember(this.calculator.calculate(def), name);
+        if (!found) throw new ConstExprError(`'${this.describeType(info)}' has no member '${name}'`);
+        if (found.member.bitField !== undefined) throw new ConstExprError(`'${name}' is a bit-field, which has no address`);
+        return { offset: found.offset, type: this.typeOfMember(found.member) };
+      },
+      element: (info) => (info.dims.length > 0 ? { ...info, dims: info.dims.slice(1) } : info.isPointer ? info.pointee : undefined),
+      isArray: (info) => info.dims.length > 0,
+      isPointer: (info) => info.isPointer && info.dims.length === 0,
+      convert: (info, value) => {
+        if (info.isPointer || info.dims.length > 0 || info.recordRef) {
+          throw new ConstExprError(`a cast to '${this.describeType(info)}' does not give an integer`);
+        }
+        if (/\b(float|double)\b/.test(info.type)) throw new ConstExprError(`'${this.describeType(info)}' is not an integer type`);
+        if (info.type === '_Bool' || info.type === 'bool') return value ? 1 : 0;
+        // Exact for 64-bit types, where doubles would round.
+        const bits = 8 * this.calculator.measure(this.measurable(info)).size;
+        const exact = BigInt(Math.trunc(value));
+        const asUnsigned = Number(BigInt.asUintN(bits, exact));
+        const asSigned = Number(BigInt.asIntN(bits, exact));
+        const signedness = this.signedness(info);
+        if (signedness === 'unsigned') return asUnsigned;
+        if (signedness === 'signed') return asSigned;
+        if (asUnsigned !== asSigned) {
+          throw new ConstExprError(`converting ${value} to '${this.describeType(info)}' depends on whether that type is signed on this target, which is not modelled`);
+        }
+        return asUnsigned;
+      },
+      describe: (info) => this.describeType(info),
+    };
   }
 
   // ------------------------------------------------------------------ resolution
@@ -1215,6 +1444,21 @@ export class StructParser {
   isStruct(name: string): boolean {
     return this.structs.has(name);
   }
+}
+
+/**
+ * Member `name` of a laid-out record and its offset, looking inside anonymous struct and union
+ * members, whose members belong to the enclosing record (C11 6.7.2.1p13).
+ */
+function findLaidOutMember(layout: CalculationResult, name: string): { member: StructMember; offset: number } | undefined {
+  for (const m of layout.members) {
+    if (m.member.name === name) return { member: m.member, offset: m.offset };
+    if (m.member.name === '' && m.nested) {
+      const inner = findLaidOutMember(m.nested, name);
+      if (inner) return { member: inner.member, offset: m.offset + inner.offset };
+    }
+  }
+  return undefined;
 }
 
 /** Normalize builtin type words to the names used by the type tables ("short int" -> "short"). */

@@ -91,14 +91,17 @@ export function computeVerificationCode(spec: LayoutSpec, input: string): ToolRe
   const useOptimized = data.mode === "optimized" && optimized;
   // Packed: the very source the Struct Layout tool laid out for this mode, packing written in.
   const usePacked = data.mode === "packed" && data.analysis.packed;
+  const { platform } = data.analysis;
   const code = useOptimized
     ? CCodeGenerator.generateVerificationCode(
         CCodeGenerator.generateOptimizedCode(result.struct, optimized.struct),
+        platform,
         CCodeGenerator.getOptimizedRootName(result.struct, optimized.struct),
         language,
       )
     : CCodeGenerator.generateVerificationCode(
         usePacked ? applyPacking(input, data.analysis.packing) : input,
+        platform,
         result.struct.name,
         language,
       );

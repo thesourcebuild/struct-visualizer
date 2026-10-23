@@ -1,6 +1,7 @@
 import type { AlignRequest, ParsedStruct, StructMember } from '../types';
 import { memberLabel } from '../display';
 import { StructParser } from '../parser/struct-parser';
+import type { ParserTarget } from '../parser/struct-parser';
 
 export class CCodeGenerator {
   /**
@@ -8,8 +9,8 @@ export class CCodeGenerator {
    * definition, so results can be checked against a real compiler. The source is included
    * verbatim; the member list comes from the same parser the calculator uses.
    */
-  static generateVerificationCode(structCode: string, structName?: string, language: 'c' | 'cpp' = 'c'): string {
-    const parser = new StructParser();
+  static generateVerificationCode(structCode: string, target: ParserTarget, structName?: string, language: 'c' | 'cpp' = 'c'): string {
+    const parser = new StructParser(target);
     parser.parse(structCode);
     const def = (structName ? parser.getStruct(structName) ?? parser.getUnion(structName) : undefined) ?? parser.getLastDefinition();
     const name = def?.name ?? structName ?? 'Example';

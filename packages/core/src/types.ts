@@ -9,9 +9,10 @@ export interface DataType {
 
 /**
  * An explicit alignment request: a byte count, 'max' for `aligned` with no argument (the
- * target's largest alignment), or the alignment of a type for `alignas(type)`.
+ * target's largest alignment), or `alignas(type)`: the type as written and its alignment on the
+ * target it was parsed for.
  */
-export type AlignRequest = number | 'max' | { ofType: string };
+export type AlignRequest = number | 'max' | { ofType: string; alignment: number };
 
 export interface StructMember {
   /** Empty for unnamed members: unnamed bit-fields and C11 anonymous struct/union members. */
@@ -114,6 +115,12 @@ export interface Architecture {
   alignUnnamedBitfields?: boolean;
   /** Enums take the smallest integer type that holds their values (-fshort-enums; arm-none-eabi). */
   shortEnums?: boolean;
+  /**
+   * GCC's `__alignof__` for scalar types aligned more on their own than as members: on i386
+   * SysV, 8-byte scalars are 8-aligned alone and 4-aligned in a struct, and `_Alignof` gives 4.
+   * Measured in tests/cross-compiler.test.ts.
+   */
+  preferredAlignment?: Record<string, number>;
 }
 
 export interface PackingRules {

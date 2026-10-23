@@ -13,7 +13,7 @@ import {
   resolveArchitectureForSelection,
   targetArchitectureList,
 } from '@sp/core';
-import type { CalculationResult, DataModel, OSType, ParsedStruct, TargetArchitecture } from '@sp/core';
+import type { CalculationResult, DataModel, OSType, ParsedStruct, ParserTarget, TargetArchitecture } from '@sp/core';
 
 type TestCase = {
   name: string;
@@ -76,9 +76,9 @@ function assertBasicLayoutInvariants(result: CalculationResult, isPacked: boolea
   assert.equal(result.totalSize % structAlignment, 0, 'total size must be aligned to struct alignment');
 }
 
-function assertVerificationGeneration(code: string, parsed: ParsedStruct): void {
-  const cCode = CCodeGenerator.generateVerificationCode(code, parsed.name, 'c');
-  const cppCode = CCodeGenerator.generateVerificationCode(code, parsed.name, 'cpp');
+function assertVerificationGeneration(code: string, parsed: ParsedStruct, target: ParserTarget): void {
+  const cCode = CCodeGenerator.generateVerificationCode(code, target, parsed.name, 'c');
+  const cppCode = CCodeGenerator.generateVerificationCode(code, target, parsed.name, 'cpp');
 
   assert.ok(cCode.includes('#include <stdio.h>'), 'C verification code must include stdio');
   assert.ok(cCode.includes('offsetof('), 'C verification code must print offsetof');
@@ -105,7 +105,7 @@ function runSingleCode(
     `missing architecture mapping for combo: ${dataModel}/${target}/${osType} -> ${architectureId}`
   );
 
-  const parser = new StructParser();
+  const parser = new StructParser({ architecture, dataModel });
   const validation = parser.parse(code);
   assert.ok(
     validation.isValid,
@@ -118,7 +118,7 @@ function runSingleCode(
   const calculator = new PaddingCalculator(architecture, dataModel);
   const result = calculator.calculate(parsed);
   // Packed: the source with __attribute__((packed)) on every definition, laid out the same way.
-  const packedParser = new StructParser();
+  const packedParser = new StructParser({ architecture, dataModel });
   packedParser.parse(applyPacking(code, 'attribute'));
   const packed = calculator.calculate(packedParser.getLastDefinition()!);
   const comparison = calculator.compareLayouts(parsed);
@@ -127,7 +127,7 @@ function runSingleCode(
 
   assertBasicLayoutInvariants(result, false);
   assertBasicLayoutInvariants(packed, true);
-  assertVerificationGeneration(code, parsed);
+  assertVerificationGeneration(code, parsed, { architecture, dataModel });
 
   if (PRINT_LAYOUTS) {
     const label = caseLabel ?? `${parsed.name}/${target}/${osType}/${dataModel}`;

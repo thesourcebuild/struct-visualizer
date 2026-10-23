@@ -650,6 +650,7 @@ export function resolveArchitectureForSelection(
         ? { ...baseArchitecture.packingRules }
         : { structAlignment: 'max', paddingAlignment: true };
     let dataTypes = baseArchitecture.dataTypes ? { ...baseArchitecture.dataTypes } : undefined;
+    let preferredAlignment: Record<string, number> | undefined;
 
     switch (targetArchitecture) {
         case 'intel-x86':
@@ -669,6 +670,8 @@ export function resolveArchitectureForSelection(
                     'long double': { name: 'long double', size: 12, alignment: 4, category: 'primitive' as const },
                 };
                 dataTypes = { ...(dataTypes ?? {}), ...linuxX86Overrides };
+                // GCC's __alignof__ still gives these their own 8 (measured with i686-linux-gnu-gcc).
+                preferredAlignment = { 'double': 8, 'long long': 8, 'unsigned long long': 8, 'int64_t': 8, 'uint64_t': 8 };
             } else if (osType === 'windows') {
                 // Win32/MSVC-style defaults: keep 64-bit scalar alignment at 8.
                 const windowsX86Overrides = {
@@ -744,6 +747,7 @@ export function resolveArchitectureForSelection(
         defaultAlignment,
         maxAlignment,
         packingRules,
+        ...(preferredAlignment && { preferredAlignment }),
         ...bitfieldAndEnumRules(dataModel, targetArchitecture, osType),
     };
 }

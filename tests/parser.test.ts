@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CCodeGenerator, StructParser, analyzeStruct } from "@sp/core";
+import { CCodeGenerator, StructParser, analyzeStruct, resolvePlatform } from "@sp/core";
 import type { PlatformSelection } from "@sp/core";
 
 // Expected values are what GCC produces for x86-64 Linux (System V, LP64) unless noted.
@@ -52,9 +52,9 @@ describe("declarators", () => {
   });
 
   it("reports errors with their line", () => {
-    const a = analyzeStruct("struct S {\n  int a;\n  char b[sizeof(int)];\n};", X64);
+    const a = analyzeStruct("struct S {\n  int a;\n  char b[N];\n};", X64);
     expect(a.errors[0]?.line).toBe(3);
-    expect(a.errors[0]?.message).toMatch(/sizeof/);
+    expect(a.errors[0]?.message).toMatch(/'N' is not a known constant/);
     expect(analyzeStruct("struct S {\n  int a\n  int b;\n};", X64).errors[0]?.message).toMatch(/Expected ';' after member 'a'/);
   });
 });
@@ -84,7 +84,7 @@ describe("packing and alignment", () => {
 
   it("applies #pragma pack with push/pop scoping", () => {
     const code = "#pragma pack(push, 2)\nstruct P { char a; int b; };\n#pragma pack(pop)\nstruct Q { char a; int b; struct P p; };";
-    const parser = new StructParser();
+    const parser = new StructParser(resolvePlatform(X64));
     parser.parse(code);
     expect(parser.getStruct("P")?.pragmaPack).toBe(2);
     expect(parser.getStruct("Q")?.pragmaPack).toBeUndefined();
@@ -155,8 +155,15 @@ describe("preprocessor", () => {
     expect(r.offsets).toEqual({ c: 0, w: 8 });
   });
 
-  it("reports function-like macros instead of misparsing them", () => {
-    expect(layout("#define ARR(n) char a[n]\nstruct S { ARR(4); };").errors[0]).toMatch(/Function-like macro 'ARR/);
+  it("expands function-like macros in declarations", () => {
+    const r = layout("#define ARR(name, n) char name[n]\n#define PAD(n) ARR(pad##n, n)\nstruct S { ARR(a, 3); PAD(5); int x; };");
+    expect(r.errors).toEqual([]);
+    expect(r.offsets).toEqual({ a: 0, pad5: 3, x: 8 });
+  });
+
+  it("reports a wrong argument count and an unterminated invocation", () => {
+    expect(layout("#define F(a, b) a\nstruct S { int F(x); };").errors[0]).toMatch(/Macro 'F' takes 2 arguments, but 1 was given/);
+    expect(layout("#define F(a) a\nstruct S { int F(x; };").errors[0]).toMatch(/Unterminated invocation of macro 'F'/);
   });
 
   it("says when a pragma has no effect", () => {
@@ -202,5 +209,39 @@ describe("optimized code generation", () => {
     expect(again.errors).toEqual([]);
     expect(again.result!.totalSize).toBe(a.optimized!.totalSize);
     expect(again.result!.members.map((m) => m.offset)).toEqual(a.optimized!.members.map((m) => m.offset));
+  });
+});
+
+describe("constant expressions with types", () => {
+  const I386: PlatformSelection = { target: "intel-x86", dataModel: "ILP32", os: "linux" };
+
+  it("works out sizeof and offsetof for the target, from the definitions before them", () => {
+    const code = "struct H { char c; long l; };\nstruct S { char pad[32 - sizeof(struct H)]; char at[offsetof(struct H, l)]; };";
+    expect(layout(code).offsets).toEqual({ pad: 0, at: 16 });
+    expect(layout(code, I386).offsets).toEqual({ pad: 0, at: 24 });
+  });
+
+  it("gives __alignof__ the i386 preferred alignment and _Alignof the member alignment", () => {
+    const r = layout("struct S { char a[_Alignof(double)]; char b[__alignof__(double)]; };", I386);
+    expect(r.offsets).toEqual({ a: 0, b: 4 });
+    expect(r.size).toBe(12);
+  });
+
+  it("reports a type with no definition yet", () => {
+    expect(layout("struct S { char a[sizeof(struct S)]; };").errors[0]).toMatch(/'struct S' is incomplete here/);
+    expect(layout("struct S { char a[sizeof(struct Later)]; };\nstruct Later { int x; };").errors[0]).toMatch(/'struct Later' is incomplete here/);
+  });
+
+  it("reports a failed static assertion and one it cannot check", () => {
+    expect(layout('_Static_assert(sizeof(long) == 4, "ILP32 only");\nstruct S { int a; };').errors[0]).toBe('Static assertion failed: "ILP32 only" (sizeof ( long ) == 4).');
+    expect(layout("static_assert(std::is_pod<int>::value);\nstruct S { int a; };").warnings[0]).toMatch(/is not checked/);
+  });
+
+  it("rejects sizeof in #if, as the preprocessor does", () => {
+    expect(layout("#if sizeof(int) == 4\n#endif\nstruct S { int a; };").errors[0]).toMatch(/'sizeof' needs types, which #if does not know/);
+  });
+
+  it("does not guess how a value converts to a type whose signedness the target decides", () => {
+    expect(layout("struct S { char a[(char)200 > 0 ? 1 : 2]; };").errors[0]).toMatch(/depends on whether that type is signed/);
   });
 });

@@ -65,22 +65,6 @@ export class PaddingCalculator {
    * Lay out a struct. Positions are tracked in bits so that bit-fields can be placed exactly; a
    * member that is not a bit-field always starts on a byte, at the first one its alignment allows.
    *
-   * Bit-fields follow the target compiler's rules (`bitfieldLayout`), both checked against the
-   * compilers in tests/cross-compiler.test.ts:
-   * - 'gcc' (GCC and Clang outside Windows): a field goes at the next free bit unless that would
-   *   make it span more units of its type's alignment than its type has, in which case it moves to
-   *   the next such boundary. Under `packed` or any `#pragma pack` that check is skipped.
-   * - 'ms' (MSVC, and MinGW's default -mms-bitfields): a field opens a storage unit of its type's
-   *   size, aligned like the type, unless the previous member is a bit-field of a type of the same
-   *   size whose unit still has room.
-   *
-   * Padding is what no member occupies: the bytes between the end of one member's bits and the
-   * byte where the next member starts, and the trailing bytes up to the struct's alignment.
-   */
-  /**
-   * Lay out a struct. Positions are tracked in bits so that bit-fields can be placed exactly; a
-   * member that is not a bit-field always starts on a byte, at the first one its alignment allows.
-   *
    * Bit-fields follow the target compiler's rules (`bitfieldLayout`), each checked against the
    * compiler in tests/cross-compiler.test.ts:
    * - 'gcc' (GCC and Clang outside Windows): a field goes at the next free bit. On targets where
@@ -358,7 +342,24 @@ export class PaddingCalculator {
   private resolveAlignRequest(request: AlignRequest): number {
     if (typeof request === 'number') return request;
     if (request === 'max') return this.architecture.maxAlignment ?? this.architecture.defaultAlignment;
-    return this.getTypeInfo(request.ofType).alignment;
+    return request.alignment;
+  }
+
+  /**
+   * `sizeof` and `_Alignof` of a member's type on its own: no packing or alignment request of an
+   * enclosing struct applies, an aligned typedef's alignment does.
+   */
+  measure(member: StructMember): { size: number; alignment: number } {
+    const { size, alignment } = this.getMemberSizeAndAlignment(member);
+    return { size, alignment: member.typeAlignment !== undefined ? this.resolveAlignRequest(member.typeAlignment) : alignment };
+  }
+
+  /** GCC's `__alignof__`: the type's own alignment, which for some scalars exceeds `_Alignof`. */
+  preferredAlignment(member: StructMember): number {
+    if (member.typeAlignment !== undefined) return this.resolveAlignRequest(member.typeAlignment);
+    const natural = this.measure(member).alignment;
+    if (member.isNested || member.enumType || member.type.includes('*')) return natural;
+    return this.architecture.preferredAlignment?.[this.normalizeType(member.type)] ?? natural;
   }
 
   /**

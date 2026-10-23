@@ -45,12 +45,12 @@ A real tokenizer, preprocessor and declarator parser, not pattern matching:
 - typedefs of any type: scalars, pointers, arrays, function pointers
 - nested, named-nested and anonymous (C11) struct/union members
 - full C declarators: `char *names[4]`, `char (*row)[16]`, function pointers, several names per declaration
-- array sizes and bit-field widths as constant expressions, including `#define` and enum constants
+- array sizes, bit-field widths and enum values as constant expressions, including macros, enum constants, casts, and `sizeof`, `_Alignof`, `__alignof__` and `offsetof` worked out for the selected target from the definitions before them (`char pad[64 - sizeof(struct Head)]`), as are `&((T *)0)->m` and `sizeof(((T *)0)->m)`; `_Static_assert` is checked
 - flexible array members (`int data[];`)
 - bit-fields placed bit by bit by each compiler's own rules (GCC and Clang, MSVC, SDCC), including unnamed, zero-width, packed and `#pragma pack` ones; the walkthrough shows each field's bit range
 - `#pragma pack(n)` with `push`/`pop`, `__attribute__((packed))`, Keil's and IAR's `__packed`, `__attribute__((aligned(n)))` on members, types and typedefs, `alignas` / `_Alignas`, `__declspec(align(n))`, packed enums; `#pragma pack` caps alignment requests, `packed` does not, as GCC and MSVC do
 - **Packed mode** packs every definition in the syntax you choose, `#pragma pack(1)`, `__attribute__((packed))` or `__packed`, offering only what the platform's compiler accepts (MSVC and the 8051 compilers: `#pragma pack`). The two GCC/MSVC forms differ for zero-width bit-fields. The Verification Code tool prints exactly the packed source the layout was computed from
-- the preprocessor: `#define`, `#if`/`#ifdef`/`#elif`/`#else`, `#include` (skipped; standard types are built in)
+- the preprocessor: object-like and function-like macros expanded as C11 specifies, with `#`, `##`, `__VA_ARGS__`, `__VA_OPT__` and GNU's `, ## __VA_ARGS__`; `#if`/`#ifdef`/`#elif`/`#else`; `#include` (skipped; standard types are built in). No macro is predefined
 - C++: methods, static members, access specifiers, nested types and default member initializers take no space
 
 ### Go
@@ -82,7 +82,7 @@ The engines are tested against the real compilers, not against expected values w
 | Language | Ground truth (`tests/`) |
 |---|---|
 | C | `compiler.test.ts` compiles and runs each case with the host's GCC and compares `sizeof`, alignment and every `offsetof` |
-| C, every target | `cross-compiler.test.ts` compiles every C example and the bit-field, enum and pointer cases for 14 targets: GCC for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64 (Linux and bare metal), MIPS (PIC32) and AVR; MinGW for x86-64 and i386 Windows (MSVC's bit-field rules); SDCC for the 8051. Every case is also compiled packed, as `#pragma pack(1)` and as `__attribute__((packed))` wherever the compiler takes them, from the same source the Verification Code tool prints. It reads size, alignment, every `offsetof` and each bit-field's bit position back from the object file, so cross compilers need not run anything |
+| C, every target | `cross-compiler.test.ts` compiles every C example and the bit-field, enum, pointer, `sizeof`/`offsetof` and macro cases for 14 targets: GCC for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64 (Linux and bare metal), MIPS (PIC32) and AVR; MinGW for x86-64 and i386 Windows (MSVC's bit-field rules); SDCC for the 8051. Every case is also compiled packed, as `#pragma pack(1)` and as `__attribute__((packed))` wherever the compiler takes them, from the same source the Verification Code tool prints. It reads size, alignment, every `offsetof` and each bit-field's bit position back from the object file, so cross compilers need not run anything |
 | Go | `go-compiler.test.ts` checks every case and its reordered version against `go/types` on all 14 architectures, then compiles and runs the generated verification code with `GOARCH=amd64` and `GOARCH=386` |
 | Rust | `rust-compiler.test.ts` compiles and runs 71 cases on x86_64-pc-windows-msvc, and checks the same facts as compile-time assertions on thumbv7em-none-eabihf (no_std) |
 | All | `cross-language.test.ts` checks that the Go ports and the `repr(C)` Rust ports of the C examples have the C layout |
@@ -186,7 +186,7 @@ The engines all produce the same result shape. A struct, union or enum, in any l
 These results model compilers; they are not compilers. Not modelled:
 
 - **C++:** inheritance and the vtable pointer of classes with virtual functions; templates (a template has no layout until instantiated).
-- **C:** bit-fields on XC16, Keil C51 and bare-metal AArch64 follow GCC's rules without a compiler check (SP004); Packed mode with Keil's and IAR's `__packed` is laid out like GCC's packed attribute, also unchecked (SP009); the 8-bit Microchip target is AVR, not 8-bit PIC; function-like macros (reported, not expanded) and `sizeof` in array sizes; `__attribute__((mode))`, `vector_size` and `ms_struct` (reported when used).
+- **C:** bit-fields on XC16, Keil C51 and bare-metal AArch64 follow GCC's rules without a compiler check (SP004); Packed mode with Keil's and IAR's `__packed` is laid out like GCC's packed attribute, also unchecked (SP009); the 8-bit Microchip target is AVR, not 8-bit PIC; the compiler's predefined macros (`_WIN32`, `__SIZEOF_LONG__`...), so `#ifdef` on them takes the undefined branch everywhere; `__attribute__((mode))`, `vector_size` and `ms_struct` (reported when used).
 - **Go:** TinyGo (planned); standard-library types beyond the common ones (declare them in the input to lay them out); types from other modules.
 - **Rust:**
   - `repr(Rust)` shows what rustc 1.99 does today, which other versions may change.

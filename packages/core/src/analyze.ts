@@ -39,7 +39,7 @@ export interface StructAnalysis {
 export function analyzeStruct(code: string, selection: PlatformSelection, packing?: PackingSyntax): StructAnalysis {
   const platform = resolvePlatform(selection);
   const syntax = resolvePackingSyntax(platform.os, platform.dataModel, packing);
-  const parser = new StructParser();
+  const parser = new StructParser(platform);
   const validation = parser.parse(code);
   const typeErrors = validation.isValid
     ? validateSupportedTypes(parser, platform.dataModel, platform.architecture)
@@ -81,7 +81,7 @@ export function analyzeStruct(code: string, selection: PlatformSelection, packin
 
 /** The last definition of already-packed source, laid out on `platform`. */
 function packedLayout(code: string, platform: ResolvedPlatform): CalculationResult | null {
-  const parser = new StructParser();
+  const parser = new StructParser(platform);
   if (!parser.parse(code).isValid) return null;
   const definition = parser.getLastDefinition();
   return definition ? new PaddingCalculator(platform.architecture, platform.dataModel).calculate(definition) : null;
