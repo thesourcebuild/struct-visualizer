@@ -3,9 +3,11 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PaddingCalculator, analyzeStruct, bindingTargetName, examples, generateBindings } from "@sp/core";
 import type { BindingLanguage, BindingOutput, CalculationResult, PlatformSelection } from "@sp/core";
+import { References, digest, useReferences } from "./support/references";
+import type { Answer } from "./support/references";
 
 /**
  * Every binding the Bindings tool writes is compiled by its language and its layout read back
@@ -17,6 +19,9 @@ import type { BindingLanguage, BindingOutput, CalculationResult, PlatformSelecti
  * Rust: with the stable compiler for the targets rustup ships a standard library for (rustup
  * target add), and by building core from source on nightly (-Zbuild-std) for the tier-3 targets it
  * ships none for (MIPS, AVR). SP_REQUIRE_BINDING_TOOLCHAINS makes a target left unchecked a failure.
+ *
+ * A binding no toolchain here can compile is checked against what its compiler confirmed when it
+ * last compiled that same code (tests/references/bindings.json, see ./support/references.ts).
  */
 const run = promisify(execFile);
 const requireToolchains = Boolean(process.env.SP_REQUIRE_BINDING_TOOLCHAINS);
@@ -408,17 +413,28 @@ const CHECKERS: Record<BindingLanguage, { available: boolean; check: () => Promi
   "python-ctypes": { available: toolchains.python, check: checkPython },
 };
 
+/**
+ * What a binding was checked to have when it was compiled: the size and member offsets its
+ * compiler confirmed, for the code it was given (a digest), which is the only code they hold for.
+ */
+interface Confirmed {
+  code: string;
+  size: number;
+  offsets: Record<string, number>;
+}
+const refs = new References<Confirmed>("bindings");
+afterAll(() => refs.save());
+
 for (const language of LANGUAGES) {
   const checker = CHECKERS[language];
-  if (!checker.available) {
-    if (requireToolchains) it(`${language} toolchain is installed`, () => expect.fail(`no ${language} toolchain`));
-    continue;
-  }
-  describe(`${language} bindings`, () => {
+  const compile = checker.available && !useReferences;
+  if (!checker.available && requireToolchains) it(`${language} toolchain is installed`, () => expect.fail(`no ${language} toolchain`));
+  describe(`${language} bindings${compile ? "" : " (recorded answers)"}`, () => {
     beforeAll(async () => {
       failures.set(language, failures.get(language) ?? new Map());
       ran.set(language, ran.get(language) ?? new Set());
       unavailable.set(language, unavailable.get(language) ?? new Map());
+      if (!compile) return;
       if (language === "python-struct") {
         failures.set("python-ctypes", failures.get("python-ctypes") ?? new Map());
         ran.set("python-ctypes", ran.get("python-ctypes") ?? new Set());
@@ -435,13 +451,24 @@ for (const language of LANGUAGES) {
           ctx.skip(binding.error);
           return;
         }
-        if (!ran.get(language)!.has(p.index)) {
-          const why = unavailable.get(language)!.get(p.index) ?? `no ${language} compiler for this target here`;
-          if (requireToolchains) expect.fail(`not checked: ${why}`);
-          ctx.skip(why);
-          return;
+        const compiled = ran.get(language)!.has(p.index);
+        if (compile && !compiled && requireToolchains) {
+          expect.fail(`not checked: ${unavailable.get(language)!.get(p.index) ?? `no ${language} compiler for this target here`}`);
         }
-        expect(failures.get(language)!.get(p.index), binding.code).toBeUndefined();
+        // What the binding must have: the C layout's size and the offsets of the members it keeps.
+        const want: Confirmed = { code: digest(binding.code), size: p.expected.size, offsets: Object.fromEntries(p.expected.union ? [] : kept(p, language)) };
+        let now: Answer<Confirmed> | undefined;
+        if (compiled) {
+          const failure = failures.get(language)!.get(p.index);
+          now = failure !== undefined ? { rejected: failure } : { layout: want };
+        }
+        const truth = refs.answer(`${language} | ${p.target.name} | ${p.label}`, now);
+        if ("rejected" in truth) expect.fail(`${truth.rejected}\n${binding.code}`);
+        if (!("layout" in truth)) throw new Error("no layout");
+        if (truth.layout.code !== want.code) {
+          throw new Error(`The ${language} binding changed since its compiler checked it. Record it again with SP_RECORD_REFERENCES=1 and the ${language} toolchain installed.\n${binding.code}`);
+        }
+        expect(want, binding.code).toEqual(truth.layout);
       });
     }
   });

@@ -98,7 +98,14 @@ A port of Zig 0.16's layout code (`Type.abiSize`, `Type.abiAlignment` and Sema's
 
 ## How results are checked
 
-The engines are tested against the real compilers, not against expected values written by hand. The tests skip a compiler that is not installed.
+The engines are tested against the real compilers, not against expected values written by hand.
+
+**Compiler references.** What the compilers answered for every case on every target is recorded in `tests/references/` (one JSON file per suite: `c`, `cpp`, `go`, `rust`, `zig`, `bindings`). Only a compiler's answer is ever recorded, never the engine's:
+
+- Where a compiler is installed, its suite checks the engine against the compiler, and the recording against the compiler too. A recording that is missing or differs fails, so none goes stale (CI has every compiler).
+- Where one is not, the suite checks the engine against the recording. Every target is still checked: MSVC's on Linux, the cross compilers' on a machine with none.
+- A binding or reordered struct is recorded with a digest of the code its compiler was given. When the generated code changes, the check fails until it is compiled and recorded again, rather than vouching for code no compiler has seen.
+- `SP_RECORD_REFERENCES=1 pnpm test` records the installed compilers' answers (a compiler that is not installed keeps its recordings). `SP_USE_REFERENCES=1` checks against the recordings even where the compilers are installed.
 
 | Language | Ground truth (`tests/`) |
 |---|---|
@@ -106,7 +113,7 @@ The engines are tested against the real compilers, not against expected values w
 | C, every target | `cross-compiler.test.ts` compiles every C example and the bit-field, enum, pointer, `sizeof`/`offsetof` and macro cases for 14 targets: GCC for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64 (Linux and bare metal), MIPS (PIC32), big-endian PowerPC 32 and MIPS32 (Linux and bare metal) and AVR; MSVC for x64 and x86 Windows (its object files read directly); SDCC for the 8051. Every case is also compiled packed, as `#pragma pack(1)` and as `__attribute__((packed))` wherever the compiler takes them, from the same source the Verification Code tool prints. It reads size, alignment, every `offsetof` and each bit-field's bit position (in memory order: from the most significant bit of each byte on big-endian targets) back from the object file, so cross compilers need not run anything |
 | C++, every target | `cpp-compiler.test.ts` compiles each C++ case, and every example, as C++17 and C++20 with g++ for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64, MIPS, PowerPC 32, big-endian MIPS32 and AVR, and with MSVC for x64 and x86. It reads size, alignment, size and alignment as a base, and every base class and virtual base offset from g++'s class dump (`-fdump-lang-class`), and every base, vfptr, vbptr, vtordisp and member offset from MSVC's layout report (`/d1reportAllClassLayout`) |
 | Go | `go-compiler.test.ts` checks every case and its reordered version against `go/types` on all 14 architectures, then compiles and runs the generated verification code with `GOARCH=amd64` and `GOARCH=386` |
-| Rust | `rust-compiler.test.ts` compiles and runs 71 cases on x86_64-pc-windows-msvc, and checks the same facts as compile-time assertions on thumbv7em-none-eabihf (no_std) |
+| Rust | `rust-compiler.test.ts` checks 71 cases on all 13 targets as compile-time assertions: size, alignment, each field's offset and size, and `Option<T>`'s size, with the stable compiler, and for AVR (tier 3) on nightly with core and alloc built from source. A case rustc refuses on a target (a 64-bit atomic on Cortex-M, `Arc` on AVR, std on bare metal) the engine must refuse too. On Windows the generated verification program is also compiled and run |
 | Zig | `zig-compiler.test.ts` checks every example and 51 more cases on all 16 targets in Debug, ReleaseSafe and ReleaseFast: size, alignment, the size of `?T` and every field's `@offsetOf` (`@bitOffsetOf` for packed structs), as compile-time checks with `zig build-obj`. What Zig rejects the engine must reject too, and the generated verification programs are built and run for the host |
 | All | `cross-language.test.ts` checks that the Go ports, the `repr(C)` Rust ports and the `extern` Zig ports of the C examples have the C layout, bit-fields included |
 | Bindings | `bindings.test.ts` compiles every binding the Bindings tool writes, for every C example and its own cases on 13 targets, and reads its size and member offsets back in that language: Zig `comptime` checks with `zig build-obj` for each target, Rust `const` checks for each target triple (with core built from source on nightly for the tier-3 ones, MIPS and AVR), Go constant checks for each GOARCH, Python's `struct` and `ctypes`, and .NET's `Marshal.OffsetOf` |
@@ -121,7 +128,7 @@ sudo apt install --no-install-recommends g++ gcc-i686-linux-gnu g++-i686-linux-g
   gcc-arm-none-eabi gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
 ```
 
-Rust targets whose standard library is not installed locally are modelled from their LLVM data layouts but not compiler-checked. Install one with `rustup target add <triple>` to add it to the test.
+For Rust: `rustup target add <triple>` for each target, and `rustup toolchain install nightly --profile minimal -c rust-src` for the tier-3 ones. Without them, those targets are checked against the recorded answers.
 
 ## Lint rules
 

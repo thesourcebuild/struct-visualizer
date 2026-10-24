@@ -3,9 +3,10 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { GO_TARGETS, analyzeGo, generateGoOptimizedCode, generateGoVerificationCode, goExamples } from "@sp/core";
 import type { CalculationResult } from "@sp/core";
+import { References, digest, useReferences } from "./support/references";
 
 /**
  * Ground truth for Go: tests/fixtures/golayout type-checks each case with go/types and
@@ -15,7 +16,7 @@ import type { CalculationResult } from "@sp/core";
  * The helper is built and run once for all cases (asynchronously: it takes a while, and a
  * blocked worker times out vitest's RPC).
  *
- * Skips when Go is not installed.
+ * Without Go, the layouts are checked against go/types' recorded answers (tests/references/go.json).
  */
 function hasGo(): boolean {
   try {
@@ -85,7 +86,14 @@ function parseProgramOutput(out: string): HelperLayout {
   };
 }
 
-describe.skipIf(!hasGo())("Go layouts match go/types (gc) for every architecture", () => {
+/** go/types' answer for the reordered code the tool generates, which holds for that code only. */
+type ForCode = HelperLayout & { code: string };
+
+const refs = new References<{ name: string; archs: Record<string, HelperLayout> } | ForCode>("go");
+afterAll(() => refs.save());
+const compile = hasGo() && !useReferences;
+
+describe(`Go layouts match go/types (gc) for every architecture${compile ? "" : " (recorded answers)"}`, () => {
   const entries = Object.entries(CASES);
   /** go/types' answer for each case as written. */
   let truths: HelperOutput[] = [];
@@ -99,6 +107,7 @@ describe.skipIf(!hasGo())("Go layouts match go/types (gc) for every architecture
   };
 
   beforeAll(async () => {
+    if (!compile) return;
     dir = mkdtempSync(join(tmpdir(), "sp-go-"));
     const helper = join(dir, `golayout${exe}`);
     await run("go", ["build", "-o", helper, "main.go"], {
@@ -121,8 +130,11 @@ describe.skipIf(!hasGo())("Go layouts match go/types (gc) for every architecture
 
   entries.forEach(([label, code], index) => {
     it(label, () => {
-      const truth = truths[index]!;
-      if ("error" in truth) throw new Error(`go/types rejected the case: ${truth.error}`);
+      const now = compile ? truths[index]! : undefined;
+      const answer = refs.answer(label, now && ("error" in now ? { rejected: now.error } : { layout: now }));
+      if ("rejected" in answer) throw new Error(`go/types rejected the case: ${answer.rejected}`);
+      if (!("layout" in answer)) throw new Error("go/types gave no layout");
+      const truth = answer.layout as { name: string; archs: Record<string, HelperLayout> };
 
       for (const target of GC_TARGETS) {
         const analysis = analyzeGo(code, target.id);
@@ -133,9 +145,19 @@ describe.skipIf(!hasGo())("Go layouts match go/types (gc) for every architecture
 
         // The reordered struct, as generated, compiles to the layout the calculator predicts,
         // and is never larger.
-        const opt = optimizedTruths.get(optimizedSource(code, target.id))!;
-        if ("error" in opt) throw new Error(`go/types rejected the optimized code: ${opt.error}`);
-        expect({ arch: target.id, ...shape(analysis.optimized!) }).toEqual({ arch: target.id, ...opt.archs[target.id] });
+        const source = optimizedSource(code, target.id);
+        const opt = compile ? optimizedTruths.get(source)! : undefined;
+        const optAnswer = refs.answer(
+          `${label} | reordered for ${target.id}`,
+          opt && ("error" in opt ? { rejected: opt.error } : { layout: { code: digest(source), ...opt.archs[target.id]! } }),
+        );
+        if ("rejected" in optAnswer) throw new Error(`go/types rejected the optimized code: ${optAnswer.rejected}`);
+        if (!("layout" in optAnswer)) throw new Error("go/types gave no layout");
+        const { code: recordedFor, ...layout } = optAnswer.layout as ForCode;
+        if (recordedFor !== digest(source)) {
+          throw new Error(`The reordered code for ${target.id} changed since go/types' answer for it was recorded. Record it again with SP_RECORD_REFERENCES=1 and Go installed.`);
+        }
+        expect({ arch: target.id, ...shape(analysis.optimized!) }).toEqual({ arch: target.id, ...layout });
         expect(analysis.optimized!.totalSize).toBeLessThanOrEqual(result.totalSize);
       }
     });
@@ -144,7 +166,7 @@ describe.skipIf(!hasGo())("Go layouts match go/types (gc) for every architecture
   // go/types is the compiler's model; this checks the compiler itself, through the verification
   // code the tool generates. Every case becomes a package of one module (one `go build` per
   // arch); amd64 and 386 binaries both run on an x86-64 host.
-  describe.skipIf(process.arch !== "x64")("the generated verification code agrees when compiled", () => {
+  describe.skipIf(process.arch !== "x64" || !compile)("the generated verification code agrees when compiled", () => {
     for (const goarch of ["amd64", "386"]) {
       it(`GOARCH=${goarch}`, async () => {
         const mod = join(dir, `verify-${goarch}`);

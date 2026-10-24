@@ -39,11 +39,11 @@ jobs:
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 9.0.x
-      # Every target the Rust bindings are written for: rustup ships the library of most; the tier-3
-      # ones (MIPS, AVR) have core built from source on nightly (-Zbuild-std).
-      - name: Add the Rust targets the bindings are checked for
+      # Every target the Rust engine and the Rust bindings are checked on: rustup ships the library of
+      # most; the tier-3 ones (MIPS, AVR) have core built from source on nightly (-Zbuild-std).
+      - name: Add the Rust targets
         run: |
-          rustup target add x86_64-pc-windows-msvc i686-unknown-linux-gnu i686-pc-windows-msvc armv7-unknown-linux-gnueabihf thumbv7em-none-eabihf aarch64-unknown-linux-gnu riscv32imac-unknown-none-elf riscv64gc-unknown-linux-gnu powerpc-unknown-linux-gnu
+          rustup target add x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin i686-unknown-linux-gnu i686-pc-windows-msvc armv7-unknown-linux-gnueabihf thumbv7em-none-eabihf aarch64-unknown-linux-gnu riscv32imac-unknown-none-elf riscv64gc-unknown-linux-gnu powerpc-unknown-linux-gnu wasm32-unknown-unknown
           rustup toolchain install nightly --profile minimal -c rust-src
           echo "nightly=$(rustup run nightly rustc --version | tr -c 'A-Za-z0-9.-' '_')" >> "$GITHUB_OUTPUT"
         id: rust

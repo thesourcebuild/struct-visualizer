@@ -1,10 +1,12 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { analyzeStruct, examples } from "@sp/core";
 import type { CalculationResult, PlatformSelection, SourceLanguage } from "@sp/core";
 import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compilers";
+import { References, useReferences } from "./support/references";
+import type { Answer } from "./support/references";
 
 /**
  * C++ class layout against the compilers: each case is compiled as C++17 and as C++20 by g++ for
@@ -15,7 +17,8 @@ import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compi
  * - MSVC's /d1reportAllClassLayout: the offset of every base, vfptr, vbptr, vtordisp and member,
  *   and of each virtual base (its vbi table); size and alignment come from the object file.
  *
- * The g++ cross compilers are found as in tests/cross-compiler.test.ts. On Ubuntu:
+ * The g++ cross compilers are found as in tests/cross-compiler.test.ts; a target whose compiler
+ * is missing is checked against its recorded answers (tests/references/cpp.json). On Ubuntu:
  *   apt install --no-install-recommends g++ g++-i686-linux-gnu g++-arm-linux-gnueabihf \
  *     g++-aarch64-linux-gnu g++-riscv64-linux-gnu g++-mipsel-linux-gnu g++-powerpc-linux-gnu g++-mips-linux-gnu g++-arm-none-eabi \
  *     gcc-avr avr-libc
@@ -295,26 +298,26 @@ function msvcClass(report: string, name: string): Pick<Measured, "subobjects" | 
   return { subobjects: subobjects.sort(), pointers: pointers.sort(), offsets };
 }
 
+const refs = new References<Measured>("cpp");
+afterAll(() => refs.save());
+
 for (const target of TARGETS) {
   const installed = target.msvc ? vcvarsall !== null : hasTool(target.cc);
-  if (!installed) {
-    if (target.msvc ? requireMsvc : requireCompilers) {
-      it(`${target.cc} is installed for ${target.name}`, () => {
-        throw new Error(`${target.cc} not found, and ${target.msvc ? "SP_REQUIRE_MSVC" : "SP_REQUIRE_COMPILERS"} is set`);
-      });
-    } else {
-      describe.skip(`C++ layouts match ${target.name} (${target.cc} not installed)`, () => {
-        it.skip("not run", () => {});
-      });
-    }
+  if (!installed && (target.msvc ? requireMsvc : requireCompilers)) {
+    it(`${target.cc} is installed for ${target.name}`, () => {
+      throw new Error(`${target.cc} not found, and ${target.msvc ? "SP_REQUIRE_MSVC" : "SP_REQUIRE_COMPILERS"} is set`);
+    });
     continue;
   }
-  describe(`C++ layouts match ${target.name}`, () => {
+  // Without the compiler, the layouts are checked against its recorded answers.
+  const compile = installed && !useReferences;
+  describe(`C++ layouts match ${target.name}${compile ? "" : " (recorded answers)"}`, () => {
     /** Per entry: what the compiler reports, or its error for a case it rejects. */
     const results = new Map<number, Measured | string>();
     const applies = (e: Entry) => !(target.oldGcc && e.language === "c++20");
 
     beforeAll(async () => {
+      if (!compile) return;
       const dir = mkdtempSync(join(tmpdir(), "sp-cpp-"));
       for (const std of STANDARDS) {
         const cases = entries.flatMap((e, i) => (e.language === std.language && applies(e) ? [i] : []));
@@ -373,13 +376,22 @@ for (const target of TARGETS) {
           ctx.skip(`${target.cc} predates [[no_unique_address]] (GCC 9) and ignores it`);
           return;
         }
-        const expected = results.get(i);
-        if (typeof expected === "string") {
-          const reason = expected.split("\n").find((l) => /error/i.test(l)) ?? expected;
-          if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${entry.label} | ${reason}`);
-          ctx.skip(`${target.cc} rejects it: ${reason}`);
+        let now: Answer<Measured> | undefined;
+        if (compile) {
+          const reported = results.get(i)!;
+          now = typeof reported === "string" ? { rejected: reported.split("\n").find((l) => /error/i.test(l)) ?? reported } : { layout: reported };
+        }
+        const truth = refs.answer(`${target.name} | ${entry.label}`, now);
+        if ("rejected" in truth) {
+          if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${entry.label} | ${truth.rejected}`);
+          ctx.skip(`${target.cc} rejects it: ${truth.rejected}`);
           return;
         }
+        if ("unmeasurable" in truth) {
+          ctx.skip(truth.unmeasurable);
+          return;
+        }
+        const expected = truth.layout;
         const actual = modelled(entry, target);
         if (process.env.SP_CROSS_VERBOSE && JSON.stringify(sorted(actual)) !== JSON.stringify(sorted(expected))) {
           console.log(`[diff] ${target.name} | ${entry.label}\n  engine:   ${JSON.stringify(sorted(actual))}\n  compiler: ${JSON.stringify(sorted(expected))}`);

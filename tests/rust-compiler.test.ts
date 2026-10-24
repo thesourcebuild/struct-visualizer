@@ -1,34 +1,55 @@
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { beforeAll, describe, expect, it } from "vitest";
-import { analyzeRust, generateRustVerificationModule, rustExamples } from "@sp/core";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { RUST_TARGETS, analyzeRust, formatRustType, generateRustVerificationModule, rustExamples } from "@sp/core";
 import type { CalculationResult, RustAnalysis } from "@sp/core";
+import { References, useReferences } from "./support/references";
+import type { Answer } from "./support/references";
 
 /**
- * Ground truth for Rust, from the installed rustc:
- * - x86_64-pc-windows-msvc (the host): every case is a module of one crate whose generated
- *   verification code prints size, align, each field's offset and size, and Option<T>'s size.
- * - thumbv7em-none-eabihf (32-bit, no_std): the same facts as compile-time assertions;
- *   `const _: [(); EXPECTED] = [(); ACTUAL]` fails with both numbers in the message.
+ * Ground truth for Rust, from rustc:
+ * - every target: size, align, each field's offset and Option<T>'s size as compile-time checks,
+ *   `const _: [(); MODEL] = [(); RUSTC]`, which fail with both numbers. With the stable compiler
+ *   for the targets rustup ships a standard library for, and on nightly with core and alloc built
+ *   from source (-Zbuild-std) for the tier-3 one, AVR. no_std targets use core and alloc.
+ * - x86_64-pc-windows-msvc (the host, on Windows): the generated verification code, compiled and
+ *   run, prints the same facts.
  *
- * Skips when rustc (or a target's standard library) is missing.
+ * A target that cannot be compiled here is checked against rustc's recorded answers
+ * (tests/references/rust.json), or fails when SP_REQUIRE_COMPILERS is set.
  */
 const run = promisify(execFile);
+const requireCompilers = Boolean(process.env.SP_REQUIRE_COMPILERS);
 
-function installedTargets(): string[] {
+const rustupLines = (args: string[]) => {
   try {
-    return execFileSync("rustup", ["target", "list", "--installed"], { encoding: "utf8" }).split(/\r?\n/).filter(Boolean);
+    return execFileSync("rustup", args, { encoding: "utf8" }).split(/\r?\n/).filter(Boolean);
   } catch {
-    try {
-      execFileSync("rustc", ["--version"], { stdio: "ignore" });
-      return [execFileSync("rustc", ["-vV"], { encoding: "utf8" }).match(/host: (\S+)/)![1]!];
-    } catch {
-      return [];
-    }
+    return [];
   }
+};
+/** Targets whose standard library is installed for the stable compiler. */
+const installed = new Set(rustupLines(["target", "list", "--installed"]));
+/** Targets rustup distributes a standard library for; the rest are tier 3. */
+const distributed = new Set(rustupLines(["target", "list"]).map((l) => l.replace(/ \(.*\)$/, "")));
+/** A nightly toolchain with the library source, to build core and alloc for a tier-3 target. */
+const buildStd = rustupLines(["component", "list", "--toolchain", "nightly", "--installed"]).some((l) => l.startsWith("rust-src"));
+/** Where cargo keeps the core and alloc it builds (as in tests/bindings.test.ts). */
+const buildStdDir = process.env.SP_RUST_BUILD_STD_DIR || join(tmpdir(), "sp-rust-build-std");
+/** Targets without std: their crates are no_std and use alloc. */
+const NO_STD = new Set(["thumbv7em-none-eabihf", "riscv32imac-unknown-none-elf", "avr-none"]);
+/** Targets that need a CPU named (AVR has no default). */
+const RUST_FLAGS: Record<string, string[]> = { "avr-none": ["-C", "target-cpu=atmega328p"] };
+
+/** How a target is compiled here, if it can be. */
+function compilerFor(target: string): "stable" | "build-std" | undefined {
+  if (useReferences) return undefined;
+  if (installed.has(target)) return "stable";
+  if (!distributed.has(target) && distributed.size > 0 && buildStd) return "build-std";
+  return undefined;
 }
 
 const CASES: Record<string, string> = {
@@ -86,15 +107,13 @@ const CASES: Record<string, string> = {
   "Ordering": "struct S { o: core::cmp::Ordering, x: Option<core::cmp::Ordering>, n: u16 }",
 };
 
-/** Cases that need std (not available on no_std targets). */
-const STD_ONLY = ["hash collections", "Cow", "64-bit atomics"];
-
 const NO_STD_PRELUDE = [
   "use alloc::boxed::Box;",
   "use alloc::vec::Vec;",
   "use alloc::string::String;",
   "use alloc::rc::Rc;",
-  "use alloc::sync::Arc;",
+  // alloc has Arc only where the target has pointer-sized atomics (not AVR).
+  '#[cfg(target_has_atomic = "ptr")] use alloc::sync::Arc;',
   "use alloc::collections::{VecDeque, BTreeMap, BTreeSet, BinaryHeap, LinkedList};",
 ].join("\n");
 const STD_PRELUDE = "use std::rc::Rc;\nuse std::sync::Arc;\nuse std::collections::{VecDeque, BTreeMap, BTreeSet, BinaryHeap, LinkedList};";
@@ -123,6 +142,19 @@ function facts(a: RustAnalysis): Facts {
   };
 }
 
+/** The checks for a case the engine cannot lay out: rustc's numbers, whatever they are, are the answer. */
+function unknownFacts(a: RustAnalysis): Facts {
+  const item = a.definition ? a.file.items.get(a.definition.name) : undefined;
+  const fields = item && (item.kind === "struct" || item.kind === "union") ? item.fields : [];
+  return { size: 0, align: 0, fields: fields.map((f) => ({ name: f.name, offset: 0, size: 0 })), option: 0 };
+}
+
+/** The root's field types as written, for size_of checks. */
+function fieldTypes(a: RustAnalysis): string[] {
+  const item = a.definition ? a.file.items.get(a.definition.name) : undefined;
+  return item && (item.kind === "struct" || item.kind === "union") ? item.fields.map((f) => formatRustType(f.type)) : [];
+}
+
 function parseReport(out: string): Facts {
   const head = /size (\d+), align (\d+)/.exec(out)!;
   return {
@@ -137,20 +169,10 @@ function parseReport(out: string): Facts {
   };
 }
 
-const targets = installedTargets();
 const entries = Object.entries(CASES);
 
 describe("Rust layouts", () => {
-  it("every case is laid out without errors", () => {
-    for (const [label, code] of entries) {
-      for (const t of ["x86_64-pc-windows-msvc", "thumbv7em-none-eabihf"]) {
-        const a = analyzeRust(code, t);
-        expect(a.errors.map((e) => e.message), `${label} on ${t}`).toEqual([]);
-      }
-    }
-  });
-
-  describe.skipIf(!targets.includes("x86_64-pc-windows-msvc") || process.platform !== "win32" || process.arch !== "x64")(
+  describe.skipIf(compilerFor("x86_64-pc-windows-msvc") !== "stable" || process.platform !== "win32" || process.arch !== "x64")(
     "match rustc on x86_64-pc-windows-msvc (compiled and run)",
     () => {
       let sections: string[] = [];
@@ -180,53 +202,155 @@ describe("Rust layouts", () => {
     },
   );
 
-  describe.skipIf(!targets.includes("thumbv7em-none-eabihf"))("match rustc on thumbv7em-none-eabihf (compile-time checks)", () => {
-    it("all cases", async () => {
-      const lines: string[] = ["#![no_std]", "extern crate alloc;"];
-      const where: string[] = [];
-      const note = (text: string) => {
-        where[lines.length + 1] = text;
-      };
-      entries.forEach(([label, code], i) => {
-        if (STD_ONLY.includes(label)) return;
-        const a = analyzeRust(code, "thumbv7em-none-eabihf");
-        const f = facts(a);
-        const root = a.definition!.name;
-        // no_std: std paths that core also has.
-        const coreCode = code.replace(/\bstd::(?=(num|cell|mem|marker|cmp|time|sync::atomic|ffi|fmt|convert|ops|ptr)\b)/g, "core::");
-        lines.push(`#[allow(dead_code, unused_imports)]`, `mod case${i} {`, NO_STD_PRELUDE, coreCode);
-        note(`${label}: size_of::<${root}>()`);
-        lines.push(`const _: [(); ${f.size}] = [(); core::mem::size_of::<${root}>()];`);
-        note(`${label}: align_of::<${root}>()`);
-        lines.push(`const _: [(); ${f.align}] = [(); core::mem::align_of::<${root}>()];`);
-        for (const field of f.fields) {
-          note(`${label}: offset_of!(${root}, ${field.name})`);
-          lines.push(`const _: [(); ${field.offset}] = [(); core::mem::offset_of!(${root}, ${field.name})];`);
-        }
-        note(`${label}: size_of::<Option<${root}>>()`);
-        lines.push(`const _: [(); ${f.option}] = [(); core::mem::size_of::<Option<${root}>>()];`);
-        lines.push("}");
-      });
-      const dir = mkdtempSync(join(tmpdir(), "sp-rust-thumb-"));
-      const src = join(dir, "lib.rs");
-      writeFileSync(src, lines.join("\n"));
-      const result = await run("rustc", [
-        "--edition", "2021", "--crate-type", "lib", "--emit", "metadata", "--target", "thumbv7em-none-eabihf",
-        "-A", "warnings", "--out-dir", dir, src,
-      ]).then(
-        () => "",
-        (err: { stderr?: string }) => err.stderr ?? String(err),
-      );
-      // One block per error; a mismatch names both numbers: "expected ... size of MODEL, found ... RUSTC".
-      const mismatches = result
-        .split(/^(?=error)/m)
-        .map((block) => {
-          const at = /lib\.rs:(\d+):\d+/.exec(block);
-          const sizes = /size of (\d+), found one with a size of (\d+)/.exec(block);
-          return at && sizes ? `${where[Number(at[1])] ?? `line ${at[1]}`}: model ${sizes[1]}, rustc ${sizes[2]}` : undefined;
-        })
-        .filter((m): m is string => m !== undefined);
-      expect(mismatches.length > 0 ? mismatches : result.includes("error") ? [result.slice(0, 3000)] : []).toEqual([]);
-    }, 600_000);
-  });
 });
+
+/** rustc's facts for each case on one target, worked out from its compile-time checks. */
+interface Checked {
+  answers: Map<number, Answer<Facts>>;
+  /** An error no case can be blamed for: no answer to record. */
+  failure?: string;
+}
+
+interface Case {
+  index: number;
+  label: string;
+  code: string;
+  /** The engine's errors: a case it rejects is still compiled, so rustc's answer is known. */
+  errors: string[];
+  /** The engine's facts, or zeros for a case it rejects. */
+  facts: Facts;
+  root?: string;
+  types: string[];
+}
+
+/** A case's source for a no_std target: the std paths that core and alloc also have. */
+const forNoStd = (code: string) =>
+  code
+    .replace(/\bstd::(?=(num|cell|mem|marker|cmp|time|sync::atomic|ffi|fmt|convert|ops|ptr)\b)/g, "core::")
+    .replace(/\bstd::borrow\b/g, "alloc::borrow");
+
+/**
+ * One crate of compile-time checks for every case on `target`. Each fact is a check against the
+ * engine's number; where it fails, rustc names its own, so rustc's whole answer is known either way.
+ */
+async function checkTarget(target: string, how: "stable" | "build-std", cases: Case[]): Promise<Checked> {
+  const noStd = NO_STD.has(target);
+  const lines: string[] = noStd ? ["#![no_std]", "extern crate alloc;"] : [];
+  /** Per line of the crate: the case and the fact its check is about. */
+  const at: Array<{ index: number; fact: string } | undefined> = [];
+  const push = (line: string, mark?: { index: number; fact: string }) => {
+    lines.push(line);
+    at[lines.length] = mark;
+  };
+  const caseOfLine = (line: number) => {
+    for (let k = line; k > 0; k--) if (at[k]) return at[k]!.index;
+    return undefined;
+  };
+  const mem = noStd ? "core::mem" : "std::mem";
+  for (const c of cases) {
+    const code = noStd ? forNoStd(c.code) : c.code;
+    push(`#[allow(dead_code, unused_imports, non_camel_case_types)]`, { index: c.index, fact: "" });
+    push(`mod case${c.index} {`, { index: c.index, fact: "" });
+    for (const l of `${noStd ? NO_STD_PRELUDE : STD_PRELUDE}\n${code}`.split("\n")) push(l);
+    const check = (value: number, expr: string, fact: string) => push(`const _: [(); ${value}] = [(); ${expr}];`, { index: c.index, fact });
+    check(c.facts.size, `${mem}::size_of::<${c.root}>()`, "size");
+    check(c.facts.align, `${mem}::align_of::<${c.root}>()`, "align");
+    c.facts.fields.forEach((f, k) => {
+      check(f.offset, `${mem}::offset_of!(${c.root}, ${f.name})`, `offset ${f.name}`);
+      check(f.size, `${mem}::size_of::<${c.types[k]}>()`, `size ${f.name}`);
+    });
+    check(c.facts.option, `${mem}::size_of::<Option<${c.root}>>()`, "option");
+    push("}");
+  }
+  const dir = mkdtempSync(join(tmpdir(), "sp-rust-"));
+  const flags = RUST_FLAGS[target] ?? [];
+  const fail = (err: { stderr?: string }) => err.stderr ?? String(err);
+  let output: string;
+  if (how === "stable") {
+    const src = join(dir, "lib.rs");
+    writeFileSync(src, lines.join("\n"));
+    const args = ["--edition", "2021", "--crate-type", "lib", "--emit", "metadata", "--target", target, ...flags, "-A", "warnings", "--out-dir", dir, src];
+    output = await run("rustc", args, { maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
+  } else {
+    mkdirSync(join(dir, "src"));
+    writeFileSync(join(dir, "Cargo.toml"), '[package]\nname = "layoutcheck"\nversion = "0.0.0"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n');
+    writeFileSync(join(dir, "src", "lib.rs"), lines.join("\n"));
+    const env = { ...process.env, CARGO_TARGET_DIR: buildStdDir, RUSTFLAGS: [...flags, "-A", "warnings"].join(" ") };
+    const args = ["run", "nightly", "cargo", "check", "-q", "-Zbuild-std=core,alloc", "--target", target];
+    output = await run("rustup", args, { cwd: dir, env, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
+  }
+
+  const answers = new Map<number, Answer<Facts>>(cases.map((c) => [c.index, { layout: structuredClone(c.facts) }]));
+  let blamed = false;
+  for (const block of output.split(/^(?=error)/m)) {
+    const where = /lib\.rs:(\d+):\d+/.exec(block);
+    if (!where || !/^error/.test(block)) continue;
+    const line = Number(where[1]);
+    const index = caseOfLine(line);
+    if (index === undefined) continue;
+    blamed = true;
+    const answer = answers.get(index)!;
+    const sizes = /size of (\d+), found one with a size of (\d+)/.exec(block);
+    const mark = at[line];
+    if (sizes && mark && mark.fact && "layout" in answer) {
+      // rustc's number for the fact the check is about.
+      const value = Number(sizes[2]);
+      const facts = answer.layout;
+      const [what, name] = mark.fact.split(" ");
+      if (mark.fact === "size") facts.size = value;
+      else if (mark.fact === "align") facts.align = value;
+      else if (mark.fact === "option") facts.option = value;
+      else if (what === "offset") facts.fields.find((f) => f.name === name)!.offset = value;
+      else facts.fields.find((f) => f.name === name)!.size = value;
+    } else if (!("rejected" in answer)) {
+      answers.set(index, { rejected: block.split("\n")[0]!.trim() });
+    }
+  }
+  return output && !blamed ? { answers, failure: output.slice(0, 3000) } : { answers };
+}
+
+const refs = new References<Facts>("rust");
+afterAll(() => refs.save());
+
+for (const target of RUST_TARGETS) {
+  const how = compilerFor(target.id);
+  if (!how && requireCompilers) {
+    it(`rustc can compile for ${target.id}`, () => {
+      throw new Error(
+        distributed.has(target.id) || distributed.size === 0
+          ? `rustup target add ${target.id}`
+          : `${target.id} is tier 3: rustup toolchain install nightly --profile minimal -c rust-src`,
+      );
+    });
+    continue;
+  }
+  describe(`Rust layouts match rustc on ${target.id}${how ? "" : " (recorded answers)"}`, () => {
+    const cases: Case[] = entries.map(([label, code], index) => {
+      const a = analyzeRust(code, target.id);
+      const errors = a.errors.map((e) => e.message);
+      return { index, label, code, errors, facts: errors.length === 0 ? facts(a) : unknownFacts(a), root: a.definition?.name, types: fieldTypes(a) };
+    });
+    let checked: Checked | undefined;
+
+    beforeAll(async () => {
+      // A case with no definition (a syntax error) has nothing to compile.
+      if (how) checked = await checkTarget(target.id, how, cases.filter((c) => c.root));
+    }, 900_000);
+
+    for (const c of cases) {
+      it(c.label, () => {
+        if (checked?.failure) throw new Error(checked.failure);
+        if (!c.root) throw new Error(c.errors.join("; "));
+        const truth = refs.answer(`${target.id} | ${c.label}`, checked?.answers.get(c.index));
+        if ("rejected" in truth) {
+          // What rustc refuses on this target (a type core does not have here), the engine must refuse.
+          expect(c.errors.length, `rustc rejects it on ${target.id} (${truth.rejected}); the engine does not`).toBeGreaterThan(0);
+          return;
+        }
+        if (!("layout" in truth)) throw new Error("rustc gave no layout");
+        expect(c.errors, `${c.label} on ${target.id}`).toEqual([]);
+        expect({ label: c.label, ...c.facts }).toEqual({ label: c.label, ...truth.layout });
+      });
+    }
+  });
+}

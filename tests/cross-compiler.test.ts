@@ -1,10 +1,12 @@
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { analyzeStruct, applyPacking, examples, packingSyntaxesFor, resolvePlatform } from "@sp/core";
 import type { PackingSyntax, PlatformSelection } from "@sp/core";
 import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compilers";
+import { References, useReferences } from "./support/references";
+import type { Answer } from "./support/references";
 
 /**
  * Ground truth on every target: each case (the bit-field, enum and pointer cases below, and every C
@@ -20,8 +22,9 @@ import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compi
  *
  * The GCC-family compilers and SDCC are looked up on the PATH, or inside WSL when the tests run on
  * Windows; MSVC is found with vswhere on Windows, and its object files are read directly. A
- * target whose compiler is missing is skipped, or fails when SP_REQUIRE_COMPILERS is set (as in
- * CI), except MSVC, which only SP_REQUIRE_MSVC requires. On Ubuntu:
+ * target whose compiler is missing is checked against its recorded answers (tests/references/c.json,
+ * see ./support/references.ts), or fails when SP_REQUIRE_COMPILERS is set (as in CI), except MSVC,
+ * which only SP_REQUIRE_MSVC requires. On Ubuntu:
  *   apt install --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf \
  *     gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-mipsel-linux-gnu gcc-arm-none-eabi \
  *     gcc-powerpc-linux-gnu gcc-mips-linux-gnu gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
@@ -340,26 +343,26 @@ const appliesTo = (entry: Entry, target: Target) =>
   entry.packing === undefined ||
   packingSyntaxesFor(target.selection.os, target.selection.dataModel).includes(entry.packing);
 
+const refs = new References<Measured>("c");
+afterAll(() => refs.save());
+
 for (const target of TARGETS) {
   const installed = target.msvc ? vcvarsall !== null : hasTool(target.cc);
-  if (!installed) {
-    if (target.msvc ? requireMsvc : requireCompilers) {
-      it(`${target.cc} is installed for ${target.name}`, () => {
-        throw new Error(`${target.cc} not found, and SP_REQUIRE_COMPILERS is set`);
-      });
-    } else {
-      describe.skip(`layouts match ${target.name} (${target.cc} not installed)`, () => {
-        it.skip("not run", () => {});
-      });
-    }
+  if (!installed && (target.msvc ? requireMsvc : requireCompilers)) {
+    it(`${target.cc} is installed for ${target.name}`, () => {
+      throw new Error(`${target.cc} not found, and ${target.msvc ? "SP_REQUIRE_MSVC" : "SP_REQUIRE_COMPILERS"} is set`);
+    });
     continue;
   }
-  describe(`layouts match ${target.name}`, () => {
+  // Without the compiler, the layouts are checked against its recorded answers.
+  const compile = installed && !useReferences;
+  describe(`layouts match ${target.name}${compile ? "" : " (recorded answers)"}`, () => {
     const sdcc = target.cc === "sdcc";
     /** Symbols per case index, or the compiler's error for a case it rejects. */
     const results = new Map<number, Map<string, number[]> | string>();
 
     beforeAll(async () => {
+      if (!compile) return;
       const dir = mkdtempSync(join(tmpdir(), "sp-cc-"));
       const cases = parsable.filter((i) => appliesTo(entries[i]!, target));
       for (const i of cases) writeFileSync(join(dir, `case_${i}.c`), probeSource(i));
@@ -399,33 +402,42 @@ for (const target of TARGETS) {
       const { label } = entry;
       const code = source(entry);
       it(label, (ctx) => {
-        const symbols = results.get(i);
-        if (symbols === undefined) {
+        if (!parsable.includes(i)) {
           // Not parsable by the engine: report the parser's errors.
           expect(analyzeStruct(entry.code, target.selection).errors.map((e) => e.message)).toEqual([]);
           return;
         }
-        if (typeof symbols === "string") {
+        let now: Answer<Measured> | undefined;
+        if (compile) {
+          const symbols = results.get(i)!;
+          if (typeof symbols === "string") {
+            now = { rejected: symbols.split("\n").find((l) => /error/i.test(l)) ?? symbols };
+          } else {
+            try {
+              now = { layout: measured(symbols, code, i, resolvePlatform(target.selection).architecture.endianness === "big") };
+            } catch (err) {
+              if (!(err instanceof Unmeasurable)) throw err;
+              now = { unmeasurable: err.message };
+            }
+          }
+        }
+        const truth = refs.answer(`${target.name} | ${label}`, now);
+        if ("rejected" in truth) {
           // The compiler does not accept this declaration, so it has no layout to compare.
-          const reason = symbols.split("\n").find((l) => /error/i.test(l)) ?? symbols;
-          if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${reason}`);
-          ctx.skip(`${target.cc} rejects it: ${reason}`);
+          if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${truth.rejected}`);
+          ctx.skip(`${target.cc} rejects it: ${truth.rejected}`);
+          return;
+        }
+        if ("unmeasurable" in truth) {
+          if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${truth.unmeasurable}`);
+          ctx.skip(truth.unmeasurable);
           return;
         }
         const actual = modelled(entry, target.selection);
-        let expected: Measured;
-        try {
-          expected = measured(symbols, code, i, resolvePlatform(target.selection).architecture.endianness === "big");
-        } catch (err) {
-          if (!(err instanceof Unmeasurable)) throw err;
-          if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${err.message}`);
-          ctx.skip(err.message);
-          return;
+        if (process.env.SP_CROSS_VERBOSE && JSON.stringify(actual) !== JSON.stringify(truth.layout)) {
+          console.log(`[diff] ${target.name} | ${label}\n  engine:   ${JSON.stringify(actual)}\n  compiler: ${JSON.stringify(truth.layout)}`);
         }
-        if (process.env.SP_CROSS_VERBOSE && JSON.stringify(actual) !== JSON.stringify(expected)) {
-          console.log(`[diff] ${target.name} | ${label}\n  engine:   ${JSON.stringify(actual)}\n  compiler: ${JSON.stringify(expected)}`);
-        }
-        expect(actual).toEqual(expected);
+        expect(actual).toEqual(truth.layout);
       });
     });
   });

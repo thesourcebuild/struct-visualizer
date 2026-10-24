@@ -15,7 +15,7 @@
 import type { CalculationResult, ParseError, ParsedStruct, StructMember } from '../types';
 import { INTEGER_TYPES, formatRustType, parseRust } from './parser';
 import type { ConstExpr, GenericArg, GenericParam, RustEnum, RustField, RustFile, RustItem, RustRepr, RustStruct, RustType } from './parser';
-import { RUST_PRELUDE } from './std';
+import { RUST_PRELUDE, STD_ONLY } from './std';
 import { getRustTarget } from './targets';
 import type { RustTarget } from './targets';
 
@@ -267,7 +267,13 @@ function prelude(): RustFile {
 
 const C_TYPES: Record<string, string> = {
   c_char: 'i8', c_schar: 'i8', c_uchar: 'u8', c_short: 'i16', c_ushort: 'u16',
-  c_longlong: 'i64', c_ulonglong: 'u64', c_float: 'f32', c_double: 'f64',
+  c_longlong: 'i64', c_ulonglong: 'u64', c_float: 'f32',
+};
+
+/** core::sync::atomic's integer types and the width each needs. */
+const ATOMIC_BITS: Record<string, number> = {
+  AtomicBool: 8, AtomicU8: 8, AtomicI8: 8, AtomicU16: 16, AtomicI16: 16,
+  AtomicU32: 32, AtomicI32: 32, AtomicU64: 64, AtomicI64: 64,
 };
 
 export interface EnumInfo {
@@ -331,6 +337,8 @@ export class RustLayoutEngine {
       case 'c_long':
       case 'c_ulong':
         return this.primitive(`${name === 'c_long' ? 'i' : 'u'}${this.target.cLongBytes * 8}`);
+      case 'c_double':
+        return this.primitive(`f${this.target.cDoubleBytes * 8}`);
       case 'c_void':
         // An enum with two hidden variants: one byte, but only ever used behind a pointer.
         return this.scalarLayout(1, 1, 0n, 1n);
@@ -535,6 +543,21 @@ export class RustLayoutEngine {
     }
   }
 
+  /** A standard type the target's core, alloc or std does not have, as rustc would say. */
+  private checkAvailable(name: string, line?: number): void {
+    const t = this.target;
+    const bits = ATOMIC_BITS[name];
+    if (bits !== undefined && !t.atomicBits.includes(bits)) {
+      throw new RustLayoutError(`core::sync::atomic::${name} does not exist on ${t.id}: it has no ${bits}-bit atomics.`, line);
+    }
+    if (name === 'Arc' && !t.atomicCas) {
+      throw new RustLayoutError(`alloc::sync::Arc does not exist on ${t.id}: it has no atomic compare-and-swap. Use Rc.`, line);
+    }
+    if (STD_ONLY.has(name) && !t.std) {
+      throw new RustLayoutError(`${name} is in std, which ${t.id} does not have (no_std: only core and alloc).`, line);
+    }
+  }
+
   private pathLayout(type: Extract<RustType, { kind: 'path' }>, subst: Subst, line?: number): Layout {
     const name = type.segments[type.segments.length - 1]!;
     if (type.segments.length === 1) {
@@ -557,6 +580,7 @@ export class RustLayoutEngine {
         line,
       );
     }
+    if (!this.file.items.has(name)) this.checkAvailable(name, line);
     const inner = this.bindGenerics(item, type.args, subst);
     const key = `${name}<${[...inner.entries()].map(([k, v]) => `${k}=${v.kind === 'type' ? formatRustType(v.type) : v.value}`).join(',')}>`;
     const cached = this.cache.get(key);

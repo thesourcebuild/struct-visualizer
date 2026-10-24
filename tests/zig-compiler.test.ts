@@ -3,9 +3,11 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ZIG_TARGETS, analyzeZig, generateZigVerificationModule, zigExamples, zigTargetFlags } from "@sp/core";
 import type { ZigAnalysis, ZigBuildMode } from "@sp/core";
+import { References, useReferences } from "./support/references";
+import type { Answer } from "./support/references";
 
 /**
  * Ground truth for Zig, from the installed compiler (0.16):
@@ -16,7 +18,8 @@ import type { ZigAnalysis, ZigBuildMode } from "@sp/core";
  *   compiler's values on a mismatch;
  * - the verification program the Zig Verification Code tool generates, built and run for the host.
  *
- * Skips when zig is missing, unless SP_REQUIRE_COMPILERS is set.
+ * Without zig, the layouts are checked against its recorded answers (tests/references/zig.json);
+ * SP_REQUIRE_COMPILERS makes a missing zig a failure.
  */
 const run = promisify(execFile);
 const requireZig = Boolean(process.env.SP_REQUIRE_COMPILERS);
@@ -137,9 +140,15 @@ for (const target of ZIG_TARGETS) {
   }
 }
 
-const failures = new Map<number, string>();
-const checked = new Set<number>();
+/** zig's answer for each compiled case: its facts, or why it rejected the case. */
+const observed = new Map<number, Answer<string>>();
+/** Groups whose compilation failed for a reason no case can be blamed for. */
+const groupErrors = new Map<number, string>();
 const dir = mkdtempSync(join(tmpdir(), "sp-zig-"));
+const refs = new References<string>("zig");
+afterAll(() => refs.save());
+/** Without zig, the cases are checked against its recorded answers. */
+const compileHere = zig && !useReferences;
 
 async function compileAll() {
   const groups = new Map<string, Prepared[]>();
@@ -180,17 +189,20 @@ async function compileGroup(key: string, cases: Prepared[]) {
   const file = join(dir, `${targetId}_${mode}.zig`);
   writeFileSync(file, lines.join("\n"));
   const output = await compile(file, [...zigTargetFlags(target), "-O", mode!]);
-  for (const p of cases) checked.add(p.index);
+  // A case zig says nothing about has the facts it was checked for.
+  for (const p of cases) observed.set(p.index, { layout: p.expected });
   let blamed = false;
   for (const m of output.matchAll(/^(.*?):(\d+):\d+: error: (.*)$/gm)) {
     const own = /^case (\d+): (.*)$/.exec(m[3]!);
     const index = own ? Number(own[1]) : caseAtLine(lines, Number(m[2]));
     if (index === undefined) continue;
     blamed = true;
-    failures.set(index, own ? `zig: ${own[2]}` : `zig rejects it: ${m[3]}`);
+    // A mismatch prints zig's facts in full; any other error is zig refusing the case.
+    if (own) observed.set(index, { layout: own[2]! });
+    else if (!("rejected" in observed.get(index)!)) observed.set(index, { rejected: m[3]! });
   }
-  // An error no case can be blamed for fails them all.
-  if (output && !blamed) for (const p of cases) failures.set(p.index, output.slice(0, 3000));
+  // An error no case can be blamed for fails them all, and is no answer to record.
+  if (output && !blamed) for (const p of cases) groupErrors.set(p.index, output.slice(0, 3000));
 }
 
 /** What Zig refuses to compile: the engine must refuse it too. */
@@ -213,12 +225,16 @@ const REJECTED: Record<string, string> = {
   "undeclared type": "const S = struct { a: Missing };",
 };
 
-describe.skipIf(!zig && !requireZig)("Zig rejects what the engine rejects", () => {
+it.runIf(requireZig)("zig 0.16 is installed", () => {
+  expect(zig).toBe(true);
+});
+
+describe(`Zig rejects what the engine rejects${compileHere ? "" : " (recorded answers)"}`, () => {
   const cases = Object.entries(REJECTED).map(([label, code], i) => ({ label, code, i, a: analyzeZig(code, "x86_64-linux-gnu", "Debug") }));
   const rejected = new Map<number, string>();
 
   beforeAll(async () => {
-    if (!zig) return;
+    if (!compileHere) return;
     const lines = numbered(
       cases.map((c) => {
         const root = [...c.code.matchAll(/const (\w+) =/g)].pop()![1];
@@ -236,26 +252,28 @@ describe.skipIf(!zig && !requireZig)("Zig rejects what the engine rejects", () =
 
   for (const c of cases) {
     it(c.label, () => {
-      expect(rejected.get(c.i), "zig compiled it").toBeDefined();
-      expect(c.a.errors.length, `zig: ${rejected.get(c.i)}`).toBeGreaterThan(0);
+      const now = compileHere ? (rejected.has(c.i) ? { rejected: rejected.get(c.i)! } : { layout: "compiled" }) : undefined;
+      const truth = refs.answer(`rejected | ${c.label}`, now);
+      expect("rejected" in truth, "zig compiled it").toBe(true);
+      expect(c.a.errors.length, `zig: ${"rejected" in truth ? truth.rejected : ""}`).toBeGreaterThan(0);
     });
   }
 });
 
-describe.skipIf(!zig && !requireZig)("Zig layout matches zig 0.16", () => {
-  it("zig 0.16 is installed", () => {
-    expect(zig).toBe(true);
-  });
-
+describe(`Zig layout matches zig 0.16${compileHere ? "" : " (recorded answers)"}`, () => {
   beforeAll(async () => {
-    if (zig) await compileAll();
+    if (compileHere) await compileAll();
   }, 1_800_000);
 
   for (const p of prepared) {
     it(`${p.target.label} ${p.mode}: ${p.label}`, () => {
       expect(p.analysis.errors, p.code).toEqual([]);
-      expect(checked.has(p.index)).toBe(true);
-      expect(failures.get(p.index), `expected ${p.expected}`).toBeUndefined();
+      const error = groupErrors.get(p.index);
+      if (error) throw new Error(error);
+      const truth = refs.answer(`${p.target.id} ${p.mode} | ${p.label}`, compileHere ? observed.get(p.index) : undefined);
+      if ("rejected" in truth) throw new Error(`zig rejects it: ${truth.rejected}`);
+      if (!("layout" in truth)) throw new Error("zig gave no layout");
+      expect(p.expected, "the engine's facts, then zig's").toBe(truth.layout);
     });
   }
 });
@@ -263,7 +281,7 @@ describe.skipIf(!zig && !requireZig)("Zig layout matches zig 0.16", () => {
 /** The host's target, for running the verification programs. */
 const host = process.arch === "x64" ? (process.platform === "win32" ? "x86_64-windows-gnu" : process.platform === "linux" ? "x86_64-linux-gnu" : process.platform === "darwin" ? "x86_64-macos-none" : undefined) : process.arch === "arm64" ? (process.platform === "linux" ? "aarch64-linux-gnu" : process.platform === "darwin" ? "aarch64-macos-none" : undefined) : undefined;
 
-describe.skipIf(!zig || !host)("generated Zig verification programs", () => {
+describe.skipIf(!compileHere || !host)("generated Zig verification programs", () => {
   for (const mode of ["Debug", "ReleaseFast"] as const) {
     const cases = Object.entries(CASES)
       .map(([label, code], i) => ({ label, code, i, a: analyzeZig(code, host!, mode) }))
