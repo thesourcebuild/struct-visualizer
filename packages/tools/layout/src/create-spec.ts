@@ -10,6 +10,7 @@ import type { DataModel, OSType, TargetArchitecture } from "@sp/core";
 import {
   DEFAULT_OS,
   DEFAULT_TARGET,
+  OPTION_BINDING_LANGUAGE,
   OPTION_COMPARE,
   OPTION_DATA_MODEL,
   OPTION_ENUM_ALIGN,
@@ -39,6 +40,7 @@ export function defaultOptions(): OptionValues {
     [OPTION_ENUM_ALIGN]: "default",
     [OPTION_LANGUAGE]: "c",
     [OPTION_REFERENCE_MODEL]: "LP64",
+    [OPTION_BINDING_LANGUAGE]: "rust",
   };
 }
 

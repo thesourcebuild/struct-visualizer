@@ -13,11 +13,11 @@ import { OPTION_GROUP_META } from "./catalogue/groups";
 import { layoutCatalogueFor } from "./catalogue/options";
 import { requireLayoutTool } from "./catalogue/tool-meta";
 import { computeDataModels } from "./reference";
-import { computeLayout, computeVerificationCode } from "./compute";
+import { computeBindings, computeLayout, computeVerificationCode } from "./compute";
 import { resolveSpec } from "./resolve";
 import type { LayoutData } from "./compute";
 import { createSpec, normalizeOptions, readTarget } from "./create-spec";
-import { describeDataModels, describeLayout, describeVerification } from "./explain/describe";
+import { describeBindings, describeDataModels, describeLayout, describeVerification } from "./explain/describe";
 import { LAYOUT_RULES, VERIFICATION_RULES } from "./lint/rules";
 import { LAYOUT_MANIFESTS } from "./manifest";
 import {
@@ -30,6 +30,7 @@ import {
   TAG_OPTIMIZED,
   TAG_OS_SELECTABLE,
   TAG_PACKED,
+  TOOL_BINDINGS,
   TOOL_DATA_MODELS,
   TOOL_STRUCT_LAYOUT,
   TOOL_VERIFICATION_CODE,
@@ -143,6 +144,15 @@ export function layoutToolDefinition(toolId: string): ToolDefinition<LayoutSpec,
         describe: describeVerification,
         samples: layoutSamples(),
         compute: computeVerificationCode,
+        variantTag: variantTags,
+      };
+    case TOOL_BINDINGS:
+      return {
+        ...base,
+        lintRules: VERIFICATION_RULES,
+        describe: describeBindings,
+        samples: layoutSamples({ cOnly: true }),
+        compute: computeBindings,
         variantTag: variantTags,
       };
     case TOOL_DATA_MODELS:

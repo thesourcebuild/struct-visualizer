@@ -21,7 +21,7 @@ Pick a language in the sidebar. Each language has its own editor contents, examp
 
 | Language | Tools | Targets |
 |---|---|---|
-| **C / C++** | Struct Layout, Verification Code | x86, x86-64, ARM32, ARM64, RISC-V 32/64, PowerPC 32 and MIPS32 (big-endian), Microchip 8/16/32-bit, 8051; 13 data models; Windows/Linux/bare metal |
+| **C / C++** | Struct Layout, Verification Code, Bindings | x86, x86-64, ARM32, ARM64, RISC-V 32/64, PowerPC 32 and MIPS32 (big-endian), Microchip 8/16/32-bit, 8051; 13 data models; Windows/Linux/bare metal |
 | **Go** | Go Struct Layout, Go Verification Code | All 14 gc architectures: amd64, arm64, 386, arm, riscv64, loong64, mips(le), mips64(le), ppc64(le), s390x, wasm |
 | **Rust** | Rust Type Layout, Rust Verification Code | 13 target triples: x86-64 Linux/Windows/macOS, AArch64 Linux/macOS, i686 Linux/Windows, ARMv7, Cortex-M (thumbv7em), RISC-V 32/64, wasm32, AVR |
 | Reference | Data Models | LP64, LLP64, ILP32 and the embedded C compiler models (XC8, XC16, XC32, C51, SDCC) |
@@ -36,6 +36,13 @@ Every layout tool shows:
 - JSON and PNG export
 
 Each Verification Code tool generates a program that prints the real compiler's sizes and offsets, so any result can be checked on your own toolchain.
+
+The **Bindings** tool writes a C struct in another language with exactly its size and member offsets on the selected target:
+
+- **Rust** (`#[repr(C)]`, `packed(n)`, `align(n)`, unions) and **Zig** (`extern struct` with each field's C alignment) follow the target's C ABI, so they name the target triple to compile for.
+- **Go** gets explicit `_ [n]byte` padding where Go's alignment differs from C's (64-bit fields on 32-bit ports), for the GOARCH named in the file; a target Go has no port for is an error, not a guess.
+- **C#** (`LayoutKind.Explicit` with every `FieldOffset`), **Python `struct`** (the target's byte order with pad bytes) and **Python `ctypes`** (packed, padding written out, target byte order) are the same on any machine, so they also serve to read the target's raw data.
+- Bit-fields become the bytes they share, with each field's bit range in a comment; what a language cannot carry (a union in Go, a flexible array member in C#) is said in the result.
 
 ### C / C++
 
@@ -87,6 +94,7 @@ The engines are tested against the real compilers, not against expected values w
 | Go | `go-compiler.test.ts` checks every case and its reordered version against `go/types` on all 14 architectures, then compiles and runs the generated verification code with `GOARCH=amd64` and `GOARCH=386` |
 | Rust | `rust-compiler.test.ts` compiles and runs 71 cases on x86_64-pc-windows-msvc, and checks the same facts as compile-time assertions on thumbv7em-none-eabihf (no_std) |
 | All | `cross-language.test.ts` checks that the Go ports and the `repr(C)` Rust ports of the C examples have the C layout |
+| Bindings | `bindings.test.ts` compiles every binding the Bindings tool writes, for every C example and its own cases on 13 targets, and reads its size and member offsets back in that language: Zig `comptime` checks with `zig build-obj` for each target, Rust `const` checks for each installed target triple, Go constant checks for each GOARCH, Python's `struct` and `ctypes`, and .NET's `Marshal.OffsetOf` |
 
 The cross-compiler tests find GCC and SDCC on the PATH, or in WSL on Windows, and MSVC with vswhere on Windows (CI runs those on a Windows runner). On Ubuntu:
 

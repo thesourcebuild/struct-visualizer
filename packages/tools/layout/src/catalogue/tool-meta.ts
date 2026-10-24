@@ -6,7 +6,7 @@
  * ToolManifest entries from this list, so a tool is declared exactly once.
  */
 import type { ToolFamily } from "@sp/engine";
-import { TOOL_DATA_MODELS, TOOL_STRUCT_LAYOUT, TOOL_VERIFICATION_CODE } from "../pure";
+import { TOOL_BINDINGS, TOOL_DATA_MODELS, TOOL_STRUCT_LAYOUT, TOOL_VERIFICATION_CODE } from "../pure";
 
 export interface LayoutToolMeta {
   id: string;
@@ -41,6 +41,17 @@ export const LAYOUT_TOOLS: readonly LayoutToolMeta[] = [
     tags: ["sizeof", "offsetof", "codegen", "gcc", "g++"],
     summary:
       "Generate a C or C++ program that prints sizeof and offsetof for every member, to check results against your compiler.",
+    readsInput: true,
+    supportsVariants: false,
+  },
+  {
+    id: TOOL_BINDINGS,
+    label: "Bindings",
+    family: "layout",
+    category: "Calculators",
+    tags: ["ffi", "bindings", "rust", "zig", "go", "c#", "python", "ctypes", "repr(C)"],
+    summary:
+      "Write a C struct in Rust, Zig, Go, C# or Python with exactly the same size and member offsets on the selected target.",
     readsInput: true,
     supportsVariants: false,
   },

@@ -1,6 +1,6 @@
 import { createOptionCatalogue } from "@sp/engine";
 import type { OptionCatalogue, OptionDef } from "@sp/engine";
-import { dataModelList, osTypeList, packingSyntaxes, targetArchitectureList } from "@sp/core";
+import { bindingLanguages, dataModelList, osTypeList, packingSyntaxes, targetArchitectureList } from "@sp/core";
 import {
   OPTION_COMPARE,
   OPTION_DATA_MODEL,
@@ -17,6 +17,9 @@ import {
   TAG_OPTIMIZED,
   TAG_OS_SELECTABLE,
   TAG_PACKED,
+  BINDING_LANGUAGE_IDS,
+  OPTION_BINDING_LANGUAGE,
+  TOOL_BINDINGS,
   TOOL_DATA_MODELS,
   TOOL_STRUCT_LAYOUT,
   TOOL_VERIFICATION_CODE,
@@ -164,7 +167,25 @@ const REFERENCE_MODEL: OptionDef<LayoutGroup> = {
   colSpan: 2,
 };
 
+const BINDING_LANGUAGE: OptionDef<LayoutGroup> = {
+  id: OPTION_BINDING_LANGUAGE,
+  label: "Write it in",
+  group: "output",
+  kind: "enum",
+  control: "select",
+  choices: BINDING_LANGUAGE_IDS.map((id) => ({ value: id, label: bindingLanguages[id].label, summary: bindingLanguages[id].summary })),
+  summary: "The language of the binding. It has the C struct's size and member offsets on the selected target.",
+  order: 0,
+};
+
+// The struct as written, packed, or reordered: the binding is of the layout shown for that mode.
+const BINDING_MODE: OptionDef<LayoutGroup> = {
+  ...MODE,
+  summary: "The layout to write out: as written, packed in the syntax chosen below, or reordered.",
+};
+
 const CATALOGUES: Record<string, readonly OptionDef<LayoutGroup>[]> = {
+  [TOOL_BINDINGS]: [BINDING_LANGUAGE, LANGUAGE, BINDING_MODE, PACKING, TARGET, DATA_MODEL, OS, ENUM_SIZE, ENUM_ALIGN],
   [TOOL_STRUCT_LAYOUT]: [LANGUAGE, TARGET, DATA_MODEL, OS, MODE, PACKING, COMPARE, EXPLAIN, ENUM_SIZE, ENUM_ALIGN],
   [TOOL_VERIFICATION_CODE]: [LANGUAGE, VERIFY_MODE, PACKING, TARGET, DATA_MODEL, OS, ENUM_SIZE, ENUM_ALIGN],
   [TOOL_DATA_MODELS]: [REFERENCE_MODEL],

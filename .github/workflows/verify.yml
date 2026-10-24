@@ -30,6 +30,20 @@ jobs:
         uses: ./.github/actions/cross-compilers
         # A crawling mirror fails the run here, instead of holding it for the 6 h job limit.
         timeout-minutes: 60
+      # Bindings are compiled by their own languages (tests/bindings.test.ts): Zig and Rust check them
+      # for the target, C# with .NET 9; Go and Python are on the runner already.
+      - name: Install the toolchains the bindings are checked with
+        if: matrix.node == 22
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-dotnet@v6
+        if: matrix.node == 22
+        with:
+          dotnet-version: 9.0.x
+      - name: Add the Rust targets the bindings are checked for
+        if: matrix.node == 22
+        run: rustup target add thumbv7em-none-eabihf i686-unknown-linux-gnu x86_64-pc-windows-msvc
       - run: pnpm typecheck
       - run: pnpm lint
       # TODO: add `pnpm format:check` after the one-off `pnpm format` commit
@@ -38,6 +52,7 @@ jobs:
         env:
           # Fail, rather than skip, a target whose compiler did not install.
           SP_REQUIRE_COMPILERS: ${{ matrix.node == 22 && '1' || '' }}
+          SP_REQUIRE_BINDING_TOOLCHAINS: ${{ matrix.node == 22 && '1' || '' }}
       - name: Static export builds
         run: pnpm --filter @sp/web build
 

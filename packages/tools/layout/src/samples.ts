@@ -9,9 +9,12 @@ function slug(name: string): string {
     .replace(/^-|-$/g, "");
 }
 
-/** The bundled examples. A C++ one also selects C++; the C ones are valid C++ as well. */
-export function layoutSamples(): ToolSample[] {
-  return examples.map((e) => ({
+/**
+ * The bundled examples. A C++ one also selects C++; the C ones are valid C++ as well. `cOnly`
+ * for a tool the C++ examples do not apply to (their base classes have no binding).
+ */
+export function layoutSamples(options: { cOnly?: boolean } = {}): ToolSample[] {
+  return examples.filter((e) => !options.cOnly || e.language === "c").map((e) => ({
     id: slug(e.name),
     label: e.name,
     input: e.code,

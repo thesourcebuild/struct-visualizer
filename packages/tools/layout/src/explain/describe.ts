@@ -1,6 +1,6 @@
-import { dataModels, osTypes, targetArchitectures } from "@sp/core";
+import { bindingLanguages, dataModels, osTypes, targetArchitectures } from "@sp/core";
 import { resolveSpec } from "../resolve";
-import { OPTION_REFERENCE_MODEL, readLanguage, readMode, readString } from "../pure";
+import { OPTION_REFERENCE_MODEL, readBindingLanguage, readLanguage, readMode, readString } from "../pure";
 import type { LayoutSpec } from "../spec";
 
 const MODE_PHRASE = {
@@ -28,4 +28,9 @@ export function describeVerification(spec: LayoutSpec): string {
 export function describeDataModels(spec: LayoutSpec): string {
   const id = readString(spec.options, OPTION_REFERENCE_MODEL, "LP64");
   return `Primitive type sizes for ${id}, plus every data model and target.`;
+}
+
+export function describeBindings(spec: LayoutSpec): string {
+  const language = bindingLanguages[readBindingLanguage(spec.options)].label;
+  return `The struct in ${language}, with its C size and member offsets on ${platformPhrase(spec)}, ${MODE_PHRASE[readMode(spec.options)]}.`;
 }

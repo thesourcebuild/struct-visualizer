@@ -36,7 +36,18 @@ export const DEFAULT_OS = "linux";
 
 export const TOOL_STRUCT_LAYOUT = "struct-layout";
 export const TOOL_VERIFICATION_CODE = "verification-code";
+export const TOOL_BINDINGS = "bindings";
 export const TOOL_DATA_MODELS = "data-models";
+
+/** Bindings tool: the language the struct is written out in. */
+export const OPTION_BINDING_LANGUAGE = "bindingLanguage";
+export type BindingLanguageId = "rust" | "zig" | "go" | "csharp" | "python-struct" | "python-ctypes";
+export const BINDING_LANGUAGE_IDS: readonly BindingLanguageId[] = ["rust", "zig", "go", "csharp", "python-struct", "python-ctypes"];
+
+export function readBindingLanguage(options: OptionValues): BindingLanguageId {
+  const v = readString(options, OPTION_BINDING_LANGUAGE, "rust");
+  return (BINDING_LANGUAGE_IDS as readonly string[]).includes(v) ? (v as BindingLanguageId) : "rust";
+}
 
 export function readString(options: OptionValues, id: string, fallback: string): string {
   const v = options[id];
