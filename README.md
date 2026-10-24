@@ -24,7 +24,7 @@ Pick a language in the sidebar. Each language has its own editor contents, examp
 | **C / C++** | Struct Layout, Verification Code, Bindings | x86, x86-64, ARM32, ARM64, RISC-V 32/64, PowerPC 32 and MIPS32 (big-endian), Microchip 8/16/32-bit, 8051; 13 data models; Windows/Linux/bare metal |
 | **Go** | Go Struct Layout, Go Verification Code | All 14 gc architectures: amd64, arm64, 386, arm, riscv64, loong64, mips(le), mips64(le), ppc64(le), s390x, wasm |
 | **Rust** | Rust Type Layout, Rust Verification Code | 13 target triples: x86-64 Linux/Windows/macOS, AArch64 Linux/macOS, i686 Linux/Windows, ARMv7, Cortex-M (thumbv7em), RISC-V 32/64, wasm32, AVR |
-| **Zig** | Zig Type Layout, Zig Verification Code | 16 targets: x86-64 Linux/Windows (GNU and MSVC)/macOS, AArch64 Linux/macOS, x86 Linux/Windows, ARMv7, Cortex-M4, RISC-V 32/64, wasm32, AVR, big-endian PowerPC 32 and MIPS32; each in Debug, ReleaseSafe, ReleaseFast or ReleaseSmall |
+| **Zig** | Zig Type Layout, Zig Verification Code | 16 targets: x86-64 Linux/Windows (GNU and MSVC)/macOS, AArch64 Linux/macOS, x86 Linux/Windows, ARMv7, Cortex-M4, RISC-V 32/64, wasm32, AVR, big-endian PowerPC 32 and MIPS32; each in Debug, ReleaseSafe, ReleaseFast or ReleaseSmall, and on x86-64 for each CPU level (`-mcpu`) |
 | Reference | Data Models | LP64, LLP64, ILP32 and the embedded C compiler models (XC8, XC16, XC32, C51, SDCC) |
 
 Every layout tool shows:
@@ -91,9 +91,9 @@ A port of Zig 0.16's layout code (`Type.abiSize`, `Type.abiAlignment` and Sema's
 - **packed struct and packed union:** an integer of the fields' total bit width, inferred or written (`packed struct(u32)`), with each field's bit offset; nested packed types and enums with an integer tag. On big-endian targets the walkthrough numbers the bits in memory order.
 - **Unions:** bare, `union(enum)`, `union(enum(u8))`, `union(Tag)`, extern and packed. The tag goes first unless the payload is more aligned. In Debug and ReleaseSafe a bare union carries a hidden safety tag, which the build-mode option shows.
 - **Enums:** an explicit integer tag type, or the smallest one that counts the fields; non-exhaustive enums.
-- **Other types:** integers of any width (`u24`, `i65`), `f16` to `f128` and the C types per target, pointers, slices and sentinels, optionals (`?*T` and `?[]T` use null, others add a flag), error sets and error unions, vectors (laid out by Zig's own x86-64 code generator in Debug on x86-64 Linux, by LLVM elsewhere).
-- **Comptime:** constants and arithmetic, `@sizeOf`, `@alignOf`, `@bitSizeOf`, `@offsetOf`, `@Int`, `@Vector`, `@This`, `@FieldType`, `@import("builtin").mode`, and functions that return a type (`fn Pair(comptime T: type) type`) through `const`, `if` and `return`.
-- **std types**, written as std defines them: `ArrayList`, `AutoHashMap` and `StringHashMap` (whose `SafetyLock` is a byte in safe builds), `mem.Allocator`, `MultiArrayList`, `atomic.Value`, `Io.Mutex` and the other Io locks, `Io.Writer` and `Io.Reader`, linked lists, `Random`, `PriorityQueue`, bit sets, `EnumSet` and `EnumArray`.
+- **Other types:** integers of any width (`u24`, `i65`), `f16` to `f128` and the C types per target, pointers, slices and sentinels, optionals (`?*T` and `?[]T` use null, others add a flag), error sets and error unions, vectors. Vectors are laid out by LLVM's rule, or in Debug on x86-64 Linux by Zig's own x86-64 code generator, which aligns them by the CPU: 16 bytes, and 32 with AVX and 64 with AVX-512F (the CPU option, `-mcpu=x86_64_v3` and `x86_64_v4`).
+- **Comptime:** constants and integer arithmetic, with fixed-width integers where they are declared (`const n: u16`, which overflow and `@clz` need), `@sizeOf`, `@alignOf`, `@bitSizeOf`, `@offsetOf`, `@Int`, `@Vector`, `@This`, `@FieldType`, `@typeInfo`, `@clz`, `@ctz`, `@popCount`, `@intFromEnum`, `@import("builtin").mode`, and functions that return a type (`fn Pair(comptime T: type) type`) through `const`, `if` (with `|x|` captures), `switch`, `return` and method calls.
+- **std types**, transcribed from the std sources (each type's fields and the declarations they refer to): `ArrayList` and the aligned forms, `AutoHashMap` and `StringHashMap` (whose `SafetyLock` is a byte in safe builds), `mem.Allocator`, `mem.Alignment`, `math.Log2Int`, `MultiArrayList`, `atomic.Value`, `Io.Mutex` and the other Io locks, `Io.Writer`, `Io.Reader`, `Io.Limit`, linked lists, `Random`, `PriorityQueue` and the bit sets.
 - **Optimized order:** for an extern struct, the order Zig gives a plain struct, written out as an extern struct.
 
 ## How results are checked
@@ -114,7 +114,7 @@ The engines are tested against the real compilers, not against expected values w
 | C++, every target | `cpp-compiler.test.ts` compiles each C++ case, and every example, as C++17 and C++20 with g++ for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64, MIPS, PowerPC 32, big-endian MIPS32 and AVR, and with MSVC for x64 and x86. It reads size, alignment, size and alignment as a base, and every base class and virtual base offset from g++'s class dump (`-fdump-lang-class`), and every base, vfptr, vbptr, vtordisp and member offset from MSVC's layout report (`/d1reportAllClassLayout`) |
 | Go | `go-compiler.test.ts` checks every case and its reordered version against `go/types` on all 14 architectures, then compiles and runs the generated verification code with `GOARCH=amd64` and `GOARCH=386` |
 | Rust | `rust-compiler.test.ts` checks 71 cases on all 13 targets as compile-time assertions: size, alignment, each field's offset and size, and `Option<T>`'s size, with the stable compiler, and for AVR (tier 3) on nightly with core and alloc built from source. A case rustc refuses on a target (a 64-bit atomic on Cortex-M, `Arc` on AVR, std on bare metal) the engine must refuse too. On Windows the generated verification program is also compiled and run |
-| Zig | `zig-compiler.test.ts` checks every example and 51 more cases on all 16 targets in Debug, ReleaseSafe and ReleaseFast: size, alignment, the size of `?T` and every field's `@offsetOf` (`@bitOffsetOf` for packed structs), as compile-time checks with `zig build-obj`. What Zig rejects the engine must reject too, and the generated verification programs are built and run for the host |
+| Zig | `zig-compiler.test.ts` checks every example and 53 more cases on all 16 targets in Debug, ReleaseSafe and ReleaseFast, and on x86-64 Linux at each CPU level: size, alignment, the size of `?T` and every field's `@offsetOf` (`@bitOffsetOf` for packed structs), as compile-time checks with `zig build-obj`. What Zig rejects the engine must reject too, and the generated verification programs are built and run for the host |
 | All | `cross-language.test.ts` checks that the Go ports, the `repr(C)` Rust ports and the `extern` Zig ports of the C examples have the C layout, bit-fields included |
 | Bindings | `bindings.test.ts` compiles every binding the Bindings tool writes, for every C example and its own cases on 13 targets, and reads its size and member offsets back in that language: Zig `comptime` checks with `zig build-obj` for each target, Rust `const` checks for each target triple (with core built from source on nightly for the tier-3 ones, MIPS and AVR), Go constant checks for each GOARCH, Python's `struct` and `ctypes`, and .NET's `Marshal.OffsetOf` |
 
@@ -176,7 +176,6 @@ For Rust: `rustup target add <triple>` for each target, and `rustup toolchain in
 | ZG000 | error | Syntax error, with its line | — |
 | ZG001 | warning | An extern struct would be smaller with its fields reordered | Show optimized order |
 | ZG002 | info | A bare union carries a safety tag in this build mode | Show ReleaseFast |
-| ZG003 | info | A vector over 16 bytes, whose Debug alignment on x86-64 Linux depends on the CPU | — |
 | ZG004 | error | What Zig rejects: an unknown name, a type an extern or packed container cannot hold, a container that holds itself, a tag value that does not fit | — |
 | ZG005 | info | comptime fields take no space | — |
 | ZG006 | info | A declaration is not used by the one shown | — |
@@ -243,7 +242,8 @@ These results model compilers; they are not compilers. Not modelled:
 - **Zig:**
   - A plain struct's field order is what Zig 0.16 does, which later versions may change.
   - Comptime code with loops, `switch`, `@Type`, or `@typeInfo` beyond field counts and integer widths; the rest of `std`; other imports (each reported).
-  - In Debug on x86-64 Linux, vectors over 16 bytes take the baseline CPU's alignment (ZG003); error codes are taken as the default 16 bits (`--error-limit`).
+  - std types whose definition needs comptime loops, such as `EnumSet` and `EnumArray` (an error names them).
+  - Error codes are 16 bits, the default; `--error-limit`, a compiler flag, is not an option.
 
 Always confirm. See the in-app Limitations page.
 

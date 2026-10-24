@@ -59,7 +59,7 @@ export const vcvarsall: string | null = (() => {
 
 /** The environment vcvarsall sets up for `arch` (PATH to cl, INCLUDE, LIB), captured once. */
 const msvcEnvironments = new Map<string, Promise<NodeJS.ProcessEnv>>();
-function msvcEnvironment(arch: "x64" | "x86"): Promise<NodeJS.ProcessEnv> {
+export function msvcEnvironment(arch: "x64" | "x86"): Promise<NodeJS.ProcessEnv> {
   let env = msvcEnvironments.get(arch);
   if (!env) {
     // cmd's own quoting: /s strips the outer quotes and leaves the rest as written.

@@ -1,6 +1,6 @@
 import { ZIG_TARGETS, analyzeZig, zigPointerBits } from "@sp/core";
 import type { ToolVariantRow, ToolVariantTable } from "@sp/engine";
-import { readZigTarget } from "./create-spec";
+import { readZigCpu, readZigTarget } from "./create-spec";
 import { OPTION_ZIG_TARGET, readBuildMode, readMode } from "./pure";
 import type { ZigLayoutSpec } from "./spec";
 
@@ -9,9 +9,11 @@ export function zigLayoutVariants(spec: ZigLayoutSpec, input: string): ToolVaria
   const current = readZigTarget(spec.options);
   const mode = readMode(spec.options);
   const build = readBuildMode(spec.options);
+  const cpu = readZigCpu(spec.options);
 
   const rows: ToolVariantRow[] = ZIG_TARGETS.map((target) => {
-    const a = analyzeZig(input, target.id, build);
+    // The x86-64 level applies to the x86-64 targets; the others have their own CPU.
+    const a = analyzeZig(input, target.id, build, cpu);
     const r = mode === "optimized" ? (a.optimized ?? a.result) : a.result;
     return {
       cells: {

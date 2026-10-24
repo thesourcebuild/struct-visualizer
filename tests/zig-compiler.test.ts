@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { ZIG_TARGETS, analyzeZig, generateZigVerificationModule, zigExamples, zigTargetFlags } from "@sp/core";
+import { ZIG_TARGETS, ZIG_X86_64_CPUS, analyzeZig, generateZigVerificationModule, zigExamples, zigTargetFlags } from "@sp/core";
 import type { ZigAnalysis, ZigBuildMode } from "@sp/core";
 import { References, useReferences } from "./support/references";
 import type { Answer } from "./support/references";
@@ -87,7 +87,9 @@ const CASES: Record<string, string> = {
   "std: Io Writer and Reader": "const std = @import(\"std\");\nconst S = struct { w: std.Io.Writer, r: std.Io.Reader, b: bool };",
   "std: linked lists and Random": "const std = @import(\"std\");\nconst S = struct { d: std.DoublyLinkedList, dn: std.DoublyLinkedList.Node, s: std.SinglyLinkedList, sn: std.SinglyLinkedList.Node, r: std.Random, f: u8 };",
   "std: bit sets": "const std = @import(\"std\");\nconst S = struct { a: std.StaticBitSet(10), b: std.StaticBitSet(64), c: std.StaticBitSet(100), d: std.bit_set.IntegerBitSet(3), e: u8 };",
-  "std: enum containers": "const std = @import(\"std\");\nconst E = enum { a, b, c, d, e };\nconst S = struct { set: std.EnumSet(E), arr: std.EnumArray(E, u32), f: u8 };",
+  "std: aligned lists and Log2Int": "const std = @import(\"std\");\nconst S = struct { a: std.ArrayListAligned(u8, .@\"16\"), b: std.ArrayListAligned(u32, .@\"4\"), c: std.array_list.AlignedManaged(u16, .@\"8\"), d: std.math.Log2Int(u64), e: std.math.Log2Int(u8), f: std.mem.Alignment, g: std.Io.Limit };",
+  "switch and captures": "fn Pick(comptime n: comptime_int) type {\n    return switch (n) {\n        0 => void,\n        1...8 => u8,\n        9, 10 => u16,\n        else => u64,\n    };\n}\nfn Or(comptime T: ?type) type {\n    if (T) |t| return t;\n    return u32;\n}\nconst S = struct { a: Pick(0), b: Pick(5), c: Pick(10), d: Pick(100), e: Or(u8), f: Or(null) };",
+  "typed comptime integers": "const bits: u16 = 12;\nconst W = @Int(.unsigned, 16 - @clz(bits - 1));\nconst S = struct { a: W, b: [@popCount(@as(u8, 0b1011))]u8, c: [@ctz(@as(u32, 8))]u16, d: u8 };",
   "std: PriorityQueue": "const std = @import(\"std\");\nfn lessThan(_: void, a: u32, b: u32) std.math.Order {\n    return std.math.order(a, b);\n}\nconst S = struct { q: std.PriorityQueue(u32, void, lessThan), f: u8 };",
 };
 
@@ -99,6 +101,8 @@ interface Prepared {
   code: string;
   target: (typeof ZIG_TARGETS)[number];
   mode: ZigBuildMode;
+  /** An x86-64 level other than the baseline, or none. */
+  cpu?: string;
   analysis: ZigAnalysis;
   expected: string;
 }
@@ -130,12 +134,21 @@ function check(p: Prepared): string[] {
   ];
 }
 
+/**
+ * The CPU levels checked on each target: on x86-64 Linux, whose Debug builds use Zig's own code
+ * generator (which aligns vectors by the CPU's features), all of them; elsewhere the default.
+ */
+const cpusFor = (target: (typeof ZIG_TARGETS)[number]): (string | undefined)[] =>
+  target.id === "x86_64-linux-gnu" ? [undefined, ...ZIG_X86_64_CPUS.filter((c) => c.id !== "x86_64").map((c) => c.id)] : [undefined];
+
 const prepared: Prepared[] = [];
 for (const target of ZIG_TARGETS) {
   for (const mode of MODES) {
-    for (const [label, code] of Object.entries(CASES)) {
-      const analysis = analyzeZig(code, target.id, mode);
-      prepared.push({ index: prepared.length, label, code, target, mode, analysis, expected: analysis.result ? facts(analysis) : "" });
+    for (const cpu of cpusFor(target)) {
+      for (const [label, code] of Object.entries(CASES)) {
+        const analysis = analyzeZig(code, target.id, mode, cpu);
+        prepared.push({ index: prepared.length, label, code, target, mode, cpu, analysis, expected: analysis.result ? facts(analysis) : "" });
+      }
     }
   }
 }
@@ -154,7 +167,7 @@ async function compileAll() {
   const groups = new Map<string, Prepared[]>();
   for (const p of prepared) {
     if (!p.analysis.result) continue;
-    const key = `${p.target.id} ${p.mode}`;
+    const key = `${p.target.id} ${p.mode} ${p.cpu ?? ""}`;
     groups.set(key, [...(groups.get(key) ?? []), p]);
   }
   // A few compilations at a time: each is a whole compiler.
@@ -183,12 +196,12 @@ function caseAtLine(lines: string[], line: number): number | undefined {
 const numbered = (cases: string[][]) => cases.flatMap((c) => c.join("\n").split("\n"));
 
 async function compileGroup(key: string, cases: Prepared[]) {
-  const [targetId, mode] = key.split(" ");
+  const [targetId, mode, cpu] = key.split(" ");
   const target = ZIG_TARGETS.find((t) => t.id === targetId)!;
   const lines = numbered(cases.map((p) => [`const case_${p.index} = struct {`, p.code, "};", ...check(p)]));
-  const file = join(dir, `${targetId}_${mode}.zig`);
+  const file = join(dir, `${targetId}_${mode}${cpu ? `_${cpu}` : ""}.zig`);
   writeFileSync(file, lines.join("\n"));
-  const output = await compile(file, [...zigTargetFlags(target), "-O", mode!]);
+  const output = await compile(file, [...zigTargetFlags(target, cpu || undefined), "-O", mode!]);
   // A case zig says nothing about has the facts it was checked for.
   for (const p of cases) observed.set(p.index, { layout: p.expected });
   let blamed = false;
@@ -266,11 +279,11 @@ describe(`Zig layout matches zig 0.16${compileHere ? "" : " (recorded answers)"}
   }, 1_800_000);
 
   for (const p of prepared) {
-    it(`${p.target.label} ${p.mode}: ${p.label}`, () => {
+    it(`${p.target.label} ${p.mode}${p.cpu ? ` ${p.cpu}` : ""}: ${p.label}`, () => {
       expect(p.analysis.errors, p.code).toEqual([]);
       const error = groupErrors.get(p.index);
       if (error) throw new Error(error);
-      const truth = refs.answer(`${p.target.id} ${p.mode} | ${p.label}`, compileHere ? observed.get(p.index) : undefined);
+      const truth = refs.answer(`${p.target.id} ${p.mode}${p.cpu ? ` ${p.cpu}` : ""} | ${p.label}`, compileHere ? observed.get(p.index) : undefined);
       if ("rejected" in truth) throw new Error(`zig rejects it: ${truth.rejected}`);
       if (!("layout" in truth)) throw new Error("zig gave no layout");
       expect(p.expected, "the engine's facts, then zig's").toBe(truth.layout);

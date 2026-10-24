@@ -72,23 +72,6 @@ const safetyTag: Rule = {
   },
 };
 
-/** ZG003: vectors whose layout here depends on the CPU's features. */
-const cpuDependent: Rule = {
-  code: "ZG003",
-  check: ({ result }) => {
-    const a = result.data?.analysis;
-    if (!a?.definition || a.cpuDependent.length === 0) return [];
-    return [
-      {
-        code: "ZG003",
-        level: "info",
-        message: `${names(a.cpuDependent)} ${a.cpuDependent.length === 1 ? "is a vector" : "are vectors"} over 16 bytes: in Debug on x86-64 their alignment depends on the CPU (32 with AVX). This is the baseline CPU's, which -target ${a.target.id} without -mcpu builds for.`,
-        line: a.definition.line,
-      },
-    ];
-  },
-};
-
 /** ZG005: comptime fields take no space. */
 const comptimeFields: Rule = {
   code: "ZG005",
@@ -131,6 +114,6 @@ const parserWarnings: Rule = {
     (result.data?.analysis.warnings ?? []).map((w): Diag => ({ code: "ZG007", level: "warning", message: w.message, line: w.line })),
 };
 
-export const ZIG_LAYOUT_RULES: readonly Rule[] = [syntaxErrors, typeErrors, reorder, safetyTag, cpuDependent, comptimeFields, unusedTypes, parserWarnings];
+export const ZIG_LAYOUT_RULES: readonly Rule[] = [syntaxErrors, typeErrors, reorder, safetyTag, comptimeFields, unusedTypes, parserWarnings];
 
 export const ZIG_VERIFICATION_RULES: readonly Rule[] = [syntaxErrors, typeErrors, parserWarnings];

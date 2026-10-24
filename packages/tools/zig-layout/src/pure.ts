@@ -8,6 +8,8 @@ export const SPEC_VERSION = 1;
 
 /** What -target takes. */
 export const OPTION_ZIG_TARGET = "zigTarget";
+/** -mcpu, for x86-64 targets: the microarchitecture level. */
+export const OPTION_ZIG_CPU = "zigCpu";
 /** -O: Debug, ReleaseSafe, ReleaseFast or ReleaseSmall. */
 export const OPTION_BUILD_MODE = "buildMode";
 export const OPTION_MODE = "mode";
@@ -21,9 +23,12 @@ export const BUILD_MODE_IDS: readonly ZigBuildModeId[] = ["Debug", "ReleaseSafe"
 /** The definition is an extern struct whose fields could be reordered. */
 export const TAG_REORDERABLE = "reorderable";
 export const TAG_OPTIMIZED = "optimized";
+/** The target is x86-64, which has CPU levels to choose from. */
+export const TAG_X86_64 = "x86_64";
 
 export const DEFAULT_ZIG_TARGET = "x86_64-linux-gnu";
 export const DEFAULT_BUILD_MODE: ZigBuildModeId = "Debug";
+export const DEFAULT_ZIG_CPU = "x86_64";
 
 export const TOOL_ZIG_STRUCT_LAYOUT = "zig-struct-layout";
 export const TOOL_ZIG_VERIFICATION_CODE = "zig-verification-code";

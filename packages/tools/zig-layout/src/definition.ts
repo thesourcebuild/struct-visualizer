@@ -1,15 +1,15 @@
 import type { OptionValue } from "@sp/contracts";
 import type { ToolDefinition, ToolManifest, ToolResultField, ToolSample } from "@sp/engine";
-import { analyzeZig, getZigTarget, zigBackend, zigExamples, zigFloatLayout, zigIntAlignment, zigPointerBits } from "@sp/core";
+import { analyzeZig, getZigTarget, zigBackend, zigTargetFlags, zigExamples, zigFloatLayout, zigIntAlignment, zigPointerBits } from "@sp/core";
 import { OPTION_GROUP_META } from "./catalogue/groups";
 import { zigCatalogueFor } from "./catalogue/options";
 import { requireZigTool } from "./catalogue/tool-meta";
 import { computeZigLayout, computeZigVerificationCode } from "./compute";
 import type { ZigLayoutData } from "./compute";
-import { createSpec, normalizeOptions, readZigTarget } from "./create-spec";
+import { createSpec, normalizeOptions, readZigCpu, readZigTarget } from "./create-spec";
 import { ZIG_LAYOUT_RULES, ZIG_VERIFICATION_RULES } from "./lint/rules";
 import { ZIG_MANIFESTS } from "./manifest";
-import { TAG_OPTIMIZED, TAG_REORDERABLE, TOOL_ZIG_STRUCT_LAYOUT, TOOL_ZIG_VERIFICATION_CODE, readBuildMode, readMode } from "./pure";
+import { TAG_OPTIMIZED, TAG_REORDERABLE, TAG_X86_64, TOOL_ZIG_STRUCT_LAYOUT, TOOL_ZIG_VERIFICATION_CODE, readBuildMode, readMode } from "./pure";
 import { ZigLayoutSpec } from "./spec";
 import { zigLayoutVariants } from "./variants";
 
@@ -30,7 +30,8 @@ function requireManifest(toolId: string): ToolManifest {
 /** Field order only matters for an extern struct: Zig already orders plain ones. */
 function variantTags(spec: ZigLayoutSpec, input: string): string[] {
   const tags: string[] = [];
-  const def = analyzeZig(input, readZigTarget(spec.options), readBuildMode(spec.options)).definition;
+  if (getZigTarget(readZigTarget(spec.options)).arch === "x86_64") tags.push(TAG_X86_64);
+  const def = analyzeZig(input, readZigTarget(spec.options), readBuildMode(spec.options), readZigCpu(spec.options)).definition;
   if (def?.kind === "struct" && def.layout === "extern") {
     tags.push(TAG_REORDERABLE);
     if (readMode(spec.options) === "optimized") tags.push(TAG_OPTIMIZED);
@@ -43,7 +44,7 @@ function targetInfo(spec: ZigLayoutSpec): ToolResultField[] {
   const bytes = zigPointerBits(t) / 8;
   const mode = readBuildMode(spec.options);
   return [
-    { label: "-target", value: `${t.id}${t.cpu ? ` -mcpu=${t.cpu}` : ""}`, mono: true },
+    { label: "Flags", value: zigTargetFlags(t, readZigCpu(spec.options)).join(" "), mono: true },
     { label: "usize, pointers", value: `${bytes} bytes`, mono: true },
     { label: "[]T slices", value: `${2 * bytes} bytes`, mono: true },
     { label: "u64 / f64 alignment", value: `${zigIntAlignment(t, 64)} / ${zigFloatLayout(t, 64).align} bytes`, mono: true },

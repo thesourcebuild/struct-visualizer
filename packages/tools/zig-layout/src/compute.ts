@@ -1,7 +1,7 @@
 import { ZIG_OPTIMIZED_SUFFIX, analyzeZig, declaresZigMain, formatZigStruct, generateZigVerificationCode, getZigTarget, zigTargetFlags } from "@sp/core";
 import type { CalculationResult, ZigAnalysis } from "@sp/core";
 import type { ToolResult, ToolResultField } from "@sp/engine";
-import { readZigTarget } from "./create-spec";
+import { readZigCpu, readZigTarget } from "./create-spec";
 import { readBuildMode, readMode } from "./pure";
 import type { ZigLayoutMode } from "./pure";
 import type { ZigLayoutSpec } from "./spec";
@@ -42,7 +42,7 @@ export function describeUnionTag(a: ZigAnalysis): string | null {
 }
 
 export function buildZigLayoutData(spec: ZigLayoutSpec, input: string): ZigLayoutData {
-  const analysis = analyzeZig(input, readZigTarget(spec.options), readBuildMode(spec.options));
+  const analysis = analyzeZig(input, readZigTarget(spec.options), readBuildMode(spec.options), readZigCpu(spec.options));
   const mode = readMode(spec.options);
   const display = mode === "optimized" ? (analysis.optimized ?? analysis.result) : analysis.result;
   const def = analysis.definition;
@@ -64,7 +64,7 @@ function layoutFields(data: ZigLayoutData): ToolResultField[] {
   if (tag) fields.push({ label: "Tag", value: tag });
   if (a.packedBacking) fields.push({ label: "Backing integer", value: a.packedBacking, mono: true });
   if (a.enumTag) fields.push({ label: "Tag type", value: a.enumTag, mono: true });
-  fields.push({ label: "Target", value: `${a.target.id}, ${a.mode}`, mono: true });
+  fields.push({ label: "Target", value: `${a.target.id}${a.target.arch === "x86_64" ? ` (${a.cpu.id})` : ""}, ${a.mode}`, mono: true });
   return fields;
 }
 
@@ -93,7 +93,8 @@ export function computeZigVerificationCode(spec: ZigLayoutSpec, input: string): 
   const expected = optimized ? a.optimized! : a.result;
   const filename = `${name.toLowerCase()}_verify.zig`;
   const target = getZigTarget(a.target.id);
-  const command = `zig run ${zigTargetFlags(target).join(" ")} -O ${a.mode} ${filename}`;
+  const flags = zigTargetFlags(target, a.cpu.id).join(" ");
+  const command = `zig run ${flags} -O ${a.mode} ${filename}`;
 
   return {
     data,
@@ -105,7 +106,7 @@ export function computeZigVerificationCode(spec: ZigLayoutSpec, input: string): 
     ],
     working: [
       "1. Download or copy the program.",
-      `2. On a ${target.label} machine, run it with \`${command}\` (Zig 0.16). For another machine, build it with \`zig build-exe ${zigTargetFlags(target).join(" ")} -O ${a.mode} ${filename}\` and run it there.`,
+      `2. On a ${target.label} machine, run it with \`${command}\` (Zig 0.16). For another machine, build it with \`zig build-exe ${flags} -O ${a.mode} ${filename}\` and run it there.`,
       "3. Compare the printed size, align and offsets with the Zig Type Layout tool.",
       layoutGuaranteed(a)
         ? "This layout is defined by the language."

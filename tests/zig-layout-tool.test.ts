@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { zigToolDefinition } from "@sp/zig-layout/definition";
 import { applyAllFixes, lint } from "@sp/zig-layout/lint";
-import { OPTION_BUILD_MODE, OPTION_MODE, OPTION_ZIG_TARGET, TOOL_ZIG_STRUCT_LAYOUT, TOOL_ZIG_VERIFICATION_CODE } from "@sp/zig-layout";
+import { OPTION_BUILD_MODE, OPTION_MODE, OPTION_ZIG_CPU, OPTION_ZIG_TARGET, TOOL_ZIG_STRUCT_LAYOUT, TOOL_ZIG_VERIFICATION_CODE } from "@sp/zig-layout";
 import { TOOL_MANIFESTS, loadTool } from "@sp/registry";
 
 const createSpec = zigToolDefinition(TOOL_ZIG_STRUCT_LAYOUT).createSpec;
@@ -39,11 +39,23 @@ describe("Zig tool family", () => {
     expect(tool.compute(tool.createSpec({ [OPTION_BUILD_MODE]: "ReleaseFast" }), u).data!.display!.totalSize).toBe(4);
   });
 
-  it("ZG003 for vectors whose Debug layout depends on the CPU, on x86-64 Linux only", () => {
+  it("lays vectors out for the selected CPU, which only Zig's x86-64 backend (Debug on x86-64 Linux) looks at", () => {
     const v = "const S = struct { v: @Vector(8, f32), a: u8 };";
-    expect(codes(v)).toContain("ZG003");
-    expect(codes(v, { [OPTION_BUILD_MODE]: "ReleaseFast" })).not.toContain("ZG003");
-    expect(codes(v, { [OPTION_ZIG_TARGET]: "x86_64-macos-none" })).not.toContain("ZG003");
+    const tool = zigToolDefinition(TOOL_ZIG_STRUCT_LAYOUT);
+    const size = (options: Record<string, string>) => tool.compute(tool.createSpec(options), v).data!.display!.totalSize;
+    expect(size({})).toBe(48);
+    expect(size({ [OPTION_ZIG_CPU]: "x86_64_v3" })).toBe(64);
+    // LLVM aligns a 32-byte vector to 32 whatever the CPU.
+    expect(size({ [OPTION_BUILD_MODE]: "ReleaseFast" })).toBe(64);
+    expect(size({ [OPTION_ZIG_TARGET]: "x86_64-macos-none" })).toBe(64);
+    const code = zigToolDefinition(TOOL_ZIG_VERIFICATION_CODE);
+    expect(code.compute(code.createSpec({ [OPTION_ZIG_CPU]: "x86_64_v3" }), v).fields!.find((f) => f.label === "Run")!.value).toContain("-mcpu=x86_64_v3");
+  });
+
+  it("says which std types it does not model, rather than laying out a stand-in", () => {
+    const tool = zigToolDefinition(TOOL_ZIG_STRUCT_LAYOUT);
+    const r = tool.compute(tool.createSpec(), 'const std = @import("std");\nconst E = enum { a, b };\nconst S = struct { s: std.EnumSet(E) };');
+    expect(r.error).toMatch(/no declaration named 'EnumSet'/);
   });
 
   it("ZG004, ZG005 and ZG006", () => {

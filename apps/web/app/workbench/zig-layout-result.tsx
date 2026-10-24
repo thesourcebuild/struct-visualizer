@@ -23,7 +23,7 @@ export function ZigLayoutResult({ result, spec, input }: ZigLayoutResultProps) {
   if (a && def) {
     const label = layoutLabel(a);
     badges.push(
-      { label: "Target", value: `${a.target.label}, ${a.mode}` },
+      { label: "Target", value: `${a.target.label}${a.target.arch === "x86_64" ? ` (${a.cpu.label})` : ""}, ${a.mode}` },
       { label: "Layout", value: layoutGuaranteed(a) ? label : `${label}: order chosen by the compiler, not guaranteed` },
     );
     const tag = describeUnionTag(a);

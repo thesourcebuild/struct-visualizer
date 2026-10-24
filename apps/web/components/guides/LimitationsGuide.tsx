@@ -106,16 +106,15 @@ export function LimitationsGuide() {
                 </p>
                 <ul className={UL}>
                     <li>Structs, tuples, extern and packed structs, enums, bare, tagged, extern and packed unions; optionals, error sets and error unions, slices, sentinels, vectors.</li>
-                    <li>The build mode matters: Debug and ReleaseSafe give a bare union a hidden safety tag. In Debug on x86-64 Linux, Zig&apos;s own code generator lays out vectors, aligning them to 16 bytes or more.</li>
-                    <li>Comptime code that decides a type: constants, <code className={CODE}>@sizeOf</code>, <code className={CODE}>@alignOf</code>, <code className={CODE}>@bitSizeOf</code>, <code className={CODE}>@Int</code>, <code className={CODE}>@This</code>, <code className={CODE}>@import(&quot;builtin&quot;).mode</code>, and functions that return a type through <code className={CODE}>const</code>, <code className={CODE}>if</code> and <code className={CODE}>return</code>.</li>
-                    <li>The common <code className={CODE}>std</code> types (ArrayList, the hash maps, Allocator, MultiArrayList, atomics, the Io locks, bit sets, linked lists), written as std defines them.</li>
+                    <li>The build mode matters: Debug and ReleaseSafe give a bare union a hidden safety tag. In Debug on x86-64 Linux, Zig&apos;s own code generator lays out vectors by the CPU: 16-byte aligned, 32 with AVX and 64 with AVX-512F (the CPU option, as <code className={CODE}>-mcpu</code>).</li>
+                    <li>Comptime code that decides a type: constants and integer arithmetic (fixed-width where declared so), <code className={CODE}>@sizeOf</code>, <code className={CODE}>@alignOf</code>, <code className={CODE}>@bitSizeOf</code>, <code className={CODE}>@Int</code>, <code className={CODE}>@This</code>, <code className={CODE}>@typeInfo</code>, <code className={CODE}>@clz</code>, <code className={CODE}>@import(&quot;builtin&quot;).mode</code>, and functions that return a type through <code className={CODE}>const</code>, <code className={CODE}>if</code> with captures, <code className={CODE}>switch</code>, <code className={CODE}>return</code> and method calls.</li>
+                    <li>The common <code className={CODE}>std</code> types (ArrayList, the hash maps, Allocator, MultiArrayList, atomics, the Io locks, Writer and Reader, bit sets, linked lists), transcribed from the std sources.</li>
                 </ul>
                 <p className={`${P} mt-3`}>Not modelled:</p>
                 <ul className={UL}>
-                    <li>Comptime code with loops, <code className={CODE}>switch</code>, <code className={CODE}>@Type</code> or <code className={CODE}>@typeInfo</code> beyond field counts and integer widths: an error says what is not supported.</li>
+                    <li>Comptime code with loops, assignments or <code className={CODE}>@Type</code>: an error says what is not supported. So are std types defined that way, such as <code className={CODE}>EnumSet</code> and <code className={CODE}>EnumArray</code>.</li>
                     <li>The rest of <code className={CODE}>std</code>, and other imports: an error names what is missing.</li>
-                    <li>Vectors over 16 bytes in Debug on x86-64 Linux take the alignment of the baseline CPU, which <code className={CODE}>-target</code> without <code className={CODE}>-mcpu</code> builds for: with AVX they are aligned to 32 (ZG003).</li>
-                    <li><code className={CODE}>--error-limit</code>: error codes are taken as 16 bits, the default.</li>
+                    <li>The <code className={CODE}>--error-limit</code> compiler flag: error codes are 16 bits, its default.</li>
                 </ul>
             </section>
 

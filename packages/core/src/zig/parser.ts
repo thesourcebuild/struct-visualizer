@@ -46,8 +46,20 @@ export type Expr =
   | { k: 'array'; len: Expr | 'infer'; sentinel?: Expr; child: Expr; line: number }
   | { k: 'container'; c: ContainerDecl; line: number }
   | { k: 'fnType'; params: Param[]; ret: Expr; callconv?: Expr; line: number }
-  | { k: 'if'; cond: Expr; then: Expr; else?: Expr; line: number }
-  | { k: 'comptime'; e: Expr; line: number };
+  /** `if (c) a else b`; with `|x|`, c is an optional and x its payload. */
+  | { k: 'if'; cond: Expr; capture?: string; then: Expr; else?: Expr; line: number }
+  | { k: 'comptime'; e: Expr; line: number }
+  /** Reaching it at compile time is a compile error. */
+  | { k: 'unreachable'; line: number }
+  /** `switch (x) { a, b => e, 1...3 => f, else => g }`, without captures. */
+  | { k: 'switch'; subject: Expr; prongs: SwitchProng[]; line: number };
+
+export interface SwitchProng {
+  /** Values and ranges (`a...b`); empty for `else`. */
+  items: Array<{ value: Expr } | { from: Expr; to: Expr }>;
+  isElse: boolean;
+  body: Expr;
+}
 
 export interface Param {
   name?: string;
@@ -59,8 +71,10 @@ export interface Param {
 export type Stmt =
   | { k: 'decl'; decl: Decl }
   | { k: 'return'; e?: Expr; line: number }
-  | { k: 'if'; cond: Expr; then: Stmt; else?: Stmt; line: number }
+  | { k: 'if'; cond: Expr; capture?: string; then: Stmt; else?: Stmt; line: number }
   | { k: 'block'; body: Stmt[] }
+  /** `x = e;` and the compound forms: only constants decide a type, so running one is an error. */
+  | { k: 'assign'; target: Expr; value: Expr; line: number }
   | { k: 'expr'; e: Expr; line: number };
 
 export interface FnDecl {
@@ -179,7 +193,8 @@ class Parser {
 
   private is(text: string, offset = 0): boolean {
     const t = this.peek(offset);
-    return (t.kind === 'punct' || t.kind === 'ident') && t.text === text;
+    // A quoted identifier (@"fn") is a name, not the keyword or punctuation it spells.
+    return (t.kind === 'punct' || (t.kind === 'ident' && !t.quoted)) && t.text === text;
   }
 
   private accept(text: string): boolean {
@@ -200,7 +215,7 @@ class Parser {
 
   private identifier(): ZigToken {
     const t = this.peek();
-    if (t.kind !== 'ident' || (KEYWORDS.has(t.text) && this.source[t.start] !== '@')) {
+    if (t.kind !== 'ident' || (KEYWORDS.has(t.text) && !t.quoted)) {
       throw new ZigParseError(`Expected a name, found ${t.kind === 'eof' ? 'end of input' : `'${t.text}'`}.`, t.line);
     }
     return this.next();
@@ -280,7 +295,7 @@ class Parser {
     const line = this.peek().line;
     const isComptime = this.accept('comptime');
     const f: FieldDecl = { comptime: isComptime, line, start, end: start };
-    const nameToken = this.peek().kind === 'ident' && (!KEYWORDS.has(this.peek().text) || this.source[this.peek().start] === '@');
+    const nameToken = this.peek().kind === 'ident' && (!KEYWORDS.has(this.peek().text) || this.peek().quoted === true);
     // A struct field without ':' is a tuple field (a type); a union field without one is void.
     const named =
       nameToken &&
@@ -470,10 +485,10 @@ class Parser {
       this.expect('(');
       const cond = this.expr();
       this.expect(')');
-      if (this.is('|')) throw new ZigParseError('Payload captures are not supported in type functions.', t.line);
+      const capture = this.capture();
       const then = this.blockOrExprStmt();
       const otherwise = this.accept('else') ? this.blockOrExprStmt() : undefined;
-      return { k: 'if', cond, then, else: otherwise, line: t.line };
+      return { k: 'if', cond, capture, then, else: otherwise, line: t.line };
     }
     if (this.is('while') || this.is('for') || this.is('switch') || this.is('defer') || this.is('errdefer') || this.is('inline')) {
       throw new ZigParseError(`'${t.text}' is not supported in a function that returns a type.`, t.line);
@@ -486,9 +501,56 @@ class Parser {
       return { k: 'expr', e, line: t.line };
     }
     const e = this.expr();
-    if (!this.is(';')) throw new ZigParseError('Only declarations, return and if are supported in a function that returns a type.', t.line);
+    const assign = ['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '+%=', '-%=', '*%=', '+|=', '-|=', '*|=', '<<|='].find((op) => this.is(op));
+    if (assign) {
+      this.next();
+      const value = this.expr();
+      this.expect(';');
+      return { k: 'assign', target: e, value, line: t.line };
+    }
+    if (!this.is(';')) throw new ZigParseError('Only declarations, assignments, return and if are supported in a function that returns a type.', t.line);
     this.next();
     return { k: 'expr', e, line: t.line };
+  }
+
+  /** SwitchExpr: `switch (x) { a, b => e, lo...hi => f, else => g }`. */
+  private switchExpr(): Expr {
+    const line = this.expect('switch').line;
+    this.expect('(');
+    const subject = this.expr();
+    this.expect(')');
+    this.expect('{');
+    const prongs: SwitchProng[] = [];
+    while (!this.is('}')) {
+      if (this.is('inline')) throw new ZigParseError('inline switch prongs are not supported.', this.peek().line);
+      const prong: SwitchProng = { items: [], isElse: false, body: { k: 'int', v: 0n, line } };
+      if (this.accept('else')) {
+        prong.isElse = true;
+      } else {
+        for (;;) {
+          const from = this.expr();
+          if (this.accept('...')) prong.items.push({ from, to: this.expr() });
+          else prong.items.push({ value: from });
+          if (!this.accept(',') || this.is('=>')) break;
+        }
+      }
+      this.expect('=>');
+      if (this.is('|')) throw new ZigParseError('Switch prong captures are not supported.', this.peek().line);
+      prong.body = this.expr();
+      prongs.push(prong);
+      if (!this.accept(',')) break;
+    }
+    this.expect('}');
+    return { k: 'switch', subject, prongs, line };
+  }
+
+  /** PtrPayload: `|name|` after the condition of an `if`. */
+  private capture(): string | undefined {
+    if (!this.accept('|')) return undefined;
+    if (this.is('*')) throw new ZigParseError('A pointer capture (|*x|) is not supported here.', this.peek().line);
+    const name = this.identifier().text;
+    this.expect('|');
+    return name;
   }
 
   private blockOrExprStmt(): Stmt {
@@ -545,16 +607,16 @@ class Parser {
       this.expect('(');
       const cond = this.expr();
       this.expect(')');
-      if (this.is('|')) throw new ZigParseError('Payload captures are not supported here.', t.line);
+      const capture = this.capture();
       const then = this.expr();
       const otherwise = this.accept('else') ? this.expr() : undefined;
-      return { k: 'if', cond, then, else: otherwise, line: t.line };
+      return { k: 'if', cond, capture, then, else: otherwise, line: t.line };
     }
     if (this.is('comptime')) {
       this.next();
       return { k: 'comptime', e: this.expr(), line: t.line };
     }
-    if (this.is('switch') || this.is('while') || this.is('for') || this.is('break') || this.is('continue') || this.is('return') || this.is('asm')) {
+    if (this.is('while') || this.is('for') || this.is('break') || this.is('continue') || this.is('return') || this.is('asm')) {
       throw new ZigParseError(`'${t.text}' expressions are not supported.`, t.line);
     }
     const type = this.typeExpr();
@@ -738,11 +800,13 @@ class Parser {
       this.expect('(');
       const cond = this.expr();
       this.expect(')');
-      if (this.is('|')) throw new ZigParseError('Payload captures are not supported here.', t.line);
+      const capture = this.capture();
       const then = this.typeExpr();
       const otherwise = this.accept('else') ? this.typeExpr() : undefined;
-      return { k: 'if', cond, then, else: otherwise, line: t.line };
+      return { k: 'if', cond, capture, then, else: otherwise, line: t.line };
     }
+    if (this.is('switch')) return this.switchExpr();
+    if (this.accept('unreachable')) return { k: 'unreachable', line: t.line };
     if (this.is('anyframe')) throw new ZigParseError('anyframe is not supported.', t.line);
     if (this.is('fn')) {
       this.next();
@@ -752,7 +816,7 @@ class Parser {
       return { k: 'fnType', params, ret, callconv, line: t.line };
     }
     if (t.kind === 'ident') {
-      if (KEYWORDS.has(t.text) && this.source[t.start] !== '@') {
+      if (KEYWORDS.has(t.text) && !t.quoted) {
         throw new ZigParseError(`Unexpected '${t.text}'.`, t.line);
       }
       this.next();

@@ -3,10 +3,10 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { CCodeGenerator, analyzeStruct, examples } from "@sp/core";
 import type { PlatformSelection, SourceLanguage } from "@sp/core";
-import { msvc, vcvarsall } from "./support/compilers";
+import { msvc, msvcEnvironment, vcvarsall } from "./support/compilers";
 
 /**
  * End to end: the Verification Code tool's program for each case is compiled with the host's
@@ -91,6 +91,11 @@ async function compileAndRun(dir: string, index: number, source: string, languag
 
 describe.skipIf(!available)(`layouts match ${host?.compiler === "msvc" ? "MSVC" : "GCC"} on this ${process.platform} host`, () => {
   const dir = mkdtempSync(join(tmpdir(), "sp-host-"));
+
+  // vcvarsall sets up MSVC once, before the cases, so no case's time limit pays for it.
+  beforeAll(async () => {
+    if (host!.compiler === "msvc") await msvcEnvironment("x64");
+  }, 600_000);
 
   Object.entries(CASES).forEach(([label, c], index) => {
     it(label, async (ctx) => {

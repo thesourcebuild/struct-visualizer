@@ -1,6 +1,6 @@
 {
   "name": "struct-visualizer",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "packageManager": "pnpm@12.13.0",
   "engines": {

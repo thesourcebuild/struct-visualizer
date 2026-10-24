@@ -8,6 +8,8 @@ export type ZigTokenKind = 'ident' | 'builtin' | 'int' | 'float' | 'char' | 'str
 export interface ZigToken {
   kind: ZigTokenKind;
   text: string;
+  /** An @"identifier": never a keyword, whatever it spells. */
+  quoted?: boolean;
   /** Integer and character literals. */
   value?: bigint;
   line: number;
@@ -141,7 +143,7 @@ export function lexZig(text: string): ZigToken[] {
         }
         if (j >= text.length) throw new ZigLexError('Unterminated identifier.', line);
         i = j + 1;
-        tokens.push({ kind: 'ident', text: name, line, start, end: i });
+        tokens.push({ kind: 'ident', text: name, line, start, end: i, quoted: true });
         continue;
       }
       if (isIdentStart(text[i + 1])) {

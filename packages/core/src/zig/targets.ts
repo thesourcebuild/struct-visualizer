@@ -44,9 +44,39 @@ export function getZigTarget(id: string): ZigTarget {
   return ZIG_TARGETS.find((t) => t.id === id) ?? ZIG_TARGETS[0]!;
 }
 
-/** The flags that select a target on the zig command line. */
-export function zigTargetFlags(t: ZigTarget): string[] {
-  return ['-target', t.id, ...(t.cpu ? [`-mcpu=${t.cpu}`] : [])];
+/** A CPU model `-mcpu` selects, with the features that decide a layout. */
+export interface ZigCpu {
+  id: string;
+  label: string;
+  /** AVX and AVX-512F: Zig's x86-64 backend aligns vectors to 32 and 64 bytes with them. */
+  avx: boolean;
+  avx512f: boolean;
+}
+
+/** The x86-64 microarchitecture levels; `x86_64` is what -target builds for without -mcpu. */
+export const ZIG_X86_64_CPUS: readonly ZigCpu[] = [
+  { id: 'x86_64', label: 'Baseline x86-64', avx: false, avx512f: false },
+  { id: 'x86_64_v2', label: 'x86-64-v2 (SSE4.2)', avx: false, avx512f: false },
+  { id: 'x86_64_v3', label: 'x86-64-v3 (AVX2)', avx: true, avx512f: false },
+  { id: 'x86_64_v4', label: 'x86-64-v4 (AVX-512)', avx: true, avx512f: true },
+];
+
+/** The CPU models offered for a target: the x86-64 levels, or the target's one CPU. */
+export function zigCpus(t: ZigTarget): readonly ZigCpu[] {
+  if (t.arch === 'x86_64') return ZIG_X86_64_CPUS;
+  return [{ id: t.cpu ?? 'baseline', label: t.cpu ?? 'Baseline', avx: false, avx512f: false }];
+}
+
+/** The CPU `cpuId` names on `t`, or the target's default. */
+export function getZigCpu(t: ZigTarget, cpuId?: string): ZigCpu {
+  const cpus = zigCpus(t);
+  return cpus.find((c) => c.id === cpuId) ?? cpus[0]!;
+}
+
+/** The flags that select a target, and a CPU, on the zig command line. */
+export function zigTargetFlags(t: ZigTarget, cpuId?: string): string[] {
+  const cpu = t.arch === 'x86_64' ? getZigCpu(t, cpuId).id : t.cpu;
+  return ['-target', t.id, ...(cpu && cpu !== 'x86_64' ? [`-mcpu=${cpu}`] : [])];
 }
 
 export function ptrBits(t: ZigTarget): number {

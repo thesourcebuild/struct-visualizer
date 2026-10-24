@@ -1,14 +1,16 @@
 import { createOptionCatalogue } from "@sp/engine";
 import type { OptionCatalogue, OptionDef } from "@sp/engine";
-import { ZIG_TARGETS } from "@sp/core";
+import { ZIG_TARGETS, ZIG_X86_64_CPUS } from "@sp/core";
 import {
   OPTION_BUILD_MODE,
   OPTION_COMPARE,
   OPTION_EXPLAIN,
   OPTION_MODE,
+  OPTION_ZIG_CPU,
   OPTION_ZIG_TARGET,
   TAG_OPTIMIZED,
   TAG_REORDERABLE,
+  TAG_X86_64,
   TOOL_ZIG_STRUCT_LAYOUT,
   TOOL_ZIG_VERIFICATION_CODE,
 } from "../pure";
@@ -38,6 +40,22 @@ const BUILD_MODE: OptionDef<ZigGroup> = {
   ],
   summary: "-O: whether bare unions (and std types holding a SafetyLock) carry safety state.",
   order: 1,
+  colSpan: 2,
+};
+
+const CPU: OptionDef<ZigGroup> = {
+  id: OPTION_ZIG_CPU,
+  label: "CPU",
+  group: "platform",
+  kind: "enum",
+  choices: ZIG_X86_64_CPUS.map((c) => ({
+    value: c.id,
+    label: c.label,
+    summary: c.id === "x86_64" ? "What -target builds for without -mcpu." : `-mcpu=${c.id}${c.avx512f ? ": AVX-512F" : c.avx ? ": AVX" : ""}.`,
+  })),
+  summary: "-mcpu: in Debug on x86-64 Linux, Zig's own code generator aligns vectors over 16 bytes to 32 with AVX and 64 with AVX-512F.",
+  availableOn: [TAG_X86_64],
+  order: 2,
   colSpan: 2,
 };
 
@@ -76,8 +94,8 @@ const EXPLAIN: OptionDef<ZigGroup> = {
 };
 
 const CATALOGUES: Record<string, readonly OptionDef<ZigGroup>[]> = {
-  [TOOL_ZIG_STRUCT_LAYOUT]: [TARGET, BUILD_MODE, MODE, COMPARE, EXPLAIN],
-  [TOOL_ZIG_VERIFICATION_CODE]: [MODE, TARGET, BUILD_MODE],
+  [TOOL_ZIG_STRUCT_LAYOUT]: [TARGET, BUILD_MODE, CPU, MODE, COMPARE, EXPLAIN],
+  [TOOL_ZIG_VERIFICATION_CODE]: [MODE, TARGET, BUILD_MODE, CPU],
 };
 
 export function zigCatalogueFor(toolId: string): OptionCatalogue<ZigGroup> {
