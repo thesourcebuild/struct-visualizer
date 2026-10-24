@@ -51,6 +51,11 @@ const rustTargets = new Set(toolchains.rust ? rustupLines(["target", "list", "--
 const rustupTargets = new Set(toolchains.rust ? rustupLines(["target", "list"]).map((l) => l.replace(/ \(.*\)$/, "")) : []);
 /** A nightly toolchain with the library source, to build core for a tier-3 target. */
 const buildStd = toolchains.rust && rustupLines(["component", "list", "--toolchain", "nightly", "--installed"]).some((l) => l.startsWith("rust-src"));
+/**
+ * Where cargo keeps the core it builds for the tier-3 targets: building it is most of the time
+ * they take, and it is reused by later runs with the same nightly (CI caches the directory).
+ */
+const buildStdDir = process.env.SP_RUST_BUILD_STD_DIR || join(tmpdir(), "sp-rust-build-std");
 /** Targets that need a CPU named (AVR has no default). */
 const RUST_FLAGS: Record<string, string[]> = { "avr-none": ["-C", "target-cpu=atmega328p"] };
 
@@ -207,13 +212,13 @@ async function checkRust() {
       const args = ["--edition", "2021", "--crate-type", "lib", "--target", target, ...flags, "--emit", "metadata", "-o", join(dir, `rust_${target}.rmeta`), file];
       output = await run("rustc", args, { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
     } else {
-      // A tier-3 target: core built from source on nightly, kept between runs as that takes a while.
+      // A tier-3 target: core built from source on nightly, in buildStdDir.
       const crate = join(dir, `rust_${target}`);
       mkdirSync(join(crate, "src"), { recursive: true });
       writeFileSync(join(crate, "Cargo.toml"), '[package]\nname = "bindcheck"\nversion = "0.0.0"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n');
       file = join(crate, "src", "lib.rs");
       writeFileSync(file, lines.join("\n"));
-      const env = { ...process.env, CARGO_TARGET_DIR: join(tmpdir(), "sp-rust-build-std"), RUSTFLAGS: flags.join(" ") };
+      const env = { ...process.env, CARGO_TARGET_DIR: buildStdDir, RUSTFLAGS: flags.join(" ") };
       const args = ["run", "nightly", "cargo", "check", "-q", "-Zbuild-std=core", "--target", target];
       output = await run("rustup", args, { cwd: crate, env, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
     }
