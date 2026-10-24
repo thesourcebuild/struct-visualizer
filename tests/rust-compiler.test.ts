@@ -72,6 +72,13 @@ const CASES: Record<string, string> = {
   "hash collections": "use std::collections::{HashMap, HashSet};\nstruct S { m: HashMap<u32, String>, s: HashSet<u64>, f: bool }",
   "alloc collections": "struct S { q: VecDeque<u8>, t: BTreeMap<u32, u32>, h: BinaryHeap<u16>, l: LinkedList<u8>, s: BTreeSet<u8> }",
   "Cow": "use std::borrow::Cow;\nstruct S { a: Cow<'static, str>, b: Option<Cow<'static, [u8]>>, c: u8 }",
+  // The same from alloc, which no_std targets have too.
+  "Cow from alloc": "use alloc::borrow::Cow;\nstruct S { a: Cow<'static, str>, b: Option<Cow<'static, [u8]>>, c: u8 }",
+  "std path": "struct S { a: std::num::NonZeroU32, b: u8 }",
+  // rc::Weak everywhere; sync::Weak only with atomic compare-and-swap (not AVR).
+  "rc Weak, renamed": "use alloc::rc::Weak as RcWeak;\nstruct S { w: RcWeak<u32>, b: u8 }",
+  "sync Weak": "use alloc::sync::Weak;\nstruct S { w: Weak<u32>, b: u8 }",
+  "grouped imports": "use core::{cell::{Cell, RefCell as Shared}, num::NonZeroU16};\nstruct S { c: Cell<u8>, r: Shared<u32>, n: Option<NonZeroU16> }",
   "generics": "struct W<T> { a: T, b: u8 }\nstruct S { x: W<u32>, y: W<(u8, u16)>, z: W<bool> }",
   "type aliases": "type Id = u32;\ntype Pair<T> = (T, T);\nstruct S { a: Id, p: Pair<u8>, b: u64 }",
   "repr(C, packed(2))": "#[repr(C, packed(2))]\nstruct S { a: u8, b: u32, c: u16 }",
@@ -184,7 +191,8 @@ describe("Rust layouts", () => {
         });
         const main = `fn main() {\n${entries.map((_, i) => `    println!("=== ${i}");\n    case${i}::report();`).join("\n")}\n}\n`;
         const src = join(dir, "main.rs");
-        writeFileSync(src, `${modules.join("\n")}\n${main}`);
+        // alloc in scope, as the engine takes the standard types to be (see checkTarget).
+        writeFileSync(src, `extern crate alloc;\n${modules.join("\n")}\n${main}`);
         const bin = join(dir, "verify.exe");
         await run("rustc", ["--edition", "2021", "-A", "warnings", "-o", bin, src]).catch((err: { stderr?: string }) => {
           throw new Error(err.stderr ?? String(err));
@@ -223,19 +231,15 @@ interface Case {
   types: string[];
 }
 
-/** A case's source for a no_std target: the std paths that core and alloc also have. */
-const forNoStd = (code: string) =>
-  code
-    .replace(/\bstd::(?=(num|cell|mem|marker|cmp|time|sync::atomic|ffi|fmt|convert|ops|ptr)\b)/g, "core::")
-    .replace(/\bstd::borrow\b/g, "alloc::borrow");
-
 /**
  * One crate of compile-time checks for every case on `target`. Each fact is a check against the
  * engine's number; where it fails, rustc names its own, so rustc's whole answer is known either way.
  */
 async function checkTarget(target: string, how: "stable" | "build-std", cases: Case[]): Promise<Checked> {
   const noStd = NO_STD.has(target);
-  const lines: string[] = noStd ? ["#![no_std]", "extern crate alloc;"] : [];
+  // The engine takes the standard types to be in scope, as if imported: so the crate has alloc on
+  // every target, and each case the imports below.
+  const lines: string[] = noStd ? ["#![no_std]", "extern crate alloc;"] : ["extern crate alloc;"];
   /** Per line of the crate: the case and the fact its check is about. */
   const at: Array<{ index: number; fact: string } | undefined> = [];
   const push = (line: string, mark?: { index: number; fact: string }) => {
@@ -248,10 +252,10 @@ async function checkTarget(target: string, how: "stable" | "build-std", cases: C
   };
   const mem = noStd ? "core::mem" : "std::mem";
   for (const c of cases) {
-    const code = noStd ? forNoStd(c.code) : c.code;
     push(`#[allow(dead_code, unused_imports, non_camel_case_types)]`, { index: c.index, fact: "" });
     push(`mod case${c.index} {`, { index: c.index, fact: "" });
-    for (const l of `${noStd ? NO_STD_PRELUDE : STD_PRELUDE}\n${code}`.split("\n")) push(l);
+    // The case as written: a std path on a no_std target is for rustc and the engine to refuse.
+    for (const l of `${noStd ? NO_STD_PRELUDE : STD_PRELUDE}\n${c.code}`.split("\n")) push(l);
     const check = (value: number, expr: string, fact: string) => push(`const _: [(); ${value}] = [(); ${expr}];`, { index: c.index, fact });
     check(c.facts.size, `${mem}::size_of::<${c.root}>()`, "size");
     check(c.facts.align, `${mem}::align_of::<${c.root}>()`, "align");

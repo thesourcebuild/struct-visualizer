@@ -270,6 +270,10 @@ const C_TYPES: Record<string, string> = {
   c_longlong: 'i64', c_ulonglong: 'u64', c_float: 'f32',
 };
 
+/** What rustc says to a std path on a target without std. */
+const noStdMessage = (t: RustTarget) =>
+  `${t.id} has no std (no_std): only core and alloc. Write core:: or alloc:: (core::num, alloc::vec, ...).`;
+
 /** core::sync::atomic's integer types and the width each needs. */
 const ATOMIC_BITS: Record<string, number> = {
   AtomicBool: 8, AtomicU8: 8, AtomicI8: 8, AtomicU16: 16, AtomicI16: 16,
@@ -298,7 +302,11 @@ export class RustLayoutEngine {
   // ---------------------------------------------------------------- items and names
 
   lookupItem(name: string): RustItem | undefined {
-    return this.file.items.get(name) ?? prelude().items.get(name);
+    const own = this.file.items.get(name);
+    if (own) return own;
+    // A standard type imported under another name (`use alloc::rc::Weak as RcWeak`).
+    const imported = this.file.uses.find((u) => u.name === name)?.path;
+    return prelude().items.get(imported ? imported[imported.length - 1]! : name);
   }
 
   private intAlign(bytes: number): number {
@@ -543,28 +551,43 @@ export class RustLayoutEngine {
     }
   }
 
+  /**
+   * The path a standard type is named by: as written (`alloc::sync::Weak`), or from the `use`
+   * that brought the name into scope, or the bare name.
+   */
+  private standardPath(type: Extract<RustType, { kind: 'path' }>): string[] {
+    if (type.segments.length > 1) return type.segments;
+    const name = type.segments[0]!;
+    return this.file.uses.find((u) => u.name === name)?.path ?? [name];
+  }
+
   /** A standard type the target's core, alloc or std does not have, as rustc would say. */
-  private checkAvailable(name: string, line?: number): void {
+  private checkAvailable(name: string, path: readonly string[], line?: number): void {
     const t = this.target;
     const bits = ATOMIC_BITS[name];
     if (bits !== undefined && !t.atomicBits.includes(bits)) {
       throw new RustLayoutError(`core::sync::atomic::${name} does not exist on ${t.id}: it has no ${bits}-bit atomics.`, line);
     }
-    if (name === 'Arc' && !t.atomicCas) {
-      throw new RustLayoutError(`alloc::sync::Arc does not exist on ${t.id}: it has no atomic compare-and-swap. Use Rc.`, line);
+    // alloc::sync (Arc and its Weak) needs pointer-sized compare-and-swap; alloc::rc::Weak does not.
+    if ((name === 'Arc' || (name === 'Weak' && path.includes('sync'))) && !t.atomicCas) {
+      throw new RustLayoutError(`alloc::sync::${name} does not exist on ${t.id}: it has no atomic compare-and-swap. Use alloc::rc.`, line);
     }
     if (STD_ONLY.has(name) && !t.std) {
       throw new RustLayoutError(`${name} is in std, which ${t.id} does not have (no_std: only core and alloc).`, line);
     }
   }
 
-  private pathLayout(type: Extract<RustType, { kind: 'path' }>, subst: Subst, line?: number): Layout {
-    const name = type.segments[type.segments.length - 1]!;
-    if (type.segments.length === 1) {
-      const bound = subst.get(name);
+  private pathLayout(written: Extract<RustType, { kind: 'path' }>, subst: Subst, line?: number): Layout {
+    if (written.segments.length === 1) {
+      const bound = subst.get(written.segments[0]!);
       if (bound?.kind === 'type') return this.layoutOf(bound.type, new Map(), line);
-      if (bound?.kind === 'const') throw new RustLayoutError(`'${name}' is a constant, not a type.`, line);
+      if (bound?.kind === 'const') throw new RustLayoutError(`'${written.segments[0]}' is a constant, not a type.`, line);
     }
+    // A name brought in by `use ... as Name` is the item it names.
+    const imported = written.segments.length === 1 && !this.file.items.has(written.segments[0]!) ? this.file.uses.find((u) => u.name === written.segments[0]) : undefined;
+    const type = imported ? { ...written, segments: imported.path } : written;
+    const name = type.segments[type.segments.length - 1]!;
+    if (type.segments.length > 1 && type.segments[0] === 'std' && !this.target.std) throw new RustLayoutError(noStdMessage(this.target), line);
     if (type.args.length === 0) {
       if (name === 'str') throw new RustLayoutError("'str' has no size on its own. Use &str, Box<str> or String.", line);
       const p = this.primitive(name);
@@ -580,7 +603,7 @@ export class RustLayoutEngine {
         line,
       );
     }
-    if (!this.file.items.has(name)) this.checkAvailable(name, line);
+    if (!this.file.items.has(name)) this.checkAvailable(name, this.standardPath(type), line);
     const inner = this.bindGenerics(item, type.args, subst);
     const key = `${name}<${[...inner.entries()].map(([k, v]) => `${k}=${v.kind === 'type' ? formatRustType(v.type) : v.value}`).join(',')}>`;
     const cached = this.cache.get(key);
@@ -1098,6 +1121,13 @@ export function analyzeRust(code: string, targetId: string): RustAnalysis {
 
   const item = file.items.get(rootName) as RustStruct | RustEnum;
   analysis.definition = { name: rootName, kind: item.kind, line: item.line, repr: item.repr };
+  if (!target.std) {
+    // `use std::...` names a crate the target does not have.
+    for (const at of new Set(file.uses.filter((u) => u.path[0] === 'std').map((u) => u.line))) {
+      analysis.errors.push({ message: noStdMessage(target), line: at, type: 'semantic' });
+    }
+    if (analysis.errors.length > 0) return analysis;
+  }
   const engine = new RustLayoutEngine(target, file);
   try {
     const layout = engine.rootLayout(rootName);

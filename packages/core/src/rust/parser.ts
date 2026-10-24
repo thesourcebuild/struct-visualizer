@@ -105,6 +105,11 @@ export interface RustFile {
   /** Item names in source order. */
   order: string[];
   consts: Map<string, RustConst>;
+  /**
+   * What each `use` item imports: the name it brings into scope and its full path (`Weak` from
+   * `alloc::sync::Weak`), so a standard type is known by its module. A glob import has no name.
+   */
+  uses: Array<{ name?: string; path: string[]; line: number }>;
   errors: ParseError[];
   warnings: ParseError[];
 }
@@ -123,7 +128,7 @@ export const INTEGER_TYPES = ['u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'i8', 
 // ------------------------------------------------------------------ parser
 
 export function parseRust(code: string): RustFile {
-  const file: RustFile = { items: new Map(), order: [], consts: new Map(), errors: [], warnings: [] };
+  const file: RustFile = { items: new Map(), order: [], consts: new Map(), uses: [], errors: [], warnings: [] };
   let tokens: RustToken[];
   try {
     tokens = lexRust(code);
@@ -154,6 +159,52 @@ export function parseRust(code: string): RustFile {
     if (t?.kind !== 'id' || t.lifetime || KEYWORDS.has(t.value)) fail(`Expected ${what}${found()}.`);
     pos += 1;
     return t!.value;
+  };
+  /** A path segment of a `use` item: a name, or `crate`, `self`, `super`. */
+  const importSegment = (): string => {
+    const t = peek();
+    if (t?.kind === 'id' && !t.lifetime && (!KEYWORDS.has(t.value) || ['crate', 'self', 'super'].includes(t.value))) {
+      pos += 1;
+      return t.value;
+    }
+    return fail(`Expected a path in a use item${found()}.`);
+  };
+  /** UseTree: `a::b::C`, `a::{B, c::D as E}`, `a::*`, recording each name it imports. */
+  const parseUseTree = (prefix: string[], at: number): void => {
+    if (is('*')) {
+      pos += 1;
+      file.uses.push({ path: prefix, line: at });
+      return;
+    }
+    if (is('{')) {
+      pos += 1;
+      while (!is('}')) {
+        parseUseTree(prefix, at);
+        if (!is(',')) break;
+        pos += 1;
+      }
+      expect('}', 'to close the use group');
+      return;
+    }
+    let path = [...prefix, importSegment()];
+    if (is('::')) {
+      pos += 1;
+      parseUseTree(path, at);
+      return;
+    }
+    // `use a::b::{self}` imports `b` itself.
+    if (path.length > 1 && path[path.length - 1] === 'self') path = path.slice(0, -1);
+    let name = path[path.length - 1]!;
+    if (is('as')) {
+      pos += 1;
+      if (is('_')) {
+        pos += 1;
+        name = '_';
+      } else {
+        name = ident('a name after as');
+      }
+    }
+    file.uses.push({ name, path, line: at });
   };
   /** Closing '>' of a generic list, splitting '>>', '>=' and '>>=' as needed. */
   const closeAngle = () => {
@@ -783,8 +834,13 @@ export function parseRust(code: string): RustFile {
           if (peek()?.kind === 'id') pos += 1;
           if (is('{') || is('(') || is('[')) skipGroup();
           if (is(';')) pos += 1;
+        } else if (is('use')) {
+          pos += 1;
+          if (is('::')) pos += 1;
+          parseUseTree([], at);
+          expect(';', 'after a use item');
         } else if (
-          ['fn', 'impl', 'trait', 'use', 'extern', 'static', 'unsafe', 'async', 'mod', 'const', 'auto'].includes(peek()?.value ?? '')
+          ['fn', 'impl', 'trait', 'extern', 'static', 'unsafe', 'async', 'mod', 'const', 'auto'].includes(peek()?.value ?? '')
         ) {
           skipItem();
         } else {
