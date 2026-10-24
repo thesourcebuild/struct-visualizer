@@ -72,6 +72,22 @@ export const riscv32Architecture: Architecture = {
   description: 'RISC-V 32-bit architecture (RV32)',
 };
 
+// PowerPC (32-bit, big-endian, System V)
+export const ppc32Architecture: Architecture = {
+  id: 'ppc32',
+  name: 'ppc32',
+  displayName: 'PowerPC 32-bit',
+  description: 'PowerPC 32-bit, System V ABI, big-endian',
+};
+
+// MIPS32 (big-endian, o32)
+export const mips32beArchitecture: Architecture = {
+  id: 'mips32be',
+  name: 'mips32be',
+  displayName: 'MIPS32 big-endian',
+  description: 'MIPS32, o32 ABI, big-endian',
+};
+
 // RISC-V (64-bit)
 export const riscv64Architecture: Architecture = {
   id: 'riscv64',
@@ -90,7 +106,9 @@ export const architectures: Record<string, Architecture> = {
   '8051': arch8051,
   avr: avrArchitecture,
   pic16: pic16Architecture,
-  pic32: pic32Architecture
+  pic32: pic32Architecture,
+  ppc32: ppc32Architecture,
+  mips32be: mips32beArchitecture,
 };
 
 export const architectureList = [
@@ -104,4 +122,6 @@ export const architectureList = [
   avrArchitecture,
   pic16Architecture,
   pic32Architecture,
+  ppc32Architecture,
+  mips32beArchitecture,
 ];

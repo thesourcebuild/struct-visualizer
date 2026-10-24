@@ -21,7 +21,7 @@ Pick a language in the sidebar. Each language has its own editor contents, examp
 
 | Language | Tools | Targets |
 |---|---|---|
-| **C / C++** | Struct Layout, Verification Code | x86, x86-64, ARM32, ARM64, RISC-V 32/64, Microchip 8/16/32-bit, 8051; 13 data models; Windows/Linux/bare metal |
+| **C / C++** | Struct Layout, Verification Code | x86, x86-64, ARM32, ARM64, RISC-V 32/64, PowerPC 32 and MIPS32 (big-endian), Microchip 8/16/32-bit, 8051; 13 data models; Windows/Linux/bare metal |
 | **Go** | Go Struct Layout, Go Verification Code | All 14 gc architectures: amd64, arm64, 386, arm, riscv64, loong64, mips(le), mips64(le), ppc64(le), s390x, wasm |
 | **Rust** | Rust Type Layout, Rust Verification Code | 13 target triples: x86-64 Linux/Windows/macOS, AArch64 Linux/macOS, i686 Linux/Windows, ARMv7, Cortex-M (thumbv7em), RISC-V 32/64, wasm32, AVR |
 | Reference | Data Models | LP64, LLP64, ILP32 and the embedded C compiler models (XC8, XC16, XC32, C51, SDCC) |
@@ -82,8 +82,8 @@ The engines are tested against the real compilers, not against expected values w
 | Language | Ground truth (`tests/`) |
 |---|---|
 | C, C++ | `verification-program.test.ts` builds and runs the Verification Code tool's program for every example in every mode (natural, packed, optimized), as C, C++17 and C++20, with gcc and g++ for x86-64 Linux and MSVC for x64 and x86 Windows, and compares what it prints with what the Struct Layout tool shows. `compiler.test.ts` does the same for more cases with the host's compiler |
-| C, every target | `cross-compiler.test.ts` compiles every C example and the bit-field, enum, pointer, `sizeof`/`offsetof` and macro cases for 14 targets: GCC for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64 (Linux and bare metal), MIPS (PIC32) and AVR; MSVC for x64 and x86 Windows (its object files read directly); SDCC for the 8051. Every case is also compiled packed, as `#pragma pack(1)` and as `__attribute__((packed))` wherever the compiler takes them, from the same source the Verification Code tool prints. It reads size, alignment, every `offsetof` and each bit-field's bit position back from the object file, so cross compilers need not run anything |
-| C++, every target | `cpp-compiler.test.ts` compiles each C++ case, and every example, as C++17 and C++20 with g++ for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64, MIPS and AVR, and with MSVC for x64 and x86. It reads size, alignment, size and alignment as a base, and every base class and virtual base offset from g++'s class dump (`-fdump-lang-class`), and every base, vfptr, vbptr, vtordisp and member offset from MSVC's layout report (`/d1reportAllClassLayout`) |
+| C, every target | `cross-compiler.test.ts` compiles every C example and the bit-field, enum, pointer, `sizeof`/`offsetof` and macro cases for 14 targets: GCC for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64 (Linux and bare metal), MIPS (PIC32), big-endian PowerPC 32 and MIPS32 (Linux and bare metal) and AVR; MSVC for x64 and x86 Windows (its object files read directly); SDCC for the 8051. Every case is also compiled packed, as `#pragma pack(1)` and as `__attribute__((packed))` wherever the compiler takes them, from the same source the Verification Code tool prints. It reads size, alignment, every `offsetof` and each bit-field's bit position (in memory order: from the most significant bit of each byte on big-endian targets) back from the object file, so cross compilers need not run anything |
+| C++, every target | `cpp-compiler.test.ts` compiles each C++ case, and every example, as C++17 and C++20 with g++ for x86-64, i386, ARM32 (Linux and arm-none-eabi), AArch64, RISC-V 32/64, MIPS, PowerPC 32, big-endian MIPS32 and AVR, and with MSVC for x64 and x86. It reads size, alignment, size and alignment as a base, and every base class and virtual base offset from g++'s class dump (`-fdump-lang-class`), and every base, vfptr, vbptr, vtordisp and member offset from MSVC's layout report (`/d1reportAllClassLayout`) |
 | Go | `go-compiler.test.ts` checks every case and its reordered version against `go/types` on all 14 architectures, then compiles and runs the generated verification code with `GOARCH=amd64` and `GOARCH=386` |
 | Rust | `rust-compiler.test.ts` compiles and runs 71 cases on x86_64-pc-windows-msvc, and checks the same facts as compile-time assertions on thumbv7em-none-eabihf (no_std) |
 | All | `cross-language.test.ts` checks that the Go ports and the `repr(C)` Rust ports of the C examples have the C layout |
@@ -94,6 +94,7 @@ The cross-compiler tests find GCC and SDCC on the PATH, or in WSL on Windows, an
 sudo apt install --no-install-recommends g++ gcc-i686-linux-gnu g++-i686-linux-gnu \
   gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
   gcc-riscv64-linux-gnu g++-riscv64-linux-gnu gcc-mipsel-linux-gnu g++-mipsel-linux-gnu \
+  gcc-powerpc-linux-gnu g++-powerpc-linux-gnu gcc-mips-linux-gnu g++-mips-linux-gnu \
   gcc-arm-none-eabi gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
 ```
 

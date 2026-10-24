@@ -93,7 +93,7 @@ describe("struct-layout compute", () => {
   it("lists every platform in the variants table and marks the current one", () => {
     const spec = tool.createSpec();
     const table = tool.variants!(spec, PADDED);
-    expect(table.rows.length).toBe(40);
+    expect(table.rows.length).toBe(43);
     const current = table.rows.filter((r) => r.current);
     expect(current).toHaveLength(1);
     expect(current[0]!.options[OPTION_TARGET]).toBe("intel-x64-amd");

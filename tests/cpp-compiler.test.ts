@@ -17,7 +17,7 @@ import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compi
  *
  * The g++ cross compilers are found as in tests/cross-compiler.test.ts. On Ubuntu:
  *   apt install --no-install-recommends g++ g++-i686-linux-gnu g++-arm-linux-gnueabihf \
- *     g++-aarch64-linux-gnu g++-riscv64-linux-gnu g++-mipsel-linux-gnu g++-arm-none-eabi \
+ *     g++-aarch64-linux-gnu g++-riscv64-linux-gnu g++-mipsel-linux-gnu g++-powerpc-linux-gnu g++-mips-linux-gnu g++-arm-none-eabi \
  *     gcc-avr avr-libc
  */
 const requireCompilers = Boolean(process.env.SP_REQUIRE_COMPILERS);
@@ -42,6 +42,8 @@ const TARGETS: Target[] = [
   { name: "RISC-V 32 Linux (g++)", selection: { target: "riscv32", dataModel: "ILP32", os: "linux" }, cc: "riscv64-linux-gnu-g++", flags: ["-march=rv32gc", "-mabi=ilp32d"] },
   { name: "RISC-V 64 Linux (g++)", selection: { target: "riscv64", dataModel: "LP64", os: "linux" }, cc: "riscv64-linux-gnu-g++", flags: [] },
   { name: "PIC32 MIPS, XC32 model (mipsel g++)", selection: { target: "microchip-32bit", dataModel: "XC32", os: "none" }, cc: "mipsel-linux-gnu-g++", flags: ["-mno-abicalls", "-fno-pic"] },
+  { name: "PowerPC 32 Linux, big-endian (g++)", selection: { target: "powerpc32", dataModel: "ILP32", os: "linux" }, cc: "powerpc-linux-gnu-g++", flags: [] },
+  { name: "MIPS32 Linux, big-endian (g++)", selection: { target: "mips32-be", dataModel: "ILP32", os: "linux" }, cc: "mips-linux-gnu-g++", flags: [] },
   { name: "AVR, XC8 model (avr-g++)", selection: { target: "microchip-8bit", dataModel: "XC8", os: "none" }, cc: "avr-g++", flags: ["-mmcu=atmega328p"], oldGcc: true },
   { name: "x86-64 Windows (MSVC)", selection: { target: "intel-x64-amd", dataModel: "LLP64", os: "windows" }, cc: "cl", flags: [], msvc: "x64" },
   { name: "i386 Windows (MSVC)", selection: { target: "intel-x86", dataModel: "ILP32", os: "windows" }, cc: "cl", flags: [], msvc: "x86" },

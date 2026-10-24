@@ -48,14 +48,14 @@ export function LimitationsGuide() {
                 </p>
                 <ul className={UL}>
                     <li>
-                        Checked against the compilers: GCC for x86, x86-64, ARM, AArch64 Linux, RISC-V, MIPS and AVR; MSVC for Windows (x64 and
-                        x86); SDCC for the 8051.
+                        Checked against the compilers: GCC for x86, x86-64, ARM, AArch64 Linux, RISC-V, MIPS (both byte orders), PowerPC and AVR;
+                        MSVC for Windows (x64 and x86); SDCC for the 8051.
                     </li>
                     <li>
                         Not checked: XC16, Keil C51 and bare-metal AArch64 use GCC&apos;s rules for their kind of target, and the calculator says so
                         (SP004).
                     </li>
-                    <li>Bits are numbered from the least significant bit of each byte, as these little-endian targets allocate them.</li>
+                    <li>Bits are numbered in memory order, as the compiler allocates them: from the least significant bit of each byte on little-endian targets, from the most significant bit on the big-endian ones (PowerPC, MIPS32 big-endian). Byte order moves no member.</li>
                     <li>Whether a plain <code className={CODE}>int</code> bit-field is signed is implementation-defined.</li>
                 </ul>
             </section>

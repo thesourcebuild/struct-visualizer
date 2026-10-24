@@ -257,6 +257,6 @@ function runMatrixCoverage(): number {
 
 it("layout invariants hold for every example on every target × data model × OS", () => {
   const executed = runMatrixCoverage();
-  // 14 C examples and 3 custom cases on each of 40 platform combinations.
-  assert.equal(executed, 680);
+  // 14 C examples and 3 custom cases on each of 43 platform combinations.
+  assert.equal(executed, 731);
 });

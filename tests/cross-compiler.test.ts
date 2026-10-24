@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { analyzeStruct, applyPacking, examples, packingSyntaxesFor } from "@sp/core";
+import { analyzeStruct, applyPacking, examples, packingSyntaxesFor, resolvePlatform } from "@sp/core";
 import type { PackingSyntax, PlatformSelection } from "@sp/core";
 import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compilers";
 
@@ -15,7 +15,8 @@ import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compi
  * Each case is its own translation unit, compiled in one shell call per target. It contributes a
  * byte array of its sizes and offsets, and one constant per bit-field with
  * only that field set to all ones: the bits that come out set are the field's. Bits are numbered
- * from the least significant bit of each byte; every target here is little-endian.
+ * in memory order: from the least significant bit of each byte, or from the most significant on
+ * the big-endian targets (PowerPC, MIPS32 big-endian).
  *
  * The GCC-family compilers and SDCC are looked up on the PATH, or inside WSL when the tests run on
  * Windows; MSVC is found with vswhere on Windows, and its object files are read directly. A
@@ -23,7 +24,7 @@ import { hasTool, msvc, readCoffSymbols, tool, vcvarsall } from "./support/compi
  * CI), except MSVC, which only SP_REQUIRE_MSVC requires. On Ubuntu:
  *   apt install --no-install-recommends gcc-i686-linux-gnu gcc-arm-linux-gnueabihf \
  *     gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu gcc-mipsel-linux-gnu gcc-arm-none-eabi \
- *     gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
+ *     gcc-powerpc-linux-gnu gcc-mips-linux-gnu gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
  * The Windows targets model MSVC and are checked against it, not against MinGW, whose GCC lays
  * out some bit-field unions and alignment requests under #pragma pack differently.
  */
@@ -51,6 +52,9 @@ const TARGETS: Target[] = [
   { name: "RISC-V 64 bare metal (gcc)", selection: { target: "riscv64", dataModel: "LP64", os: "none" }, cc: "riscv64-unknown-elf-gcc", flags: ["-march=rv64imac", "-mabi=lp64"] },
   { name: "AVR, XC8 model (avr-gcc)", selection: { target: "microchip-8bit", dataModel: "XC8", os: "none" }, cc: "avr-gcc", flags: ["-mmcu=atmega328p"] },
   { name: "PIC32 MIPS, XC32 model (mipsel gcc)", selection: { target: "microchip-32bit", dataModel: "XC32", os: "none" }, cc: "mipsel-linux-gnu-gcc", flags: ["-mno-abicalls", "-fno-pic"] },
+  { name: "PowerPC 32 Linux, big-endian (gcc)", selection: { target: "powerpc32", dataModel: "ILP32", os: "linux" }, cc: "powerpc-linux-gnu-gcc", flags: [] },
+  { name: "MIPS32 Linux, big-endian (gcc)", selection: { target: "mips32-be", dataModel: "ILP32", os: "linux" }, cc: "mips-linux-gnu-gcc", flags: [] },
+  { name: "MIPS32 bare metal, big-endian (gcc)", selection: { target: "mips32-be", dataModel: "ILP32", os: "none" }, cc: "mips-linux-gnu-gcc", flags: ["-mno-abicalls", "-fno-pic"] },
   { name: "8051 (SDCC)", selection: { target: "8051-8bit", dataModel: "SDCC", os: "none" }, cc: "sdcc", flags: ["-mmcs51", "--std-c11"] },
   { name: "x86-64 Windows (MSVC)", selection: { target: "intel-x64-amd", dataModel: "LLP64", os: "windows" }, cc: "cl", flags: ["/std:c11"], msvc: "x64" },
   { name: "i386 Windows (MSVC)", selection: { target: "intel-x86", dataModel: "ILP32", os: "windows" }, cc: "cl", flags: ["/std:c11"], msvc: "x86" },
@@ -250,7 +254,8 @@ interface Measured {
   bits: Record<string, [number, number]>;
 }
 
-function measured(symbols: Map<string, number[]>, code: string, i: number): Measured {
+/** Bits come out in memory order: from the least significant bit of each byte, or the most on big-endian targets. */
+function measured(symbols: Map<string, number[]>, code: string, i: number, bigEndian: boolean): Measured {
   const { members } = membersOf(code);
   const sv = symbols.get(`sv_${i}`);
   if (!sv || sv[0] !== 0xa5) throw new Error(`sv_${i} not found in the object file`);
@@ -268,7 +273,7 @@ function measured(symbols: Map<string, number[]>, code: string, i: number): Meas
     const image = section.slice(0, word(0));
     const set: number[] = [];
     image.forEach((byte, b) => {
-      for (let k = 0; k < 8; k += 1) if ((byte >> k) & 1) set.push(b * 8 + k);
+      for (let k = 0; k < 8; k += 1) if ((byte >> (bigEndian ? 7 - k : k)) & 1) set.push(b * 8 + k);
     });
     // The field's bits are the run from the first set bit. A store of fewer than all of them
     // (MSVC's C compiler converts the value to _Bool when the field shares a _Bool's unit) still
@@ -410,7 +415,7 @@ for (const target of TARGETS) {
         const actual = modelled(entry, target.selection);
         let expected: Measured;
         try {
-          expected = measured(symbols, code, i);
+          expected = measured(symbols, code, i, resolvePlatform(target.selection).architecture.endianness === "big");
         } catch (err) {
           if (!(err instanceof Unmeasurable)) throw err;
           if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${err.message}`);

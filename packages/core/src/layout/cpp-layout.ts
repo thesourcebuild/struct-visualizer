@@ -758,6 +758,7 @@ function buildResult(def: ParsedStruct, entries: Entry[], size: number, align: n
       wastedSpace: 0,
       efficiency: 0,
       architecture: host.architectureName,
+      ...(host.bigEndian && { bigEndian: true }),
       baseSize,
       baseAlignment,
     },

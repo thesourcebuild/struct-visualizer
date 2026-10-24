@@ -15,7 +15,8 @@ runs:
         # gcc-avr bring their g++ too. Windows is MSVC's, checked on a Windows runner instead.
         packages="g++ gcc-i686-linux-gnu g++-i686-linux-gnu gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
           gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
-          gcc-mipsel-linux-gnu g++-mipsel-linux-gnu gcc-arm-none-eabi gcc-riscv64-unknown-elf \
+          gcc-mipsel-linux-gnu g++-mipsel-linux-gnu gcc-powerpc-linux-gnu g++-powerpc-linux-gnu \
+          gcc-mips-linux-gnu g++-mips-linux-gnu gcc-arm-none-eabi gcc-riscv64-unknown-elf \
           gcc-avr avr-libc sdcc"
         packages=$(echo $packages)
         echo "packages=$packages" >> "$GITHUB_OUTPUT"

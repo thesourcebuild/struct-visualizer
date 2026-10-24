@@ -62,6 +62,11 @@ export class PaddingCalculator {
     return this.architecture.name;
   }
 
+  /** @internal */
+  get bigEndian(): boolean {
+    return this.architecture.endianness === 'big';
+  }
+
   /** Types that fell back to the 4-byte size/alignment default during any calculation so far. */
   getUnknownTypes(): string[] {
     return [...this.unknownTypes];
@@ -289,6 +294,7 @@ export class PaddingCalculator {
       wastedSpace: totalPadding,
       efficiency,
       architecture: this.architecture.name,
+      ...(this.bigEndian && { bigEndian: true }),
       ...this.requiredAlignmentOf(struct, state.required),
     };
   }
@@ -371,6 +377,7 @@ export class PaddingCalculator {
       wastedSpace: trailingPadding,
       efficiency: maxSize > 0 ? (maxSize / totalSize) * 100 : 0,
       architecture: this.architecture.name,
+      ...(this.bigEndian && { bigEndian: true }),
       // A C++ union is the same object wherever it is (it cannot be a base).
       ...(struct.cpp && this.architecture.cppAbi && { baseSize: totalSize, baseAlignment: unionAlignment }),
       ...this.requiredAlignmentOf(struct, required),

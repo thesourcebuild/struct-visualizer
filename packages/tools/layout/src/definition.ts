@@ -107,6 +107,7 @@ function platformInfo(spec: LayoutSpec): ToolResultField[] {
     { label: "Default alignment", value: `${a.defaultAlignment} bytes`, mono: true },
     { label: "Max alignment", value: `${a.maxAlignment ?? a.defaultAlignment} bytes`, mono: true },
     { label: "C++ ABI", value: a.cppAbi === "msvc" ? "MSVC" : a.cppAbi === "itanium" ? "Itanium C++ ABI" : "none (C only)" },
+    { label: "Byte order", value: a.endianness === "big" ? "big-endian" : "little-endian" },
     { label: "Enum default", value: `${p.defaultEnumSize} bytes`, mono: true },
   ];
 }

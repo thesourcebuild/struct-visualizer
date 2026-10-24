@@ -91,7 +91,8 @@ export function PaddingProcess({ result, explain }: PaddingProcessProps) {
                         <code className="rounded bg-blue-100 px-2 py-0.5 font-mono dark:bg-blue-900">{bitOffset}</code>
                         {bits > 0 ? (
                           <>
-                            {" "}(byte {hex(m.offset)}, bit {bitOffset % 8}), occupying bits {bitOffset}–{bitOffset + bits - 1}
+                            {" "}(byte {hex(m.offset)}, bit {bitOffset % 8}
+                            {result.bigEndian ? " counting from its most significant bit" : ""}), occupying bits {bitOffset}–{bitOffset + bits - 1}
                             {m.size > 1 && <> in bytes {hex(m.offset)}–{hex(m.offset + m.size - 1)}</>}.
                           </>
                         ) : (

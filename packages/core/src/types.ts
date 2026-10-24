@@ -185,6 +185,11 @@ export interface Architecture {
   /** The largest alignment a type gets on its own; alignment requests may exceed it. */
   maxAlignment?: number;
   /**
+   * Byte order; little unless set. It does not move any member, but a bit-field's bits are
+   * numbered from the most significant bit of each byte on a big-endian target.
+   */
+  endianness?: 'little' | 'big';
+  /**
    * How the target's compiler allocates bit-fields: 'gcc' bit by bit (GCC and Clang outside
    * Windows), 'ms' in storage units of each field's type (MSVC), 'sdcc'
    * bit by bit but never splitting a field that would fit in a byte. See
@@ -232,8 +237,9 @@ export interface CalculationResult {
     /** Bytes the member occupies; for a bit-field, the bytes its bits touch. */
     size: number;
     /**
-     * A bit-field's first bit, counted from the start of the record. Bits are numbered from the
-     * least significant bit of each byte, as the compilers modelled here allocate them.
+     * A bit-field's first bit, counted from the start of the record in memory order: bit 0 is the
+     * least significant bit of byte 0 on a little-endian target, its most significant bit on a
+     * big-endian one (CalculationResult.bigEndian), as the compilers allocate them.
      */
     bitOffset?: number;
     padding: number;
@@ -251,6 +257,8 @@ export interface CalculationResult {
   wastedSpace: number;
   efficiency: number;
   architecture: string;
+  /** A big-endian target: bit-field bits are numbered from each byte's most significant bit. */
+  bigEndian?: boolean;
   /**
    * C++: the size of the class as a base subobject, without its virtual bases (nvsize). Under the
    * Itanium ABI it excludes the tail padding a derived class may reuse, unless the class is POD

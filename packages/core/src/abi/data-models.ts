@@ -3,7 +3,7 @@
 import type { Architecture } from '../types';
 
 export type DataModel = 'LP32' | 'ILP32' | 'ILP32LL' | 'ILP32LL64' | 'LP64' | 'LLP64' | 'ILP64' | 'SILP64' | 'XC8' | 'XC16' | 'XC32' | 'C51' | 'SDCC';
-export type TargetArchitecture = 'intel-x86' | 'intel-x64-amd' | 'arm32' | 'arm64' | 'microchip-8bit' | 'microchip-16bit' | 'microchip-32bit' | '8051-8bit' | 'riscv32' | 'riscv64';
+export type TargetArchitecture = 'intel-x86' | 'intel-x64-amd' | 'arm32' | 'arm64' | 'microchip-8bit' | 'microchip-16bit' | 'microchip-32bit' | '8051-8bit' | 'riscv32' | 'riscv64' | 'powerpc32' | 'mips32-be';
 export type OSType = 'windows' | 'linux' | 'none';
 
 export interface DataModelInfo {
@@ -346,6 +346,21 @@ export const targetArchitectures: Record<TargetArchitecture, TargetArchitectureI
         description: 'RISC-V 64-bit architecture (RV64)',
         supportedOSTypes: ['linux', 'none'],
     },
+    // Big-endian. PowerPC bare metal uses the embedded ABI (EABI), which is not checked here.
+    powerpc32: {
+        id: 'powerpc32',
+        name: 'powerpc32',
+        displayName: 'PowerPC 32-bit (big-endian)',
+        description: '32-bit PowerPC, System V ABI (powerpc-linux-gnu)',
+        supportedOSTypes: ['linux'],
+    },
+    'mips32-be': {
+        id: 'mips32-be',
+        name: 'mips32-be',
+        displayName: 'MIPS32 (big-endian)',
+        description: '32-bit MIPS, o32 ABI, big-endian (mips-linux-gnu)',
+        supportedOSTypes: ['linux', 'none'],
+    },
 };
 
 export const targetArchitectureList: TargetArchitectureInfo[] = [
@@ -359,6 +374,8 @@ export const targetArchitectureList: TargetArchitectureInfo[] = [
     targetArchitectures['8051-8bit'],
     targetArchitectures.riscv32,
     targetArchitectures.riscv64,
+    targetArchitectures.powerpc32,
+    targetArchitectures['mips32-be'],
 ];
 
 // OS Type Definitions
@@ -448,6 +465,11 @@ export const architectureMapping: Record<string, string> = {
     'ILP64-riscv64-none': 'riscv64',
     'SILP64-riscv64-linux': 'riscv64',
     'SILP64-riscv64-none': 'riscv64',
+
+    // Big-endian 32-bit targets - ILP32 data model
+    'ILP32-powerpc32-linux': 'ppc32',
+    'ILP32-mips32-be-linux': 'mips32be',
+    'ILP32-mips32-be-none': 'mips32be',
 };
 
 /**
@@ -473,6 +495,8 @@ export function getArchitectureId(
         '8051-8bit': '8051',
         riscv32: 'riscv32',
         riscv64: 'riscv64',
+        powerpc32: 'ppc32',
+        'mips32-be': 'mips32be',
     };
 
     // Fall back to the target's own base architecture rather than an unrelated ABI.
@@ -519,6 +543,8 @@ export function getValidDataModelsForArchitecture(targetArchitecture: TargetArch
 
         // RISC-V 32-bit: only support 32-bit data models
         case 'riscv32':
+        case 'powerpc32':
+        case 'mips32-be':
             return ['ILP32'];
 
         // RISC-V 64-bit: only support 64-bit data models
@@ -724,6 +750,20 @@ export function resolveArchitectureForSelection(
             defaultAlignment = 1;
             maxAlignment = 1;
             break;
+        case 'powerpc32':
+            // System V: long double is IBM's 128-bit double-double, 16-aligned (powerpc-linux-gnu-gcc).
+            defaultAlignment = 4;
+            maxAlignment = 16;
+            dataTypes = {
+                ...(dataTypes ?? {}),
+                'long double': { name: 'long double', size: 16, alignment: 16, category: 'primitive' as const },
+            };
+            break;
+        case 'mips32-be':
+            // o32, as for PIC32's little-endian MIPS: the same sizes and alignments (mips-linux-gnu-gcc).
+            defaultAlignment = 4;
+            maxAlignment = 8;
+            break;
         default:
             break;
     }
@@ -734,6 +774,7 @@ export function resolveArchitectureForSelection(
         pointerSize,
         defaultAlignment,
         maxAlignment,
+        ...((targetArchitecture === 'powerpc32' || targetArchitecture === 'mips32-be') && { endianness: 'big' as const }),
         ...(preferredAlignment && { preferredAlignment }),
         ...bitfieldAndEnumRules(dataModel, targetArchitecture, osType),
         ...cppAbiFor(dataModel, osType),
