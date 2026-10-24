@@ -4,7 +4,7 @@ import type { CalculationResult } from '@sp/core';
 export type JsonExportInput = {
   displayResult: CalculationResult;
   code: string;
-  /** Source language: 'c', 'cpp', 'go', 'rust'. */
+  /** Source language: 'c', 'cpp', 'go', 'rust', 'zig'. */
   language: string;
   /** What the layout was computed for, e.g. { targetArchitecture, dataModel, osType }. */
   platform: Record<string, string>;

@@ -23,7 +23,7 @@ export const OG_IMAGE = {
     url: pageUrl('/og-image.png'),
     width: 1200,
     height: 630,
-    alt: `${SITE_TITLE}: memory layout and padding for C/C++, Go and Rust`,
+    alt: `${SITE_TITLE}: memory layout and padding for C/C++, Go, Rust and Zig`,
 } as const;
 
 /**

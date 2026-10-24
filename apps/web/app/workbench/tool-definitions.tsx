@@ -49,6 +49,8 @@ function importFamily(language: Language): Promise<ToolFamilyModule> {
       return import("./family-go").then((m) => m.family);
     case "rust":
       return import("./family-rust").then((m) => m.family);
+    case "zig":
+      return import("./family-zig").then((m) => m.family);
   }
 }
 
@@ -93,7 +95,7 @@ export function useTool(id: string): { definition: AnyToolDefinition; ResultView
 
 /** Download the other languages' chunks, so switching to one later is immediate. */
 export function prefetchToolFamilies(preloaded: Language): void {
-  for (const language of ["layout", "go", "rust"] as const) {
+  for (const language of ["layout", "go", "rust", "zig"] as const) {
     if (language === preloaded) continue;
     loadFamily(language).catch(() => {
       // Retried, with its error shown, if one of that language's tools is opened.

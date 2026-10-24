@@ -3,10 +3,10 @@ import type { Diagnostic, LintRule, OptionValue, OptionValues } from "@sp/contra
 import type { OptionCatalogue, OptionEnumChoice } from "./catalogue/options";
 import type { OptionGroupMeta } from "./catalogue/groups";
 
-export type ToolFamily = "layout" | "go" | "rust" | "reference";
+export type ToolFamily = "layout" | "go" | "rust" | "zig" | "reference";
 
 /** Language of a tool's source input. Tools of one language share the editor contents. */
-export type InputLanguage = "c" | "go" | "rust";
+export type InputLanguage = "c" | "go" | "rust" | "zig";
 
 export interface ToolSpecBase {
   specVersion: number;

@@ -2,18 +2,20 @@ import type { AnyToolDefinition, ToolFamily, ToolManifest } from "@sp/engine";
 import { GO_MANIFESTS } from "@sp/go-layout/manifests";
 import { LAYOUT_MANIFESTS } from "@sp/layout/manifests";
 import { RUST_MANIFESTS } from "@sp/rust-layout/manifests";
+import { ZIG_MANIFESTS } from "@sp/zig-layout/manifests";
 
 /** Every tool, eagerly. Strings only — safe for the sidebar, sitemap and static params. */
-export const TOOL_MANIFESTS: readonly ToolManifest[] = [...LAYOUT_MANIFESTS, ...GO_MANIFESTS, ...RUST_MANIFESTS];
+export const TOOL_MANIFESTS: readonly ToolManifest[] = [...LAYOUT_MANIFESTS, ...GO_MANIFESTS, ...RUST_MANIFESTS, ...ZIG_MANIFESTS];
 
 const BY_ID = new Map(TOOL_MANIFESTS.map((m) => [m.id, m]));
 
-export const FAMILY_ORDER: readonly ToolFamily[] = ["layout", "go", "rust", "reference"];
+export const FAMILY_ORDER: readonly ToolFamily[] = ["layout", "go", "rust", "zig", "reference"];
 
 export const FAMILY_LABEL: Record<ToolFamily, string> = {
   layout: "C / C++",
   go: "Go",
   rust: "Rust",
+  zig: "Zig",
   reference: "Reference",
 };
 
@@ -32,7 +34,7 @@ export function presentFamilies(): ToolFamily[] {
 }
 
 /** Families that are a source language, chosen with the sidebar's language selector. */
-const LANGUAGE_FAMILIES: readonly ToolFamily[] = ["layout", "go", "rust"];
+const LANGUAGE_FAMILIES: readonly ToolFamily[] = ["layout", "go", "rust", "zig"];
 
 export function isLanguageFamily(family: ToolFamily): boolean {
   return LANGUAGE_FAMILIES.includes(family);
@@ -74,6 +76,10 @@ export async function loadTool(id: string): Promise<AnyToolDefinition> {
     case "rust": {
       const { rustToolDefinition } = await import("@sp/rust-layout/definition");
       return rustToolDefinition(id) as unknown as AnyToolDefinition;
+    }
+    case "zig": {
+      const { zigToolDefinition } = await import("@sp/zig-layout/definition");
+      return zigToolDefinition(id) as unknown as AnyToolDefinition;
     }
   }
 }

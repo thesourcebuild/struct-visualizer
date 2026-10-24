@@ -328,13 +328,19 @@ function rustType(t: BType, bytes: boolean, size: number): string {
   }
 }
 
+/** A type with no Rust equivalent, carried as a byte array: aligned to 1 in Rust. */
+const carriedAsBytes = (t: BType): boolean => t.kind === 'bytes' || (t.kind === 'array' && carriedAsBytes(t.element));
+
 const emitRust: Emitter = (records, ctx) => {
   const triple = rustTarget(ctx.platform);
   if (!triple) throw new BindingError(`Rust has no target for ${platformLine(ctx)}.`);
   const out = [`// ${ctx.root.cName} on ${platformLine(ctx)}.`, `// #[repr(C)] follows the target's C layout: compile it for ${triple}.`, ''];
   for (const r of records) {
     const pack = r.pack;
-    const { placed, align } = placeNatural(r, (item) => (item.kind === 'bits' ? 1 : pack !== undefined ? Math.min(item.natural, pack) : item.natural));
+    const { placed, align } = placeNatural(r, (item) => {
+      if (item.kind === 'bits' || carriedAsBytes(item.type)) return 1;
+      return pack !== undefined ? Math.min(item.natural, pack) : item.natural;
+    });
     const reprs = ['C'];
     if (pack !== undefined) reprs.push(`packed(${pack})`);
     if (r.align > Math.min(align, pack ?? Infinity)) {

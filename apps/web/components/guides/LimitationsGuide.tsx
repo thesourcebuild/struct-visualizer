@@ -97,6 +97,28 @@ export function LimitationsGuide() {
                 </ul>
             </section>
 
+            <section className={`${CARD} border-amber-500`}>
+                <h2 className={H2}>Zig</h2>
+                <p className={P}>
+                    Zig types are laid out by Zig 0.16&apos;s rules, ported from the compiler and checked against it on every target in Debug,
+                    ReleaseSafe and ReleaseFast. A plain struct&apos;s field order is the compiler&apos;s choice, which a later Zig may change; extern
+                    and packed layouts are defined by the language.
+                </p>
+                <ul className={UL}>
+                    <li>Structs, tuples, extern and packed structs, enums, bare, tagged, extern and packed unions; optionals, error sets and error unions, slices, sentinels, vectors.</li>
+                    <li>The build mode matters: Debug and ReleaseSafe give a bare union a hidden safety tag. In Debug on x86-64 Linux, Zig&apos;s own code generator lays out vectors, aligning them to 16 bytes or more.</li>
+                    <li>Comptime code that decides a type: constants, <code className={CODE}>@sizeOf</code>, <code className={CODE}>@alignOf</code>, <code className={CODE}>@bitSizeOf</code>, <code className={CODE}>@Int</code>, <code className={CODE}>@This</code>, <code className={CODE}>@import(&quot;builtin&quot;).mode</code>, and functions that return a type through <code className={CODE}>const</code>, <code className={CODE}>if</code> and <code className={CODE}>return</code>.</li>
+                    <li>The common <code className={CODE}>std</code> types (ArrayList, the hash maps, Allocator, MultiArrayList, atomics, the Io locks, bit sets, linked lists), written as std defines them.</li>
+                </ul>
+                <p className={`${P} mt-3`}>Not modelled:</p>
+                <ul className={UL}>
+                    <li>Comptime code with loops, <code className={CODE}>switch</code>, <code className={CODE}>@Type</code> or <code className={CODE}>@typeInfo</code> beyond field counts and integer widths: an error says what is not supported.</li>
+                    <li>The rest of <code className={CODE}>std</code>, and other imports: an error names what is missing.</li>
+                    <li>Vectors over 16 bytes in Debug on x86-64 Linux take the alignment of the baseline CPU, which <code className={CODE}>-target</code> without <code className={CODE}>-mcpu</code> builds for: with AVX they are aligned to 32 (ZG003).</li>
+                    <li><code className={CODE}>--error-limit</code>: error codes are taken as 16 bits, the default.</li>
+                </ul>
+            </section>
+
             <section className="bg-gradient-to-r from-blue-50 to-cyan-50 dark:from-blue-900/20 dark:to-cyan-900/20 rounded-lg shadow-md p-8 border-l-4 border-cyan-500">
                 <h2 className={H2}>Always Verify</h2>
                 <p className="text-gray-700 dark:text-gray-300 mb-4">

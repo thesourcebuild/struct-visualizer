@@ -5,7 +5,7 @@ import { pageMetadata } from '@/lib/seo';
 export const metadata = pageMetadata({
     path: '/limitations/',
     title: 'Limitations',
-    description: 'What Struct Visualizer models and what it does not, for C/C++, Go and Rust.',
+    description: 'What Struct Visualizer models and what it does not, for C/C++, Go, Rust and Zig.',
 });
 
 export default function LimitationsPage() {

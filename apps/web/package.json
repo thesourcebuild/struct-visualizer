@@ -18,6 +18,7 @@
     "@sp/platform": "workspace:*",
     "@sp/registry": "workspace:*",
     "@sp/rust-layout": "workspace:*",
+    "@sp/zig-layout": "workspace:*",
     "@sp/ui": "workspace:*",
     "next": "16.4.2",
     "react": "19.3.0",

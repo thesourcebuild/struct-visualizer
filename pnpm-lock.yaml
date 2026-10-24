@@ -190,6 +190,9 @@ importers:
       '@sp/rust-layout':
         specifier: workspace:*
         version: link:packages/tools/rust-layout
+      '@sp/zig-layout':
+        specifier: workspace:*
+        version: link:packages/tools/zig-layout
       '@types/node':
         specifier: ^22
         version: 22.20.5
@@ -247,6 +250,9 @@ importers:
       '@sp/ui':
         specifier: workspace:*
         version: link:../../packages/ui
+      '@sp/zig-layout':
+        specifier: workspace:*
+        version: link:../../packages/tools/zig-layout
       next:
         specifier: 16.4.2
         version: 16.4.2(@babel/core@7.29.7(supports-color@7.2.0))(@types/node@22.20.5)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -346,6 +352,9 @@ importers:
       '@sp/rust-layout':
         specifier: workspace:*
         version: link:../tools/rust-layout
+      '@sp/zig-layout':
+        specifier: workspace:*
+        version: link:../tools/zig-layout
     devDependencies:
       '@sp/config':
         specifier: workspace:*
@@ -399,6 +408,28 @@ importers:
         version: 5.9.3
 
   packages/tools/rust-layout:
+    dependencies:
+      '@sp/contracts':
+        specifier: workspace:*
+        version: link:../../contracts
+      '@sp/core':
+        specifier: workspace:*
+        version: link:../../core
+      '@sp/engine':
+        specifier: workspace:*
+        version: link:../../engine
+      zod:
+        specifier: ^4.1.0
+        version: 4.6.7
+    devDependencies:
+      '@sp/config':
+        specifier: workspace:*
+        version: link:../../config
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
+
+  packages/tools/zig-layout:
     dependencies:
       '@sp/contracts':
         specifier: workspace:*

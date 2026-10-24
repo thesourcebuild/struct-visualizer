@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { analyzeGo, analyzeRust, analyzeStruct, examples, goExamples, rustExamples } from "@sp/core";
+import { analyzeGo, analyzeRust, analyzeStruct, analyzeZig, examples, goExamples, rustExamples, zigExamples } from "@sp/core";
 
 /**
- * The Go and Rust examples include the C examples written in those languages. Where the
+ * The Go, Rust and Zig examples include the C examples written in those languages. Where the
  * languages promise the same layout, they must agree with the C engine (itself checked against
- * GCC): Go keeps declaration order like C, and Rust's repr(C) is C's layout.
+ * GCC): Go keeps declaration order like C, and Rust's repr(C) and Zig's extern are C's layout.
  */
 const LP64 = { target: "intel-x64-amd", dataModel: "LP64", os: "linux" } as const;
 const cByName = new Map(examples.map((e) => [e.name, e.code]));
@@ -12,7 +12,19 @@ const cByName = new Map(examples.map((e) => [e.name, e.code]));
 /** Go ports that replace a C feature Go lacks are not the same layout. */
 const NOT_EQUIVALENT = new Set(["Bit Flags (instead of bit-fields)"]);
 
-describe("C examples ported to Go and Rust", () => {
+type Result = NonNullable<ReturnType<typeof analyzeStruct>["result"]>;
+
+/** Where each member is: its byte offset, or a bit-field's first bit and width, from the start. */
+function positions(r: Result, base = 0): string[] {
+  return r.members.flatMap((m) => {
+    if (m.bitOffset !== undefined) return [`bits ${base * 8 + m.bitOffset}+${m.member.bitField}`];
+    // A packed struct member: its fields are the bit-fields.
+    if (m.nested && !m.nested.struct.isUnion && m.nested.members.some((x) => x.bitOffset !== undefined)) return positions(m.nested, base + m.offset);
+    return [`byte ${base + m.offset}`];
+  });
+}
+
+describe("C examples ported to Go, Rust and Zig", () => {
   const goPorts = goExamples.filter((e) => cByName.has(e.name));
   const rustPorts = rustExamples.filter((e) => cByName.has(e.name));
 
@@ -39,6 +51,25 @@ describe("C examples ported to Go and Rust", () => {
         size: c.totalSize,
         align: c.struct.alignment,
         offsets: c.members.map((m) => m.offset),
+      });
+    });
+  }
+
+  it("cover every C example in Zig", () => {
+    expect(zigExamples.filter((e) => cByName.has(e.name)).length).toBe(examples.filter((e) => e.language === "c").length);
+  });
+
+  // Zig's extern containers are C's layout, member for member; packed bit-fields included, as
+  // packed struct(u16) holds the bits where GCC puts them.
+  for (const port of zigExamples.filter((e) => cByName.has(e.name))) {
+    const a = analyzeZig(port.code, "x86_64-linux-gnu");
+    if (a.definition?.layout !== "extern") continue;
+    it(`Zig: ${port.name} (extern) has the C layout on x86-64 Linux`, () => {
+      const c = analyzeStruct(cByName.get(port.name)!, LP64).result!;
+      expect({ size: a.result!.totalSize, align: a.result!.struct.alignment, at: positions(a.result!) }).toEqual({
+        size: c.totalSize,
+        align: c.struct.alignment,
+        at: positions(c),
       });
     });
   }

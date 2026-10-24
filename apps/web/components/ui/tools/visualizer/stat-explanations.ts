@@ -21,7 +21,7 @@ function list(names: readonly string[]): string {
 
 /**
  * Why each Statistics number is what it is, worked out from this layout rather than written once:
- * the hover text on the cards. The same result shape comes from the C, Go and Rust engines, so the
+ * the hover text on the cards. The same result shape comes from the C, Go, Rust and Zig engines, so the
  * wording stays language-neutral.
  */
 export function explainStats(result: CalculationResult): StatExplanations {

@@ -51,7 +51,7 @@ export function GET() {
           )}
         </div>
         <div style={{ fontSize: 28, color: "#cbd5e1", marginTop: 40 }}>
-          C/C++, Go and Rust on x86, x64, ARM, RISC-V, AVR, PIC and 8051
+          C/C++, Go, Rust and Zig on x86, x64, ARM, RISC-V, AVR, PIC and 8051
         </div>
       </div>
     ),

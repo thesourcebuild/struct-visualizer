@@ -31,6 +31,7 @@ const nextConfig: NextConfig = {
     "@sp/platform",
     "@sp/registry",
     "@sp/rust-layout",
+    "@sp/zig-layout",
     "@sp/ui",
   ],
 };

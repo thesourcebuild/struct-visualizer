@@ -90,6 +90,8 @@ const TOOL_ICONS: Record<string, (p: IconProps) => React.JSX.Element> = {
   "go-verification-code": CodeIcon,
   "rust-struct-layout": LayoutIcon,
   "rust-verification-code": CodeIcon,
+  "zig-struct-layout": LayoutIcon,
+  "zig-verification-code": CodeIcon,
 };
 
 export function ToolIcon({ toolId, ...props }: IconProps & { toolId: string }) {
@@ -110,6 +112,10 @@ export const FAMILY_ACCENT: Record<ToolFamily, { dot: string; tile: string }> = 
   rust: {
     dot: "bg-orange-500",
     tile: "bg-orange-50 text-orange-600 dark:bg-orange-500/15 dark:text-orange-300",
+  },
+  zig: {
+    dot: "bg-amber-500",
+    tile: "bg-amber-50 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300",
   },
   reference: {
     dot: "bg-emerald-500",

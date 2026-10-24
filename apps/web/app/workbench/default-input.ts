@@ -22,6 +22,12 @@ type Example struct {
     c: u8,
     d: f64,
 }`,
+  zig: `const Example = struct {
+    a: u8,
+    b: i32,
+    c: u8,
+    d: f64,
+};`,
 };
 
 /** Editor wording per input language. */
@@ -40,5 +46,10 @@ export const INPUT_COPY: Record<InputLanguage, { title: string; subtitle: string
     title: "Rust source",
     subtitle: "Struct, union and enum definitions. The last definition is laid out.",
     placeholder: "struct Example { ... }",
+  },
+  zig: {
+    title: "Zig source",
+    subtitle: "Container declarations, constants and functions that return types. The last type declared is laid out.",
+    placeholder: "const Example = struct { ... };",
   },
 };

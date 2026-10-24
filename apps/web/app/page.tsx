@@ -18,13 +18,13 @@ export default function Home() {
       <div className="pt-24 pb-24 px-6 flex-1 bg-gradient-to-b from-white via-blue-50 to-white dark:from-gray-900 dark:via-gray-800 dark:to-gray-900">
         <div className="max-w-4xl mx-auto text-center">
           <div className="mb-8 inline-block px-4 py-2 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 rounded-full text-sm font-semibold">
-            ✨ C/C++ · Go · Rust
+            ✨ C/C++ · Go · Rust · Zig
           </div>
           <h1 className="text-6xl md:text-7xl font-bold text-gray-900 dark:text-white mb-6 leading-tight tracking-tight">
             Master Struct <span className="bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">Padding</span>
           </h1>
           <p className="text-xl md:text-2xl text-gray-600 dark:text-gray-300 mb-12 leading-relaxed max-w-2xl mx-auto font-light">
-            See every byte of your types in C/C++, Go and Rust: offsets, wasted padding, and the field order that fixes it, on x86, x64, ARM, RISC-V, WebAssembly and more.
+            See every byte of your types in C/C++, Go, Rust and Zig: offsets, wasted padding, and the field order that fixes it, on x86, x64, ARM, RISC-V, WebAssembly and more.
           </p>
           <div className="flex flex-col sm:flex-row gap-4 justify-center">
             <Button href="/tools" variant="primary" size="md">
@@ -51,9 +51,9 @@ export default function Home() {
               <div className="w-14 h-14 bg-gradient-to-br from-blue-100 to-blue-200 dark:from-blue-900 dark:to-blue-800 rounded-lg flex items-center justify-center mb-6 text-3xl group-hover:scale-110 transition-transform">
                 🧩
               </div>
-              <h3 className="text-xl font-bold text-gray-900 dark:text-white mb-3">C/C++, Go and Rust</h3>
+              <h3 className="text-xl font-bold text-gray-900 dark:text-white mb-3">C/C++, Go, Rust and Zig</h3>
               <p className="text-gray-600 dark:text-gray-400">
-                Each with its own rules: C ABIs and packing, Go&apos;s gc compiler, and rustc&apos;s field reordering and enum niches.
+                Each with its own rules: C ABIs and packing, Go&apos;s gc compiler, rustc&apos;s field reordering and enum niches, and Zig&apos;s extern, packed and tagged types.
               </p>
             </div>
 
@@ -64,7 +64,7 @@ export default function Home() {
               </div>
               <h3 className="text-xl font-bold text-gray-900 dark:text-white mb-3">Multi-Architecture</h3>
               <p className="text-gray-600 dark:text-gray-400">
-                x86, x64, ARM, RISC-V, WebAssembly, AVR, PIC and 8051, every Go architecture and the common Rust targets.
+                x86, x64, ARM, RISC-V, WebAssembly, AVR, PIC and 8051, every Go architecture and the common Rust and Zig targets.
               </p>
             </div>
 
@@ -86,7 +86,7 @@ export default function Home() {
               </div>
               <h3 className="text-xl font-bold text-gray-900 dark:text-white mb-3">Checked Against Compilers</h3>
               <p className="text-gray-600 dark:text-gray-400">
-                Results are tested against GCC, the Go compiler and rustc, and every tool generates a program to check on yours.
+                Results are tested against GCC, MSVC, the Go compiler, rustc and zig, and every tool generates a program to check on yours.
               </p>
             </div>
           </div>
@@ -102,10 +102,10 @@ export default function Home() {
           </div>
           <div className="space-y-6">
             {[
-              { num: '1', title: 'Pick a Language', desc: 'Choose C/C++, Go or Rust in the sidebar, then paste a struct, union or enum, or load an example.' },
-              { num: '2', title: 'Select a Target', desc: 'A CPU and data model for C, a GOARCH for Go, or a target triple for Rust.' },
+              { num: '1', title: 'Pick a Language', desc: 'Choose C/C++, Go, Rust or Zig in the sidebar, then paste a struct, union or enum, or load an example.' },
+              { num: '2', title: 'Select a Target', desc: 'A CPU and data model for C, a GOARCH for Go, or a target triple for Rust and Zig.' },
               { num: '3', title: 'View Analysis', desc: 'See the byte map, padding statistics, diagnostics and the same type on every other target.' },
-              { num: '4', title: 'Optimize & Verify', desc: 'Copy the reordered definition, and generate a C, Go or Rust program that prints what your compiler does.' },
+              { num: '4', title: 'Optimize & Verify', desc: 'Copy the reordered definition, and generate a C, Go, Rust or Zig program that prints what your compiler does.' },
             ].map((step, idx) => (
               <div key={idx} className="flex gap-6 items-start p-6 rounded-xl bg-gradient-to-r from-gray-50 to-transparent dark:from-gray-800 dark:to-transparent border border-gray-200 dark:border-gray-700 hover:border-blue-400 dark:hover:border-blue-500 transition-all duration-300 hover:shadow-md">
                 <div className="flex-shrink-0 w-14 h-14 bg-gradient-to-br from-blue-600 to-purple-600 rounded-full flex items-center justify-center text-white font-bold text-xl shadow-lg">

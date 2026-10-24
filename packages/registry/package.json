@@ -14,7 +14,8 @@
     "@sp/engine": "workspace:*",
     "@sp/go-layout": "workspace:*",
     "@sp/layout": "workspace:*",
-    "@sp/rust-layout": "workspace:*"
+    "@sp/rust-layout": "workspace:*",
+    "@sp/zig-layout": "workspace:*"
   },
   "devDependencies": {
     "@sp/config": "workspace:*",

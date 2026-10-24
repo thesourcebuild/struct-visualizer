@@ -44,6 +44,7 @@
     "@sp/layout": "workspace:*",
     "@sp/registry": "workspace:*",
     "@sp/rust-layout": "workspace:*",
+    "@sp/zig-layout": "workspace:*",
     "@types/node": "^22",
     "cross-env": "^10.0.0",
     "eslint": "^9.36.0",

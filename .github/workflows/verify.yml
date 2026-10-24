@@ -30,9 +30,10 @@ jobs:
         uses: ./.github/actions/cross-compilers
         # A crawling mirror fails the run here, instead of holding it for the 6 h job limit.
         timeout-minutes: 60
-      # Bindings are compiled by their own languages (tests/bindings.test.ts): Zig and Rust check them
-      # for the target, C# with .NET 9; Go and Python are on the runner already.
-      - name: Install the toolchains the bindings are checked with
+      # Zig is the ground truth of the Zig tools (tests/zig-compiler.test.ts). Bindings are compiled by
+      # their own languages (tests/bindings.test.ts): Zig and Rust check them for the target, C# with
+      # .NET 9; Go and Python are on the runner already.
+      - name: Install Zig, and the toolchains the bindings are checked with
         if: matrix.node == 22
         uses: mlugg/setup-zig@v2
         with:
@@ -41,9 +42,13 @@ jobs:
         if: matrix.node == 22
         with:
           dotnet-version: 9.0.x
+      # Every target the Rust bindings are written for: rustup ships the library of most; the tier-3
+      # ones (MIPS, AVR) have core built from source on nightly (-Zbuild-std).
       - name: Add the Rust targets the bindings are checked for
         if: matrix.node == 22
-        run: rustup target add thumbv7em-none-eabihf i686-unknown-linux-gnu x86_64-pc-windows-msvc
+        run: |
+          rustup target add x86_64-pc-windows-msvc i686-unknown-linux-gnu i686-pc-windows-msvc armv7-unknown-linux-gnueabihf thumbv7em-none-eabihf aarch64-unknown-linux-gnu riscv32imac-unknown-none-elf riscv64gc-unknown-linux-gnu powerpc-unknown-linux-gnu
+          rustup toolchain install nightly --profile minimal -c rust-src
       - run: pnpm typecheck
       - run: pnpm lint
       # TODO: add `pnpm format:check` after the one-off `pnpm format` commit

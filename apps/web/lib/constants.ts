@@ -2,10 +2,10 @@
 export const SITE_TITLE = 'Struct Visualizer';
 // The meta description: under 160 characters, which is about where a search result cuts it off.
 export const SITE_DESCRIPTION =
-    'See every byte of a C/C++, Go or Rust type: offsets, padding, alignment and the field order that saves space, on desktop and embedded targets, in your browser.';
+    'See every byte of a C/C++, Go, Rust or Zig type: offsets, padding, alignment and the field order that saves space, on desktop and embedded targets.';
 // The longer form, for structured data, where nothing truncates it.
 export const SITE_SUMMARY =
-    'Struct padding calculator and memory layout visualizer for C/C++, Go and Rust: offsets, padding, alignment and the optimal field order, on x86, x64, ARM, RISC-V, WebAssembly and AVR, PIC and 8051 microcontrollers. Checked against GCC, the Go compiler and rustc.';
+    'Struct padding calculator and memory layout visualizer for C/C++, Go, Rust and Zig: offsets, padding, alignment and the optimal field order, on x86, x64, ARM, RISC-V, WebAssembly and AVR, PIC and 8051 microcontrollers. Checked against GCC, MSVC, the Go compiler, rustc and zig.';
 export const SITE_KEYWORDS = [
     'struct padding',
     'struct padding calculator',
@@ -15,6 +15,7 @@ export const SITE_KEYWORDS = [
     'C++ struct',
     'Go struct alignment',
     'Rust type layout',
+    'Zig struct layout',
     'sizeof offsetof',
     'struct optimization',
     'embedded systems',

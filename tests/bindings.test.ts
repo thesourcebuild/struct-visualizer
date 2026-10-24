@@ -10,9 +10,13 @@ import type { BindingLanguage, BindingOutput, CalculationResult, PlatformSelecti
 /**
  * Every binding the Bindings tool writes is compiled by its language and its layout read back
  * there: the size of the struct and the offset of each of its members must be the C layout's on
- * that target. Zig and Rust check at compile time for the target itself (Rust for each target
- * whose standard library is installed); Go for each GOARCH; Python's struct and ctypes and C#'s
- * explicit layout do not depend on the machine, so they run here.
+ * that target. Zig and Rust check at compile time for the target itself; Go for each GOARCH;
+ * Python's struct and ctypes and C#'s explicit layout do not depend on the machine, so they run
+ * here.
+ *
+ * Rust: with the stable compiler for the targets rustup ships a standard library for (rustup
+ * target add), and by building core from source on nightly (-Zbuild-std) for the tier-3 targets it
+ * ships none for (MIPS, AVR). SP_REQUIRE_BINDING_TOOLCHAINS makes a target left unchecked a failure.
  */
 const run = promisify(execFile);
 const requireToolchains = Boolean(process.env.SP_REQUIRE_BINDING_TOOLCHAINS);
@@ -34,9 +38,21 @@ const toolchains = {
   python: has(PYTHON, ["--version"]),
   dotnet: has("dotnet", ["--version"]),
 };
-const rustTargets = toolchains.rust
-  ? new Set(execFileSync("rustup", ["target", "list", "--installed"], { encoding: "utf8" }).split(/\r?\n/).filter(Boolean))
-  : new Set<string>();
+const rustupLines = (args: string[]) => {
+  try {
+    return execFileSync("rustup", args, { encoding: "utf8" }).split(/\r?\n/).filter(Boolean);
+  } catch {
+    return [];
+  }
+};
+/** Targets whose standard library is installed for the stable compiler. */
+const rustTargets = new Set(toolchains.rust ? rustupLines(["target", "list", "--installed"]) : []);
+/** Targets rustup distributes a standard library for; the rest are tier 3. */
+const rustupTargets = new Set(toolchains.rust ? rustupLines(["target", "list"]).map((l) => l.replace(/ \(.*\)$/, "")) : []);
+/** A nightly toolchain with the library source, to build core for a tier-3 target. */
+const buildStd = toolchains.rust && rustupLines(["component", "list", "--toolchain", "nightly", "--installed"]).some((l) => l.startsWith("rust-src"));
+/** Targets that need a CPU named (AVR has no default). */
+const RUST_FLAGS: Record<string, string[]> = { "avr-none": ["-C", "target-cpu=atmega328p"] };
 
 const TARGETS: Array<{ name: string; selection: PlatformSelection }> = [
   { name: "x86-64 Linux", selection: { target: "intel-x64-amd", dataModel: "LP64", os: "linux" } },
@@ -115,6 +131,8 @@ const kept = (p: Prepared, language: BindingLanguage) =>
 /** Per language: the errors its compiler reported for each prepared case, keyed by index. */
 const failures = new Map<BindingLanguage, Map<number, string>>();
 const ran = new Map<BindingLanguage, Set<number>>();
+/** Per language: why a case could not be compiled here, keyed by index. */
+const unavailable = new Map<BindingLanguage, Map<number, string>>();
 
 const dir = mkdtempSync(join(tmpdir(), "sp-bind-"));
 
@@ -153,10 +171,19 @@ async function checkRust() {
   const byTarget = new Map<string, Prepared[]>();
   for (const p of prepared) {
     const t = bindingTargetName("rust", analyzeStruct("struct S { int a; };", p.target.selection).platform);
-    if (!t || !rustTargets.has(t) || p.bindings.get("rust")!.error) continue;
+    if (!t || p.bindings.get("rust")!.error) continue;
     byTarget.set(t, [...(byTarget.get(t) ?? []), p]);
   }
   for (const [target, cases] of byTarget) {
+    const stable = rustTargets.has(target);
+    const tier3 = !rustupTargets.has(target);
+    if (!stable && !(tier3 && buildStd)) {
+      const why = tier3
+        ? `rustup ships no core library for ${target} (tier 3); building it needs nightly: rustup toolchain install nightly --profile minimal -c rust-src`
+        : `rustup target add ${target}`;
+      for (const p of cases) unavailable.get("rust")!.set(p.index, why);
+      continue;
+    }
     const lines = ["#![no_std]", "#![allow(non_camel_case_types, non_snake_case, dead_code)]"];
     for (const p of cases) {
       const root = rootName(p);
@@ -170,12 +197,26 @@ async function checkRust() {
       }
       lines.push("};");
     }
-    const file = join(dir, `rust_${target}.rs`);
-    writeFileSync(file, lines.join("\n"));
-    const output = await run("rustc", ["--edition", "2021", "--crate-type", "lib", "--target", target, "--emit", "metadata", "-o", join(dir, `rust_${target}.rmeta`), file], { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(
-      () => "",
-      (e: { stderr?: string }) => e.stderr ?? String(e),
-    );
+    const flags = RUST_FLAGS[target] ?? [];
+    const fail = (e: { stderr?: string }) => e.stderr ?? String(e);
+    let file: string;
+    let output: string;
+    if (stable) {
+      file = join(dir, `rust_${target}.rs`);
+      writeFileSync(file, lines.join("\n"));
+      const args = ["--edition", "2021", "--crate-type", "lib", "--target", target, ...flags, "--emit", "metadata", "-o", join(dir, `rust_${target}.rmeta`), file];
+      output = await run("rustc", args, { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
+    } else {
+      // A tier-3 target: core built from source on nightly, kept between runs as that takes a while.
+      const crate = join(dir, `rust_${target}`);
+      mkdirSync(join(crate, "src"), { recursive: true });
+      writeFileSync(join(crate, "Cargo.toml"), '[package]\nname = "bindcheck"\nversion = "0.0.0"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n');
+      file = join(crate, "src", "lib.rs");
+      writeFileSync(file, lines.join("\n"));
+      const env = { ...process.env, CARGO_TARGET_DIR: join(tmpdir(), "sp-rust-build-std"), RUSTFLAGS: flags.join(" ") };
+      const args = ["run", "nightly", "cargo", "check", "-q", "-Zbuild-std=core", "--target", target];
+      output = await run("rustup", args, { cwd: crate, env, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
+    }
     record("rust", cases, output, file);
   }
 }
@@ -372,6 +413,7 @@ for (const language of LANGUAGES) {
     beforeAll(async () => {
       failures.set(language, failures.get(language) ?? new Map());
       ran.set(language, ran.get(language) ?? new Set());
+      unavailable.set(language, unavailable.get(language) ?? new Map());
       if (language === "python-struct") {
         failures.set("python-ctypes", failures.get("python-ctypes") ?? new Map());
         ran.set("python-ctypes", ran.get("python-ctypes") ?? new Set());
@@ -389,7 +431,9 @@ for (const language of LANGUAGES) {
           return;
         }
         if (!ran.get(language)!.has(p.index)) {
-          ctx.skip(`no ${language} compiler for this target here`);
+          const why = unavailable.get(language)!.get(p.index) ?? `no ${language} compiler for this target here`;
+          if (requireToolchains) expect.fail(`not checked: ${why}`);
+          ctx.skip(why);
           return;
         }
         expect(failures.get(language)!.get(p.index), binding.code).toBeUndefined();

@@ -37,7 +37,7 @@ export interface AppShellProps {
   /** Tool chosen by the route (/tools/<id>/). Undefined on /tools/, which restores the last tool. */
   initialToolId?: string;
   /** The language whose definitions the page loaded up front (set by the family shells). */
-  preloadedFamily?: "layout" | "go" | "rust";
+  preloadedFamily?: "layout" | "go" | "rust" | "zig";
 }
 
 /**
