@@ -581,21 +581,30 @@ const emitRust: Emitter = (records, ctx) => {
       }
     }
   }
-  // A test needs std and a machine to run on: a bare-metal target has neither.
+  // The round trip runs as a program (main, which prints with std; in a crate it is a function
+  // of the module) and as a test. Both need std and a machine to run on: bare metal has neither.
   const hosted = ctx.platform.os !== 'none';
   if (hosted) {
     out.push(
+      `/// ${root.cName} from the bytes the target stores: each value at its offset, ${byteOrder(ctx)}, read back.`,
+      'fn round_trip() {',
+      `    let ${writes.length > 0 ? 'mut ' : ''}bytes = [0u8; ${root.size}];`,
+      ...writes.map((w) => `    ${w}`),
+      `    let value = ${root.name}::from_bytes(&bytes)${bools.length > 0 ? '.unwrap()' : ''};`,
+      ...checks.map((c) => `    ${c}`),
+      '}',
+      '',
+      '/// Run as a program (rustc, or cargo run), the round trip, saying what it read.',
+      'pub fn main() {',
+      '    round_trip();',
+      `    println!("${root.name}: each field read back from its ${root.size} bytes");`,
+      '}',
+      '',
       '#[cfg(test)]',
       `mod ${unique('tests', new Set(records.map((r) => r.name)))} {`,
-      '    use super::*;',
-      '',
       '    #[test]',
       '    fn from_bytes_reads_each_field() {',
-      `        // ${root.cName} as the target stores it: each value at its offset, ${byteOrder(ctx)}.`,
-      `        let ${writes.length > 0 ? 'mut ' : ''}bytes = [0u8; ${root.size}];`,
-      ...writes.map((w) => `        ${w}`),
-      `        let value = ${root.name}::from_bytes(&bytes)${bools.length > 0 ? '.unwrap()' : ''};`,
-      ...checks.map((c) => `        ${c}`),
+      '        super::round_trip();',
       '    }',
       '}',
       '',
@@ -607,7 +616,7 @@ const emitRust: Emitter = (records, ctx) => {
     usage: [
       `Add ${file} to a crate built for ${triple}: compiling it checks the layout, and fails for another target.`,
       `${root.name}::from_bytes(&bytes) reads one from the bytes the target stores.`,
-      ...(hosted ? [`cargo test runs its round trip, on a ${triple} machine.`] : []),
+      ...(hosted ? [`On a ${triple} machine, rustc ${file} builds it as a program that runs its round trip (and cargo test runs it as a test).`] : []),
     ],
   };
 };
@@ -718,13 +727,33 @@ const emitZig: Emitter = (records, ctx) => {
       }
     }
   }
-  // A test needs an OS to run on (std.testing writes through it): a bare-metal target has none.
+  // The round trip runs as a program (main: only the root file's counts, so the file still
+  // imports as a module) and as a test. Both need an OS (std writes through it): a bare-metal
+  // target has neither. main must have its name; a type of the C source may have taken it.
   const hosted = ctx.platform.os !== 'none';
+  const roundTrip = unique('roundTrip', taken);
+  const runnable = hosted && !taken.has('main');
   if (hosted) {
     out.push(
       `test "${root.name} from the bytes the target stores" {`,
+      `    try ${roundTrip}();`,
+      '}',
+      '',
+    );
+    if (runnable) {
+      out.push(
+        '/// Run as a program (zig run), the round trip, saying what it read.',
+        'pub fn main() !void {',
+        `    try ${roundTrip}();`,
+        `    @import("std").debug.print("${root.name}: each field read back from its ${root.size} bytes\\n", .{});`,
+        '}',
+        '',
+      );
+    } else ctx.notes.push(`A type is named main, which a Zig program's entry point must be: the round trip runs with zig test only.`);
+    out.push(
+      `/// ${root.cName} from the bytes the target stores: each value at its offset, ${byteOrder(ctx)}, read back.`,
+      `fn ${roundTrip}() !void {`,
       `    const ${std} = @import("std");`,
-      `    // ${root.cName} as the target stores it: each value at its offset, ${byteOrder(ctx)}.`,
       `    ${writes.length > 0 ? 'var' : 'const'} ${bytes} = [_]u8{0} ** ${root.size};`,
       ...writes.map((w) => `    ${w}`),
       `    const ${value} = ${std}.mem.bytesToValue(${root.name}, &${bytes});`,
@@ -733,12 +762,14 @@ const emitZig: Emitter = (records, ctx) => {
       '',
     );
   }
+  const machine = target.split(' ')[0];
   return {
     code: out.join('\n'),
     usage: [
       `Build ${root.name}.zig with -target ${target}: compiling it checks the layout, and fails for another target.`,
       `std.mem.bytesToValue(${root.name}, &bytes) reads one from the bytes the target stores; std.mem.toBytes(value) gives them.`,
-      ...(hosted ? [`zig test ${root.name}.zig -target ${target} runs its round trip, on a ${target.split(' ')[0]} machine.`] : []),
+      ...(runnable ? [`On a ${machine} machine, zig run ${root.name}.zig runs its round trip (and zig test ${root.name}.zig as a test).`] : []),
+      ...(hosted && !runnable ? [`On a ${machine} machine, zig test ${root.name}.zig runs its round trip.`] : []),
     ],
   };
 };
@@ -908,7 +939,7 @@ const emitGo: Emitter = (records, ctx) => {
     usage: [
       `Put both files in one package and build it with GOARCH=${target.arch}: compiling it checks the layout, and fails for another GOARCH.`,
       `${read}(r) reads one from the bytes the target stores, and ${write}(w, &v) writes them.`,
-      `go test runs the example's round trip, with GOARCH=${target.arch}.`,
+      `In a module (go mod init example) with both files, go test runs the example's round trip, with GOARCH=${target.arch}.`,
     ],
   };
 };
@@ -1063,12 +1094,13 @@ const emitCSharp: Emitter = (records, ctx) => {
   }
   const runner = unique(`${root.name}RoundTrip`, new Set(records.map((r) => r.name)));
   const example = [
-    `// A round trip through the bytes ${root.cName} has on ${platformLine(ctx)}: call ${runner}.Run().`,
+    `// A round trip through the bytes ${root.cName} has on ${platformLine(ctx)}.`,
+    `// A program: in a console project with ${root.name}.cs and this file in place of Program.cs, dotnet run.`,
     'using System;',
     '',
     `public static class ${runner}`,
     '{',
-    '    public static unsafe void Run()',
+    '    public static unsafe void Main()',
     '    {',
     `        var ${value} = new ${root.name}();`,
     ...sets.map((s) => `        ${s}`),
@@ -1086,9 +1118,9 @@ const emitCSharp: Emitter = (records, ctx) => {
     code: out.join('\n'),
     example: { filename: `${runner}.cs`, code: example.join('\n') },
     usage: [
-      'Add both files to a project with AllowUnsafeBlocks: every field is at its C offset on any machine.',
+      `Add ${root.name}.cs to a project with AllowUnsafeBlocks: every field is at its C offset on any machine.`,
       `${root.name}.FromBytes(bytes) reads one from the bytes the target stores, and value.ToBytes() gives them.`,
-      `${runner}.Run() runs the round trip.`,
+      `dotnet new console, then ${root.name}.cs and ${runner}.cs in place of Program.cs, AllowUnsafeBlocks set, and dotnet run runs the round trip.`,
     ],
   };
 };
@@ -1197,6 +1229,7 @@ const emitPythonStruct: Emitter = (records, ctx) => {
     `    data = pack_${lower}(members)`,
     `    assert len(data) == ${r.size} and unpack_${lower}(data) == members`,
     `    print(unpack_${lower}(data))`,
+    `    print(f'${r.name}: {len(data)} bytes, the same after a round trip')`,
     '',
   ];
   return {

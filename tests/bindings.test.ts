@@ -1,7 +1,7 @@
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PaddingCalculator, analyzeStruct, bindingTargetName, examples, generateBindings, goExportedName } from "@sp/core";
@@ -19,7 +19,9 @@ import type { Answer } from "./support/references";
  * Each binding's own layout checks are compiled with it, and its round-trip example runs: for every
  * target in Python and C#; in Rust, Zig and Go for this machine's own target, and is compiled for
  * the others where the toolchain can (Rust where std is installed, Zig where its test runner builds,
- * Go for every GOARCH with go vet). The Go files must be as gofmt formats them.
+ * Go for every GOARCH with go vet). Each is also run the way its usage says, as its user would:
+ * rustc and zig run on the file alone, go test, a new dotnet console project, python on the file.
+ * The Go files must be as gofmt formats them.
  *
  * Rust: with the stable compiler for the targets rustup ships a standard library for (rustup
  * target add), and by building core from source on nightly (-Zbuild-std) for the tier-3 targets it
@@ -202,7 +204,15 @@ async function checkZig() {
     const output = hosted
       ? await zigRun(["test", ...targetArgs, ...(host ? [] : ["-fno-emit-bin"]), file])
       : await zigRun(["build-obj", ...targetArgs, "-fno-emit-bin", file]);
-    record("zig", cases, output, file);
+    // And each as its user runs it: zig run on the file alone, the program's root.
+    const alone =
+      !output && hosted && host
+        ? await runStandalone(cases, "zig", readBack, (p, base) => {
+            writeFileSync(`${base}.zig`, p.bindings.get("zig")!.code);
+            return run("zig", ["run", `${base}.zig`], { cwd: dir, maxBuffer: 64 * 1024 * 1024 });
+          })
+        : "";
+    record("zig", cases, alone || output, file);
   }
 }
 
@@ -231,8 +241,10 @@ async function checkRust() {
       for (const p of cases) unavailable.get("rust")!.set(p.index, why);
       continue;
     }
-    // core only, as on a bare-metal target; the bindings' tests need std and its test harness.
-    const lines = ["#![cfg_attr(not(test), no_std)]", "#![allow(non_camel_case_types, non_snake_case, dead_code)]"];
+    // A binding for a target with an OS runs as a program, which prints with std; a bare-metal
+    // one has core only.
+    const hosted = cases[0]!.target.selection.os !== "none";
+    const lines = [...(hosted ? [] : ["#![no_std]"]), "#![allow(non_camel_case_types, non_snake_case, dead_code)]"];
     for (const p of cases) {
       const root = rootName(p);
       lines.push(`pub mod case_${p.index} {`, p.bindings.get("rust")!.code, "}", "const _: () = {");
@@ -260,6 +272,12 @@ async function checkRust() {
         const exe = join(dir, `rust_${target}_test${process.platform === "win32" ? ".exe" : ""}`);
         output = await rustc(["--test", "-o", exe]);
         if (!output) output = await run(exe, [], { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(() => "", (e: { stdout?: string; stderr?: string }) => `${e.stdout ?? ""}${e.stderr ?? ""}`);
+        // And each as its user builds it: rustc on the file alone, which is then the program.
+        if (!output) output = await runStandalone(cases, "rust", readBack, async (p, base) => {
+          writeFileSync(`${base}.rs`, p.bindings.get("rust")!.code);
+          const exe = `${base}${process.platform === "win32" ? ".exe" : ""}`;
+          return run("rustc", ["-o", exe, `${base}.rs`], { cwd: dir }).then(() => run(exe, [], { cwd: dir }));
+        });
       } else if (!output && rustStd(target)) {
         output = await rustc(["--test", "--emit", "metadata", "-o", join(dir, `rust_${target}_test.rmeta`)]);
       }
@@ -271,11 +289,44 @@ async function checkRust() {
       file = join(crate, "src", "lib.rs");
       writeFileSync(file, lines.join("\n"));
       const env = { ...process.env, CARGO_TARGET_DIR: buildStdDir, RUSTFLAGS: flags.join(" ") };
-      const args = ["run", "nightly", "cargo", "check", "-q", "-Zbuild-std=core", "--target", target];
+      const args = ["run", "nightly", "cargo", "check", "-q", hosted ? "-Zbuild-std" : "-Zbuild-std=core", "--target", target];
       output = await run("rustup", args, { cwd: crate, env, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
     }
     record("rust", cases, output, file);
   }
+}
+
+/**
+ * Each case's binding run alone, as the usage steps say, on this machine: it must exit cleanly and
+ * say it read its fields back. The failures, each named as its case, for record().
+ */
+/** What a Rust or Zig program says: it read each field back from the target's bytes. */
+const readBack = (p: Prepared) => `${rootName(p)}: each field read back from its ${p.expected.size} bytes`;
+/** What a C# or Python program says: its bytes came back the same. */
+const roundTrip = (p: Prepared) => `${rootName(p)}: ${p.expected.size} bytes, the same after a round trip`;
+
+async function runStandalone(
+  cases: Prepared[],
+  language: BindingLanguage,
+  said: (p: Prepared) => string,
+  build: (p: Prepared, base: string) => Promise<{ stdout: string; stderr: string }>,
+): Promise<string> {
+  const failed: string[] = [];
+  const queue = [...cases];
+  await Promise.all(
+    Array.from({ length: 4 }, async () => {
+      for (let p = queue.shift(); p; p = queue.shift()) {
+        const base = join(dir, `${language.replace(/\W/g, "_")}_run_${p.index}`);
+        const why = await build(p, base).then(
+          // Where it says it: stdout, or stderr for Zig's std.debug.print.
+          (r) => (`${r.stdout}${r.stderr}`.includes(said(p)) ? "" : `printed ${JSON.stringify(`${r.stdout}${r.stderr}`.slice(0, 200))}`),
+          (e: { stdout?: string; stderr?: string; message?: string }) => `${e.stderr ?? ""}${e.stdout ?? ""}`.trim() || String(e.message),
+        );
+        if (why) failed.push(...why.split(/\r?\n/).slice(0, 12).map((l) => `case ${p.index}: run alone: ${l}`));
+      }
+    }),
+  );
+  return failed.join("\n");
 }
 
 async function checkGo() {
@@ -422,6 +473,16 @@ async function checkPython() {
       if (JSON.stringify(sortKeys(have)) !== JSON.stringify(sortKeys(want))) failures.get(language)!.set(p.index, `got ${JSON.stringify(have)}`);
     }
   }
+  // Above, each one runs as __main__; and as its user runs it, the file itself with python, once.
+  for (const language of ["python-struct", "python-ctypes"] as const) {
+    const first = cases[0];
+    if (!first) continue;
+    const failed = await runStandalone([first], language, roundTrip, (p, base) => {
+      writeFileSync(`${base}.py`, p.bindings.get(language)!.code);
+      return run(PYTHON, [`${base}.py`], { cwd: dir });
+    });
+    if (failed) failures.get(language)!.set(first.index, `${failures.get(language)!.get(first.index) ?? ""}${failed}\n`);
+  }
 }
 
 async function checkCSharp() {
@@ -430,7 +491,7 @@ async function checkCSharp() {
   mkdirSync(root, { recursive: true });
   writeFileSync(
     join(root, "check.csproj"),
-    '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><AllowUnsafeBlocks>true</AllowUnsafeBlocks><Nullable>disable</Nullable><ImplicitUsings>disable</ImplicitUsings><NoWarn>CS0649;CS0169</NoWarn></PropertyGroup></Project>',
+    '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><AllowUnsafeBlocks>true</AllowUnsafeBlocks><StartupObject>Program</StartupObject><Nullable>disable</Nullable><ImplicitUsings>disable</ImplicitUsings><NoWarn>CS0649;CS0169</NoWarn></PropertyGroup></Project>',
   );
   const lines: string[] = [];
   const main = ["public static class Program", "{", "    public static void Main()", "    {", "        var stdout = System.Console.Out;"];
@@ -448,7 +509,7 @@ async function checkCSharp() {
       "        try",
       "        {",
       "            System.Console.SetOut(System.IO.TextWriter.Null);",
-      `            ${ns}.${binding.example!.filename.replace(/\.cs$/, "")}.Run();`,
+      `            ${ns}.${binding.example!.filename.replace(/\.cs$/, "")}.Main();`,
       "            System.Console.SetOut(stdout);",
       "        }",
       "        catch (System.Exception e)",
@@ -478,6 +539,22 @@ async function checkCSharp() {
     if (JSON.stringify(sortKeys(have)) !== JSON.stringify(sortKeys(want))) failures.get("csharp")!.set(p.index, `got ${JSON.stringify(have)}`);
     const example = output.split(/\r?\n/).find((l) => l.startsWith(`${p.index} example: `));
     if (example) failures.get("csharp")!.set(p.index, `${failures.get("csharp")!.get(p.index) ?? ""}${example}\n`);
+  }
+  // Above, each example's Main runs; and once as its user runs it: a new console project with the
+  // binding and the example in place of Program.cs, unsafe code allowed, dotnet run.
+  const first = cases[0];
+  if (first) {
+    const failed = await runStandalone([first], "csharp", roundTrip, async (p, base) => {
+      await run("dotnet", ["new", "console", "-o", base, "--force"], { cwd: dir, timeout: 600_000 });
+      rmSync(join(base, "Program.cs"));
+      const project = join(base, `${basename(base)}.csproj`);
+      writeFileSync(project, readFileSync(project, "utf8").replace("</PropertyGroup>", "<AllowUnsafeBlocks>true</AllowUnsafeBlocks></PropertyGroup>"));
+      const binding = p.bindings.get("csharp")!;
+      writeFileSync(join(base, binding.filename), binding.code);
+      writeFileSync(join(base, binding.example!.filename), binding.example!.code);
+      return run("dotnet", ["run"], { cwd: base, maxBuffer: 64 * 1024 * 1024, timeout: 600_000 });
+    });
+    if (failed) failures.get("csharp")!.set(first.index, `${failures.get("csharp")!.get(first.index) ?? ""}${failed}\n`);
   }
 }
 
