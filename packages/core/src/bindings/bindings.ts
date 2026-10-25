@@ -281,6 +281,12 @@ function sampleValue(t: LeafType, k: number): Leaf['value'] {
 }
 
 /**
+ * Bytes an example writes out in full, up to this many; more (a union carried as its bytes, a
+ * char array in Python's struct) are made by a loop from the first, as sampleValue makes them.
+ */
+const LITERAL_BYTES = 16;
+
+/**
  * The values an example sets in `root`: every scalar, the first and last element of each array,
  * and a union's first member (a union holds one at a time). Flexible array members hold none.
  */
@@ -562,10 +568,17 @@ const emitRust: Emitter = (records, ctx) => {
           checks.push(`assert_eq!(${read} as usize, ${l.value});`);
         }
         break;
-      case 'bytes':
-        writes.push(`${range}.copy_from_slice(&[${list(l.value as number[])}]);`);
-        checks.push(`assert_eq!(${read}, [${list(l.value as number[])}]);`);
+      case 'bytes': {
+        const v = l.value as number[];
+        if (v.length <= LITERAL_BYTES) {
+          writes.push(`${range}.copy_from_slice(&[${list(v)}]);`);
+          checks.push(`assert_eq!(${read}, [${list(v)}]);`);
+        } else {
+          writes.push(`for (j, byte) in ${range}.iter_mut().enumerate() {`, `    *byte = (${v[0]} + j) as u8;`, '}');
+          checks.push(`assert!(${read}.iter().enumerate().all(|(j, &byte)| byte == (${v[0]} + j) as u8));`);
+        }
         break;
+      }
     }
   }
   // A test needs std and a machine to run on: a bare-metal target has neither.
@@ -660,6 +673,8 @@ const emitZig: Emitter = (records, ctx) => {
   const std = unique('std', taken);
   const bytes = unique('bytes', taken);
   const value = unique('value', taken);
+  const byte = unique('byte', taken);
+  const j = unique('j', taken);
   const endian = ctx.bigEndian ? '.big' : '.little';
   const writes: string[] = [];
   const checks: string[] = [];
@@ -690,10 +705,17 @@ const emitZig: Emitter = (records, ctx) => {
           checks.push(`try ${std}.testing.expectEqual(@as(usize, ${l.value}), @intFromPtr(${read}));`);
         }
         break;
-      case 'bytes':
-        writes.push(`@memcpy(${range}, &[_]u8{ ${list(l.value as number[])} });`);
-        checks.push(`try ${std}.testing.expectEqualSlices(u8, &[_]u8{ ${list(l.value as number[])} }, &${read});`);
+      case 'bytes': {
+        const v = l.value as number[];
+        if (v.length <= LITERAL_BYTES) {
+          writes.push(`@memcpy(${range}, &[_]u8{ ${list(v)} });`);
+          checks.push(`try ${std}.testing.expectEqualSlices(u8, &[_]u8{ ${list(v)} }, &${read});`);
+        } else {
+          writes.push(`for (${range}, 0..) |*${byte}, ${j}| ${byte}.* = @truncate(${v[0]} + ${j});`);
+          checks.push(`for (${read}, 0..) |${byte}, ${j}| try ${std}.testing.expectEqual(@as(u8, @truncate(${v[0]} + ${j})), ${byte});`);
+        }
         break;
+      }
     }
   }
   // A test needs an OS to run on (std.testing writes through it): a bare-metal target has none.
@@ -848,7 +870,12 @@ const emitGo: Emitter = (records, ctx) => {
       case 'int': case 'float': sets.push(`${at} = ${l.value}`); break;
       case 'bool': sets.push(`${at} = true`); break;
       case 'pointer': if (!l.type.function) sets.push(`${at} = ${l.value}`); break;
-      case 'bytes': sets.push(`${at} = [${l.type.size}]byte{${list(l.value as number[])}}`); break;
+      case 'bytes': {
+        const v = l.value as number[];
+        if (v.length <= LITERAL_BYTES) sets.push(`${at} = [${l.type.size}]byte{${list(v)}}`);
+        else sets.push(`for j := range ${at} {`, `\t${at}[j] = byte(${v[0]} + j)`, '}');
+        break;
+      }
     }
   }
   const example = [
@@ -1076,7 +1103,8 @@ const pyAttr = (base: string, name: string) => (PYTHON_KEYWORDS.has(name) ? `get
 /** A Python literal for a sample value. */
 function pyValue(v: Leaf['value']): string {
   if (typeof v === 'boolean') return 'True';
-  return Array.isArray(v) ? `bytes([${list(v)}])` : String(v);
+  if (!Array.isArray(v)) return String(v);
+  return v.length <= LITERAL_BYTES ? `bytes([${list(v)}])` : `bytes((${v[0]} + j) % 256 for j in range(${v.length}))`;
 }
 
 // ------------------------------------------------------------------ Python struct

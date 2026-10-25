@@ -109,6 +109,10 @@ const CASES: Record<string, string> = {
   "flexible array member": "struct S { short n; int data[]; };",
   "long double": "struct S { char a; long double x; char b; };",
   "nested anonymous": "struct S { char tag; union { int i; float f; } v; struct { char x; long y; } p; };",
+  // Bytes the examples fill with a loop: a run of bit-fields over 16 bytes, and a union of 300
+  // (whose values go past 255).
+  "wide bit-field run": "struct S { unsigned long long a : 60; unsigned long long b : 60; unsigned long long c : 60; char t; };",
+  "large union": "union U { char buf[300]; int i; };\nstruct S { char a; union U u; };",
 };
 
 const LANGUAGES: BindingLanguage[] = ["zig", "rust", "go", "csharp", "python-struct", "python-ctypes"];
