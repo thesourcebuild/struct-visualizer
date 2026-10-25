@@ -99,7 +99,6 @@ export function computeZigVerificationCode(spec: ZigLayoutSpec, input: string): 
 
   return {
     data,
-    text: code,
     files: [{ filename, content: code, mimeType: "text/x-zig", label: "Zig verification program" }],
     fields: [
       { label: "Run", value: command, mono: true },

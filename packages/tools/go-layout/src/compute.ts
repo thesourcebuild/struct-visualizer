@@ -81,7 +81,6 @@ export function computeGoVerificationCode(spec: GoLayoutSpec, input: string): To
 
   return {
     data,
-    text: code,
     files: [{ filename, content: code, mimeType: "text/x-go", label: "Go verification program" }],
     fields: [
       { label: "Run", value: build, mono: true },

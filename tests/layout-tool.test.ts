@@ -216,13 +216,41 @@ describe("verification-code tool", () => {
   it("emits a downloadable C program", () => {
     const result = verify.compute(verify.createSpec(), PADDED);
     expect(result.files?.[0]?.filename).toBe("Example_verify.c");
-    expect(result.text).toContain("offsetof(");
+    expect(result.files![0]!.content).toContain("offsetof(");
   });
 
   it("emits C++ when asked, with the compiler's -std", () => {
     const result = verify.compute(verify.createSpec({ language: "c++20" }), PADDED);
     expect(result.files?.[0]?.filename).toBe("Example_verify.cpp");
-    expect(result.text).toContain("#include <iostream>");
+    expect(result.files![0]!.content).toContain("#include <iostream>");
     expect(result.fields?.find((f) => f.label === "Compile")?.value).toContain("-std=c++20");
+  });
+});
+
+describe("Bindings tool", () => {
+  const bindings = layoutToolDefinition("bindings");
+  const code = "struct Example { char a; int b; char c; double d; };";
+  const compute = (language: string, options: Record<string, string> = {}) => bindings.compute(bindings.createSpec({ bindingLanguage: language, ...options }), code);
+
+  it("writes the binding, and the example where the language keeps it apart", () => {
+    const files = (language: string) => compute(language).files!.map((f) => f.filename);
+    expect(files("rust")).toEqual(["Example.rs"]);
+    expect(files("zig")).toEqual(["Example.zig"]);
+    expect(files("python-struct")).toEqual(["Example.py"]);
+    expect(files("go")).toEqual(["Example.go", "Example_example_test.go"]);
+    expect(files("csharp")).toEqual(["Example.cs", "ExampleRoundTrip.cs"]);
+  });
+
+  it("says how to build it, read and write its bytes, and run its round trip", () => {
+    const go = compute("go").working!;
+    expect(go).toContain("GOARCH=amd64");
+    expect(go).toContain("ReadExample(r)");
+    expect(go).toContain("go test");
+    expect(compute("rust").working!.split("\n")).toHaveLength(3);
+    // A bare-metal target has no machine to run a test on, and its binding no test.
+    const bare = compute("rust", { target: "arm32", dataModel: "ILP32", os: "none" });
+    expect(bare.working!.split("\n")).toHaveLength(2);
+    expect(bare.files![0]!.content).not.toContain("#[cfg(test)]");
+    expect(compute("rust").files![0]!.content).toContain("#[cfg(test)]");
   });
 });

@@ -111,7 +111,6 @@ export function computeRustVerificationCode(spec: RustLayoutSpec, input: string)
 
   return {
     data,
-    text: code,
     files: [{ filename, content: code, mimeType: "text/x-rust", label: "Rust verification program" }],
     fields: [
       { label: "Run", value: native, mono: true },

@@ -87,7 +87,7 @@ describe("Packed mode", () => {
       ["keyword", "__packed struct S"],
     ] as const) {
       const result = verify.compute(verify.createSpec({ [OPTION_MODE]: "packed", [OPTION_PACKING]: packing }), BITS);
-      expect(result.text).toContain(marker);
+      expect(result.files![0]!.content).toContain(marker);
     }
   });
 

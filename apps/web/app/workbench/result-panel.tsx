@@ -23,7 +23,7 @@ function InlineCode({ text }: { text: string }) {
   );
 }
 
-/** Generic rendering of a ToolResult: fields, tables, text, files and working. */
+/** Generic rendering of a ToolResult: fields, tables, files and working. */
 export function ResultPanel({ result }: { result: ToolResult }) {
   return (
     <div className="space-y-4">
@@ -39,31 +39,26 @@ export function ResultPanel({ result }: { result: ToolResult }) {
         </Panel>
       ))}
 
-      {result.text !== undefined && (
+      {result.files?.map((f) => (
         <Panel
-          title={result.files?.[0]?.label ?? "Output"}
-          subtitle={result.files?.[0]?.filename}
+          key={f.filename}
+          title={f.label ?? f.filename}
+          subtitle={f.label ? f.filename : undefined}
           actions={
             <>
-              <CopyButton value={result.text} />
-              {result.files?.map((f) => (
-                <Button
-                  key={f.filename}
-                  variant="primary"
-                  onClick={() => platform().saveFile(f.filename, f.content, f.mimeType)}
-                >
-                  Download {f.filename}
-                </Button>
-              ))}
+              <CopyButton value={f.content} />
+              <Button variant="primary" onClick={() => platform().saveFile(f.filename, f.content, f.mimeType)}>
+                Download {f.filename}
+              </Button>
             </>
           }
           bodyClassName="p-0"
         >
           <pre className="max-h-128 overflow-auto rounded-b-lg bg-gray-900 p-4 text-sm leading-relaxed text-gray-100">
-            <code>{result.text}</code>
+            <code>{f.content}</code>
           </pre>
         </Panel>
-      )}
+      ))}
 
       {result.working && (
         <Panel title="How to use">

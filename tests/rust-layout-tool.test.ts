@@ -46,9 +46,9 @@ describe("Rust tool family", () => {
   it("generates a verification program for the declared or reordered struct", () => {
     const tool = rustToolDefinition(TOOL_RUST_VERIFICATION_CODE);
     const code = "#[repr(C)]\nstruct S { a: u8, b: u64, c: u8 }";
-    const plain = tool.compute(tool.createSpec(), code).text!;
+    const plain = tool.compute(tool.createSpec(), code).files![0]!.content;
     expect(plain).toContain("offset_of!(S, b)");
-    const opt = tool.compute(tool.createSpec({ [OPTION_MODE]: "optimized" }), code).text!;
+    const opt = tool.compute(tool.createSpec({ [OPTION_MODE]: "optimized" }), code).files![0]!.content;
     expect(opt).toContain("#[repr(C)]\nstruct SOptimized {\n    b: u64,\n    a: u8,\n    c: u8,\n}");
     expect(opt).toContain("size_of::<SOptimized>()");
     expect(tool.compute(tool.createSpec(), `${code}\nfn main() {}`).error).toMatch(/fn main/);

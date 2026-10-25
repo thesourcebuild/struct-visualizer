@@ -91,12 +91,12 @@ export interface ToolSample {
 export interface ToolResult<TData = unknown> {
   /** Tool-specific payload rendered by a bespoke result view. */
   data?: TData;
-  text?: string;
   fields?: readonly ToolResultField[];
   /** Step-by-step explanation. */
   working?: string;
   workingFormat?: "monospace" | "markdown";
   tables?: readonly ToolTable[];
+  /** What the tool writes: each shown with its content, to copy or download. */
   files?: readonly ToolExportFile[];
   error?: string;
 }

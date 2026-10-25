@@ -1,10 +1,10 @@
 import { execFile, execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { PaddingCalculator, analyzeStruct, bindingTargetName, examples, generateBindings } from "@sp/core";
+import { PaddingCalculator, analyzeStruct, bindingTargetName, examples, generateBindings, goExportedName } from "@sp/core";
 import type { BindingLanguage, BindingOutput, CalculationResult, PlatformSelection } from "@sp/core";
 import { References, digest, useReferences } from "./support/references";
 import type { Answer } from "./support/references";
@@ -15,6 +15,11 @@ import type { Answer } from "./support/references";
  * that target. Zig and Rust check at compile time for the target itself; Go for each GOARCH;
  * Python's struct and ctypes and C#'s explicit layout do not depend on the machine, so they run
  * here.
+ *
+ * Each binding's own layout checks are compiled with it, and its round-trip example runs: for every
+ * target in Python and C#; in Rust, Zig and Go for this machine's own target, and is compiled for
+ * the others where the toolchain can (Rust where std is installed, Zig where its test runner builds,
+ * Go for every GOARCH with go vet). The Go files must be as gofmt formats them.
  *
  * Rust: with the stable compiler for the targets rustup ships a standard library for (rustup
  * target add), and by building core from source on nightly (-Zbuild-std) for the tier-3 targets it
@@ -54,6 +59,14 @@ const rustupLines = (args: string[]) => {
 const rustTargets = new Set(toolchains.rust ? rustupLines(["target", "list", "--installed"]) : []);
 /** Targets rustup distributes a standard library for; the rest are tier 3. */
 const rustupTargets = new Set(toolchains.rust ? rustupLines(["target", "list"]).map((l) => l.replace(/ \(.*\)$/, "")) : []);
+/** The target rustc runs on: the bindings' tests for it run here. */
+const rustHost = toolchains.rust ? /^host: (\S+)/m.exec(execFileSync("rustc", ["-vV"], { encoding: "utf8" }))?.[1] : undefined;
+/** Whether the standard library is installed for a target, which its tests need. */
+const rustSysroot = toolchains.rust ? execFileSync("rustc", ["--print", "sysroot"], { encoding: "utf8" }).trim() : "";
+const rustStd = (target: string) => {
+  const lib = join(rustSysroot, "lib", "rustlib", target, "lib");
+  return existsSync(lib) && readdirSync(lib).some((f) => /^libstd-.*\.rlib$/.test(f));
+};
 /** A nightly toolchain with the library source, to build core for a tier-3 target. */
 const buildStd = toolchains.rust && rustupLines(["component", "list", "--toolchain", "nightly", "--installed"]).some((l) => l.startsWith("rust-src"));
 /**
@@ -154,28 +167,48 @@ async function checkZig() {
     byTarget.set(t, [...(byTarget.get(t) ?? []), p]);
   }
   for (const [target, cases] of byTarget) {
-    const lines = ['const std = @import("std");'];
+    // No std of its own: a binding's test declares std, which may not shadow another.
+    const lines: string[] = [];
     for (const p of cases) {
       const root = rootName(p);
-      lines.push(`const case_${p.index} = struct {`, p.bindings.get("zig")!.code.replace(/\bpub const\b/g, "pub const"), "};");
-      lines.push("comptime {", `    if (@sizeOf(case_${p.index}.${root}) != ${p.expected.size}) @compileError(std.fmt.comptimePrint("case ${p.index}: size {d}", .{@sizeOf(case_${p.index}.${root})}));`);
+      lines.push(`const case_${p.index} = struct {`, p.bindings.get("zig")!.code, "};");
+      lines.push("comptime {", `    if (@sizeOf(case_${p.index}.${root}) != ${p.expected.size}) @compileError(@import("std").fmt.comptimePrint("case ${p.index}: size {d}", .{@sizeOf(case_${p.index}.${root})}));`);
       if (!p.expected.union) {
         for (const [name, offset] of kept(p, "zig")) {
-          lines.push(`    if (@offsetOf(case_${p.index}.${root}, "${name}") != ${offset}) @compileError(std.fmt.comptimePrint("case ${p.index}: ${name} at {d}", .{@offsetOf(case_${p.index}.${root}, "${name}")}));`);
+          lines.push(`    if (@offsetOf(case_${p.index}.${root}, "${name}") != ${offset}) @compileError(@import("std").fmt.comptimePrint("case ${p.index}: ${name} at {d}", .{@offsetOf(case_${p.index}.${root}, "${name}")}));`);
         }
       }
       lines.push("}");
     }
+    // The bindings' own tests, which are in their namespaces: referring to each brings them in.
+    lines.push("test {", ...cases.map((p) => `    _ = case_${p.index};`), "}");
     const file = join(dir, `zig_${target.replace(/\W+/g, "_")}.zig`);
     writeFileSync(file, lines.join("\n"));
     const [triple, ...flags] = target.split(" ");
-    const output = await run("zig", ["build-obj", "-target", triple!, ...flags, "-fno-emit-bin", file], { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(
-      () => "",
-      (e: { stderr?: string }) => e.stderr ?? String(e),
-    );
+    const zigRun = (args: string[]) =>
+      run("zig", args, { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(
+        () => "",
+        (e: { stdout?: string; stderr?: string }) => `${e.stderr ?? ""}${e.stdout ?? ""}` || String(e),
+      );
+    const targetArgs = ["-target", triple!, ...flags];
+    // A binding for a target with an OS has a test: run on this machine's own architecture and
+    // OS, analysed for the others. A bare-metal one has none: its layout checks are compiled.
+    const hosted = cases[0]!.target.selection.os !== "none";
+    const host = zigHost.length > 0 && triple!.startsWith(`${zigHost}-`);
+    const output = hosted
+      ? await zigRun(["test", ...targetArgs, ...(host ? [] : ["-fno-emit-bin"]), file])
+      : await zigRun(["build-obj", ...targetArgs, "-fno-emit-bin", file]);
     record("zig", cases, output, file);
   }
 }
+
+/** This machine's architecture and OS as zig names them (`zig env`), e.g. x86_64-windows. */
+const zigHost = (() => {
+  if (!toolchains.zig) return "";
+  const env = execFileSync("zig", ["env"], { encoding: "utf8" });
+  const m = /\.target = "([^".-]+)-([^".-]+)/.exec(env);
+  return m ? `${m[1]}-${m[2]}` : "";
+})();
 
 async function checkRust() {
   const byTarget = new Map<string, Prepared[]>();
@@ -194,7 +227,8 @@ async function checkRust() {
       for (const p of cases) unavailable.get("rust")!.set(p.index, why);
       continue;
     }
-    const lines = ["#![no_std]", "#![allow(non_camel_case_types, non_snake_case, dead_code)]"];
+    // core only, as on a bare-metal target; the bindings' tests need std and its test harness.
+    const lines = ["#![cfg_attr(not(test), no_std)]", "#![allow(non_camel_case_types, non_snake_case, dead_code)]"];
     for (const p of cases) {
       const root = rootName(p);
       lines.push(`pub mod case_${p.index} {`, p.bindings.get("rust")!.code, "}", "const _: () = {");
@@ -214,8 +248,17 @@ async function checkRust() {
     if (stable) {
       file = join(dir, `rust_${target}.rs`);
       writeFileSync(file, lines.join("\n"));
-      const args = ["--edition", "2021", "--crate-type", "lib", "--target", target, ...flags, "--emit", "metadata", "-o", join(dir, `rust_${target}.rmeta`), file];
-      output = await run("rustc", args, { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
+      const common = ["--edition", "2021", "--target", target, ...flags];
+      const rustc = (args: string[]) => run("rustc", [...common, ...args, file], { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
+      output = await rustc(["--crate-type", "lib", "--emit", "metadata", "-o", join(dir, `rust_${target}.rmeta`)]);
+      // The bindings' tests: run for this machine's own target, type-checked where std is installed.
+      if (!output && target === rustHost) {
+        const exe = join(dir, `rust_${target}_test${process.platform === "win32" ? ".exe" : ""}`);
+        output = await rustc(["--test", "-o", exe]);
+        if (!output) output = await run(exe, [], { cwd: dir, maxBuffer: 64 * 1024 * 1024 }).then(() => "", (e: { stdout?: string; stderr?: string }) => `${e.stdout ?? ""}${e.stderr ?? ""}`);
+      } else if (!output && rustStd(target)) {
+        output = await rustc(["--test", "--emit", "metadata", "-o", join(dir, `rust_${target}_test.rmeta`)]);
+      }
     } else {
       // A tier-3 target: core built from source on nightly, in buildStdDir.
       const crate = join(dir, `rust_${target}`);
@@ -244,29 +287,76 @@ async function checkGo() {
     writeFileSync(join(root, "go.mod"), "module bindcheck\n\ngo 1.21\n");
     for (const p of cases) {
       const pkg = `case_${p.index}`;
+      const binding = p.bindings.get("go")!;
       mkdirSync(join(root, pkg), { recursive: true });
-      writeFileSync(join(root, pkg, "binding.go"), p.bindings.get("go")!.code.replace("package bindings", `package ${pkg}`));
-      const struct = rootName(p);
+      writeFileSync(join(root, pkg, "binding.go"), binding.code.replace("package bindings", `package ${pkg}`));
+      writeFileSync(join(root, pkg, binding.example!.filename), binding.example!.code.replace("package bindings", `package ${pkg}`));
+      const struct = goExportedName(rootName(p));
       const asserts = [`package ${pkg}`, "", 'import "unsafe"', "", `var x ${struct}`, `var _ = [1]int{}[unsafe.Sizeof(x)-${p.expected.size}]`];
-      if (!p.expected.union) for (const [name, offset] of kept(p, "go")) asserts.push(`var _ = [1]int{}[unsafe.Offsetof(x.${["type", "func", "range", "map", "chan", "var", "go"].includes(name) ? `${name}_` : name})-${offset}]`);
+      if (!p.expected.union) for (const [name, offset] of kept(p, "go")) asserts.push(`var _ = [1]int{}[unsafe.Offsetof(x.${goExportedName(name)})-${offset}]`);
       writeFileSync(join(root, pkg, "check.go"), `${asserts.join("\n")}\n`);
     }
-    const output = await run("go", ["build", "./..."], { cwd: root, env: { ...process.env, GOOS: "linux", GOARCH: arch, CGO_ENABLED: "0" }, maxBuffer: 64 * 1024 * 1024 }).then(
-      () => "",
-      (e: { stderr?: string }) => e.stderr ?? String(e),
-    );
+    const go = (args: string[], env: NodeJS.ProcessEnv) =>
+      run("go", args, { cwd: root, env: { ...process.env, ...env, CGO_ENABLED: "0" }, maxBuffer: 64 * 1024 * 1024 }).then(
+        (r) => r.stdout,
+        (e: { stdout?: string; stderr?: string }) => `FAILED\n${e.stdout ?? ""}${e.stderr ?? ""}`,
+      );
+    const fail = (p: Prepared, why: string) => failures.get("go")!.set(p.index, `${failures.get("go")!.get(p.index) ?? ""}${why}\n`);
+    // As gofmt writes them: it lists the files it would change.
+    const unformatted = await run("gofmt", ["-l", "."], { cwd: root }).then((r) => r.stdout);
+    // Compiled for the GOARCH, the examples too; run on this machine's own.
+    const vetted = await go(["vet", "./..."], { GOOS: "linux", GOARCH: arch });
+    // Test binaries built into a directory of their own and run from there: go test removes its
+    // own, which Windows refuses while a scanner still holds the file.
+    let tested = "";
+    if (arch === goHost.arch) {
+      const bin = join(root, "testbin");
+      const built = await go(["test", "-c", "-o", `${bin}/`, "./..."], { GOOS: goHost.os, GOARCH: arch });
+      if (built.startsWith("FAILED")) tested = built;
+      else {
+        for (const p of cases) {
+          const exe = join(bin, `case_${p.index}.test${goHost.os === "windows" ? ".exe" : ""}`);
+          if (!existsSync(exe)) {
+            tested += `FAIL\tbindcheck/case_${p.index}\nno test binary was built\n`;
+            continue;
+          }
+          const out = await run(exe, [], { cwd: join(root, `case_${p.index}`), maxBuffer: 64 * 1024 * 1024 }).then(
+            () => "",
+            (e: { stdout?: string; stderr?: string }) => `${e.stdout ?? ""}${e.stderr ?? ""}`,
+          );
+          if (out) tested += `FAIL\tbindcheck/case_${p.index}\n${out}\n`;
+        }
+      }
+    }
     for (const p of cases) {
       ran.get("go")!.add(p.index);
-      const errors = output.split(/\r?\n/).filter((l) => l.includes(`case_${p.index}/`) || l.includes(`case_${p.index}\\`));
-      if (errors.length > 0) failures.get("go")!.set(p.index, errors.join("\n"));
+      const pkg = `case_${p.index}`;
+      const mine = (l: string) => l.includes(`${pkg}/`) || l.includes(`${pkg}\\`) || l.endsWith(`/${pkg}`) || new RegExp(`/${pkg}\\s`).test(l);
+      const errors = vetted.split(/\r?\n/).filter(mine);
+      if (errors.length > 0) fail(p, errors.join("\n"));
+      if (new RegExp(`^FAIL\\s+bindcheck/${pkg}\\b`, "m").test(tested)) fail(p, `go test failed:\n${tested.slice(0, 2000)}`);
+      if (unformatted.split(/\r?\n/).some(mine)) fail(p, "not formatted as gofmt formats it");
+    }
+    // A failure no case can be blamed for fails them all.
+    const blamed = cases.some((p) => failures.get("go")!.has(p.index));
+    for (const output of [vetted, tested]) {
+      const why = output.split(/\r?\n/).filter((l) => !/^ok\s/.test(l)).join("\n").slice(0, 2000);
+      if (output.startsWith("FAILED") && !blamed) for (const p of cases) fail(p, why);
     }
   }
 }
 
+/** The OS and architecture Go runs on here: the examples for that GOARCH run. */
+const goHost = (() => {
+  if (!toolchains.go) return { os: "", arch: "" };
+  const [os, arch] = execFileSync("go", ["env", "GOHOSTOS", "GOHOSTARCH"], { encoding: "utf8" }).trim().split(/\r?\n/);
+  return { os: os!, arch: arch! };
+})();
+
 async function checkPython() {
   const cases = prepared.filter((p) => !p.bindings.get("python-struct")!.error);
   const script = [
-    "import json, re, struct, ctypes",
+    "import contextlib, io, json, re, struct, ctypes, traceback",
     "def offsets(fmt, names):",
     "    order, out, prefix, it = fmt[0], {}, fmt[0], iter(names)",
     "    for count, code in re.findall(r'(\\d*)([a-zA-Z?])', fmt[1:]):",
@@ -287,18 +377,21 @@ async function checkPython() {
     script.push(
       `results[${p.index}] = {}`,
       "try:",
-      `    ns = {}`,
-      `    exec(${JSON.stringify(p.bindings.get("python-struct")!.code)}, ns)`,
+      // Run as a script: its layout checks, then its round trip (whose output is not the answer).
+      `    ns = {'__name__': '__main__'}`,
+      `    with contextlib.redirect_stdout(io.StringIO()):`,
+      `        exec(${JSON.stringify(p.bindings.get("python-struct")!.code)}, ns)`,
       `    results[${p.index}]['struct'] = {'size': struct.calcsize(ns['${constant}_FORMAT']), 'offsets': offsets(ns['${constant}_FORMAT'], ns['${constant}_FIELDS'])}`,
-      "except Exception as e:",
-      `    results[${p.index}]['struct'] = {'error': repr(e)}`,
+      "except Exception:",
+      `    results[${p.index}]['struct'] = {'error': traceback.format_exc(limit=-1)}`,
       "try:",
-      `    ns2 = {}`,
-      `    exec(${JSON.stringify(p.bindings.get("python-ctypes")!.code)}, ns2)`,
+      `    ns2 = {'__name__': '__main__'}`,
+      `    with contextlib.redirect_stdout(io.StringIO()):`,
+      `        exec(${JSON.stringify(p.bindings.get("python-ctypes")!.code)}, ns2)`,
       `    c = ns2['${root}']`,
       `    results[${p.index}]['ctypes'] = {'size': ctypes.sizeof(c), 'offsets': {f[0]: getattr(c, f[0]).offset for f in c._fields_}}`,
-      "except Exception as e:",
-      `    results[${p.index}]['ctypes'] = {'error': repr(e)}`,
+      "except Exception:",
+      `    results[${p.index}]['ctypes'] = {'error': traceback.format_exc(limit=-1)}`,
     );
   }
   script.push("print(json.dumps(results))");
@@ -336,16 +429,29 @@ async function checkCSharp() {
     '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><AllowUnsafeBlocks>true</AllowUnsafeBlocks><Nullable>disable</Nullable><ImplicitUsings>disable</ImplicitUsings><NoWarn>CS0649;CS0169</NoWarn></PropertyGroup></Project>',
   );
   const lines: string[] = [];
-  const main = ["public static class Program", "{", "    public static void Main()", "    {"];
+  const main = ["public static class Program", "{", "    public static void Main()", "    {", "        var stdout = System.Console.Out;"];
   for (const p of cases) {
     const ns = `Case${p.index}`;
-    lines.push(`namespace ${ns}`, "{", p.bindings.get("csharp")!.code, "}");
+    const binding = p.bindings.get("csharp")!;
+    lines.push(`namespace ${ns}`, "{", binding.code, "}", `namespace ${ns}`, "{", binding.example!.code, "}");
     const t = `${ns}.${rootName(p)}`;
     const fields = p.expected.union ? [] : kept(p, "csharp");
     main.push(
       `        System.Console.WriteLine("${p.index} " + System.Runtime.CompilerServices.Unsafe.SizeOf<${t}>()${fields
         .map(([name]) => ` + " ${name}=" + System.Runtime.InteropServices.Marshal.OffsetOf<${t}>(${JSON.stringify(csharpField(p, name))})`)
         .join("")});`,
+      // The round-trip example, its own output set aside.
+      "        try",
+      "        {",
+      "            System.Console.SetOut(System.IO.TextWriter.Null);",
+      `            ${ns}.${binding.example!.filename.replace(/\.cs$/, "")}.Run();`,
+      "            System.Console.SetOut(stdout);",
+      "        }",
+      "        catch (System.Exception e)",
+      "        {",
+      "            System.Console.SetOut(stdout);",
+      `            System.Console.WriteLine("${p.index} example: " + e.Message);`,
+      "        }",
     );
   }
   main.push("    }", "}");
@@ -366,6 +472,8 @@ async function checkCSharp() {
     const have = { size: Number(size), offsets: Object.fromEntries(pairs.map((x) => x.split("=")).map(([k, v]) => [k!, Number(v)])) };
     const want = { size: p.expected.size, offsets: Object.fromEntries(p.expected.union ? [] : kept(p, "csharp")) };
     if (JSON.stringify(sortKeys(have)) !== JSON.stringify(sortKeys(want))) failures.get("csharp")!.set(p.index, `got ${JSON.stringify(have)}`);
+    const example = output.split(/\r?\n/).find((l) => l.startsWith(`${p.index} example: `));
+    if (example) failures.get("csharp")!.set(p.index, `${failures.get("csharp")!.get(p.index) ?? ""}${example}\n`);
   }
 }
 
@@ -373,7 +481,8 @@ async function checkCSharp() {
 function csharpField(p: Prepared, name: string): string {
   const entry = p.result.members.find((m) => m.member.name === name)!;
   const arrayOfRecords = entry.member.arraySize !== undefined && entry.member.isNested && !entry.member.type.includes("*");
-  return arrayOfRecords ? `${name}_0` : name === rootName(p) ? `${name}_` : name;
+  // A member may not have its struct's name, nor that of the root's FromBytes and ToBytes.
+  return arrayOfRecords ? `${name}_0` : name === rootName(p) || name === "FromBytes" || name === "ToBytes" ? `${name}_` : name;
 }
 
 const sortKeys = (v: { size: number; offsets: Record<string, number> }) => ({ size: v.size, offsets: Object.fromEntries(Object.entries(v.offsets).sort(([a], [b]) => a.localeCompare(b))) });
@@ -392,7 +501,8 @@ function record(language: BindingLanguage, cases: Prepared[], output: string, fi
   };
   const lines = output.split(/\r?\n/);
   lines.forEach((l, k) => {
-    const named = /case (\d+):/.exec(l);
+    // A check's own message, or a failed test, which zig and Rust name by its path.
+    const named = /case (\d+):/.exec(l) ?? (/fail|panicked|^----/i.test(l) ? /\bcase_(\d+)(?:\.test\.|::)/.exec(l) : null);
     const at = /:(\d+):\d+/.exec(l) ?? /--> [^:]+:(\d+):/.exec(lines[k + 1] ?? "");
     const index = named ? Number(named[1]) : at && /error/.test(l) ? caseAt(Number(at[1])) : undefined;
     if (index !== undefined) {
@@ -458,7 +568,8 @@ for (const language of LANGUAGES) {
           expect.fail(`not checked: ${unavailable.get(language)!.get(p.index) ?? `no ${language} compiler for this target here`}`);
         }
         // What the binding must have: the C layout's size and the offsets of the members it keeps.
-        const want: Confirmed = { code: digest(binding.code), size: p.expected.size, offsets: Object.fromEntries(p.expected.union ? [] : kept(p, language)) };
+        // The digest is of every file the binding is: the example is compiled with it.
+        const want: Confirmed = { code: digest(binding.code + (binding.example?.code ?? "")), size: p.expected.size, offsets: Object.fromEntries(p.expected.union ? [] : kept(p, language)) };
         let now: Answer<Confirmed> | undefined;
         if (compiled) {
           const failure = failures.get(language)!.get(p.index);

@@ -14,7 +14,7 @@ export const GO_OPTIMIZED_SUFFIX = 'Optimized';
  * Rows of cells in aligned columns, the way gofmt's tabwriter does it: column c is aligned
  * across each run of consecutive rows that have a cell after column c, one space apart.
  */
-function alignColumns(rows: readonly string[][]): string[] {
+export function alignColumns(rows: readonly string[][]): string[] {
   const out = rows.map(() => '');
   const columns = Math.max(0, ...rows.map((r) => r.length));
   for (let c = 0; c < columns; c++) {

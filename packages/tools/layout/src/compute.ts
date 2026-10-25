@@ -124,7 +124,6 @@ export function computeVerificationCode(spec: LayoutSpec, input: string): ToolRe
 
   return {
     data,
-    text: code,
     files: [
       {
         filename,
@@ -172,8 +171,11 @@ export function computeBindings(spec: LayoutSpec, input: string): ToolResult<Lay
   ];
   return {
     data,
-    text: binding.code,
-    files: [{ filename: binding.filename, content: binding.code, mimeType: "text/plain", label: `${bindingLanguages[language].label} binding` }],
+    files: [
+      { filename: binding.filename, content: binding.code, mimeType: "text/plain", label: `${bindingLanguages[language].label} binding` },
+      ...(binding.example ? [{ filename: binding.example.filename, content: binding.example.code, mimeType: "text/plain", label: `${bindingLanguages[language].label} example` }] : []),
+    ],
     fields,
+    working: binding.usage.map((step, k) => `${k + 1}. ${step}`).join("\n"),
   };
 }

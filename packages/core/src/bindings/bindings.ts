@@ -1,6 +1,7 @@
 import type { CalculationResult, StructMember } from '../types';
 import type { ResolvedPlatform } from '../abi/resolve-selection';
 import type { PaddingCalculator } from '../layout/padding-calculator';
+import { alignColumns } from '../go/codegen';
 
 /**
  * Bindings: the laid-out C struct written in another language so that it has exactly the same
@@ -12,17 +13,32 @@ import type { PaddingCalculator } from '../layout/padding-calculator';
 export type BindingLanguage = 'rust' | 'zig' | 'go' | 'csharp' | 'python-struct' | 'python-ctypes';
 
 export const bindingLanguages: Record<BindingLanguage, { label: string; extension: string; summary: string }> = {
-  rust: { label: 'Rust', extension: 'rs', summary: '#[repr(C)] structs and unions, for the target triple named in the file.' },
-  zig: { label: 'Zig', extension: 'zig', summary: 'extern structs and unions, with field alignments where C has its own.' },
-  go: { label: 'Go', extension: 'go', summary: 'Structs with explicit padding fields, for the GOARCH named in the file.' },
-  csharp: { label: 'C#', extension: 'cs', summary: '[StructLayout(LayoutKind.Explicit)] with every field at its offset: the same on any machine.' },
-  'python-struct': { label: 'Python struct', extension: 'py', summary: 'struct format strings in the target byte order with explicit pad bytes, to read and write raw data.' },
-  'python-ctypes': { label: 'Python ctypes', extension: 'py', summary: 'ctypes Structures in the target byte order, packed with explicit padding: the same on any machine.' },
+  rust: { label: 'Rust', extension: 'rs', summary: '#[repr(C)] structs and unions for the target triple named in the file, which checks its layout when compiled, with from_bytes and a test.' },
+  zig: { label: 'Zig', extension: 'zig', summary: 'extern structs and unions, with field alignments where C has its own; the file checks its layout when compiled, and has a test.' },
+  go: { label: 'Go', extension: 'go', summary: 'Structs with every padding byte a field, for the GOARCH named in the file, which checks its layout when compiled; read and written with encoding/binary, with an example test.' },
+  csharp: { label: 'C#', extension: 'cs', summary: '[StructLayout(LayoutKind.Explicit)] with every field at its offset: the same on any machine. FromBytes and ToBytes, with a round-trip example.' },
+  'python-struct': { label: 'Python struct', extension: 'py', summary: 'struct format strings in the target byte order with explicit pad bytes, to read and write raw data, with a round trip when run.' },
+  'python-ctypes': { label: 'Python ctypes', extension: 'py', summary: 'ctypes Structures in the target byte order, packed with explicit padding: the same on any machine. Checked on import, with a round trip when run.' },
 };
 
+export interface BindingFile {
+  filename: string;
+  code: string;
+}
+
 export interface BindingOutput {
+  /**
+   * The binding: the types, a check of their layout where the language can make one (at compile
+   * time in Rust, Zig and Go, on import in Python), a way to read and write them as raw bytes, and
+   * a round-trip example where the language keeps examples with the code (Rust and Zig tests,
+   * Python's `__main__`).
+   */
   code: string;
   filename: string;
+  /** The example, where the language keeps it in a file of its own (Go's `_test.go`, C#). */
+  example?: BindingFile;
+  /** How to use it, step by step: build it, read and write the bytes, run the example. */
+  usage: string[];
   /** What the binding cannot carry over, said plainly: bit-fields as bytes, a different alignment. */
   notes: string[];
   /** Set when no exact binding exists for this target or struct; code is then empty. */
@@ -178,10 +194,11 @@ type Placed = Array<{ item: Item; bytes?: boolean } | { pad: number; name: strin
 /**
  * Place the items as a language with natural alignment does (each at the next offset its
  * `align` allows), with explicit padding where C leaves more. A field the language would place
- * later than C did (C packed it) is carried as bytes. Returns the placement and the language's
- * own size and alignment for the record without an alignment attribute.
+ * later than C did (C packed it) is carried as bytes. With `explicit`, every gap is a padding
+ * field, the trailing one too. Returns the placement and the language's own size and alignment
+ * for the record without an alignment attribute.
  */
-function placeNatural(record: Record_, align: (item: Item) => number): { placed: Placed; size: number; align: number } {
+function placeNatural(record: Record_, align: (item: Item) => number, explicit = false): { placed: Placed; size: number; align: number } {
   const placed: Placed = [];
   let pos = 0;
   let maxAlign = 1;
@@ -195,20 +212,21 @@ function placeNatural(record: Record_, align: (item: Item) => number): { placed:
       pos = Math.max(pos, item.size);
       continue;
     }
-    if (alignTo(pos, a) > item.offset) {
-      // The language would not put it as early as C does: carry its bytes, which align to 1.
+    if (item.offset % a !== 0) {
+      // The language cannot put it where C does: carry its bytes, which align to 1.
       bytes = true;
       a = 1;
     }
-    // Padding only where the language would not reach C's offset by aligning the field itself.
-    if (alignTo(pos, a) < item.offset) {
+    // Padding where the language would not reach C's offset by aligning the field itself, or
+    // every gap when the language must see each padding byte (Go's encoding/binary).
+    if (explicit ? pos < item.offset : alignTo(pos, a) < item.offset) {
       placed.push({ pad: item.offset - pos, name: `_pad${pads++}` });
     }
     placed.push(bytes ? { item, bytes } : { item });
     maxAlign = Math.max(maxAlign, a);
     pos = item.offset + item.size;
   }
-  if (alignTo(pos, maxAlign) < record.size) {
+  if (explicit ? pos < record.size : alignTo(pos, maxAlign) < record.size) {
     placed.push({ pad: record.size - pos, name: `_pad${pads++}` });
     pos = record.size;
   }
@@ -220,6 +238,108 @@ const alignTo = (n: number, a: number) => Math.ceil(n / Math.max(1, a)) * Math.m
 function bitsComment(item: Extract<Item, { kind: 'bits' }>, bigEndian: boolean): string {
   const order = bigEndian ? 'from the most significant bit of its first byte' : 'from the least significant bit of its first byte';
   return `bit-fields, bits counted ${order}: ${item.fields.map((f) => `${f.name} ${f.bit}..${f.bit + f.width - 1}`).join(', ')}`;
+}
+
+// ------------------------------------------------------------------ examples
+
+/** A step from a record to one of its values: a member, an array element, or a union's bytes. */
+type Step =
+  | { kind: 'field'; record: Record_; item: Item }
+  | { kind: 'index'; index: number[]; flat: number; type: Extract<BType, { kind: 'array' }> }
+  | { kind: 'raw'; record: Record_ };
+
+type LeafType = Extract<BType, { kind: 'int' | 'float' | 'bool' | 'pointer' | 'bytes' }>;
+
+/** One value an example sets: where it is, its type, and the value. */
+interface Leaf {
+  path: Step[];
+  offset: number;
+  type: LeafType;
+  /** A number, true for a bool, or bytes. Function pointers are null (0): no function is there. */
+  value: number | boolean | number[];
+  /** Reached through a union member, which some languages must say (Rust's unsafe). */
+  inUnion: boolean;
+}
+
+interface LeafOptions {
+  /** Items the language carries as their bytes: placed where their alignment does not allow. */
+  asBytes?: ReadonlySet<Item>;
+  /** Unions the language carries as their bytes (Go). */
+  unionsAsBytes?: boolean;
+}
+
+/** The example's value for the k-th value: small enough for any integer, exact as a float. */
+function sampleValue(t: LeafType, k: number): Leaf['value'] {
+  const small = ((k - 1) % 100) + 1;
+  switch (t.kind) {
+    case 'int': return small;
+    case 'float': return k + 0.5;
+    case 'bool': return true;
+    case 'pointer': return t.function ? 0 : 16 * small;
+    case 'bytes': return Array.from({ length: t.size }, (_, j) => (k + j) % 256);
+  }
+}
+
+/**
+ * The values an example sets in `root`: every scalar, the first and last element of each array,
+ * and a union's first member (a union holds one at a time). Flexible array members hold none.
+ */
+function leaves(root: Record_, options: LeafOptions = {}): Leaf[] {
+  const out: Leaf[] = [];
+  const push = (path: Step[], offset: number, type: LeafType, inUnion: boolean) => out.push({ path, offset, type, value: sampleValue(type, out.length + 1), inUnion });
+  const walkRecord = (r: Record_, base: number, path: Step[], inUnion: boolean) => {
+    if (r.union && options.unionsAsBytes) {
+      push([...path, { kind: 'raw', record: r }], base, { kind: 'bytes', size: r.size }, inUnion);
+      return;
+    }
+    for (const item of r.union ? r.items.slice(0, 1) : r.items) {
+      const at: Step[] = [...path, { kind: 'field', record: r, item }];
+      if (item.kind === 'bits' || options.asBytes?.has(item)) push(at, base + item.offset, { kind: 'bytes', size: item.size }, inUnion || r.union);
+      else walkType(item.type, base + item.offset, item.size, at, inUnion || r.union);
+    }
+  };
+  const walkType = (t: BType, offset: number, size: number, path: Step[], inUnion: boolean) => {
+    switch (t.kind) {
+      case 'record':
+        walkRecord(t.record, offset, path, inUnion);
+        return;
+      case 'array': {
+        const count = t.dims.reduce((a, b) => a * b, 1);
+        if (count === 0) return;
+        const step = size / count;
+        for (const flat of count === 1 ? [0] : [0, count - 1]) {
+          const index = t.dims.map((_, d) => Math.floor(flat / t.dims.slice(d + 1).reduce((a, b) => a * b, 1)) % t.dims[d]!);
+          walkType(t.element, offset + flat * step, step, [...path, { kind: 'index', index, flat, type: t }], inUnion);
+        }
+        return;
+      }
+      default:
+        push(path, offset, t, inUnion);
+    }
+  };
+  walkRecord(root, 0, [], false);
+  return out;
+}
+
+/** The offset of every bool outside a union, whose bytes must be 0 or 1 (unions take any bytes). */
+function boolOffsets(r: Record_, base = 0): number[] {
+  if (r.union) return [];
+  const ofType = (t: BType, offset: number, size: number): number[] => {
+    if (t.kind === 'bool') return [offset];
+    if (t.kind === 'record') return boolOffsets(t.record, offset);
+    if (t.kind !== 'array') return [];
+    const count = t.dims.reduce((a, b) => a * b, 1);
+    return Array.from({ length: count }, (_, k) => ofType(t.element, offset + (k * size) / count, size / count)).flat();
+  };
+  return r.items.flatMap((item) => (item.kind === 'field' ? ofType(item.type, base + item.offset, item.size) : []));
+}
+
+/** A name not yet taken, made so by trailing underscores; it is then taken. */
+function unique(name: string, taken: Set<string>): string {
+  let n = name;
+  while (taken.has(n)) n += '_';
+  taken.add(n);
+  return n;
 }
 
 // ------------------------------------------------------------------ targets per language
@@ -290,11 +410,11 @@ export function generateBindings(result: CalculationResult, platform: ResolvedPl
     const root = builder.record(result, result.struct.name);
     const records = builder.records; // dependencies first: each is pushed after what it contains
     const ctx: EmitContext = { platform, notes: builder.notes, bigEndian: platform.architecture.endianness === 'big', pointerSize: platform.architecture.pointerSize, root };
-    const code = EMITTERS[language](records, ctx);
-    return { code, filename, notes: [...new Set(ctx.notes)] };
+    const { code, example, usage } = EMITTERS[language](records, ctx);
+    return { code, filename, ...(example && { example }), usage, notes: [...new Set(ctx.notes)] };
   } catch (err) {
     if (!(err instanceof BindingError)) throw err;
-    return { code: '', filename, notes: [], error: err.message };
+    return { code: '', filename, usage: [], notes: [], error: err.message };
   }
 }
 
@@ -306,10 +426,15 @@ interface EmitContext {
   root: Record_;
 }
 
-type Emitter = (records: Record_[], ctx: EmitContext) => string;
+type Emitter = (records: Record_[], ctx: EmitContext) => { code: string; example?: BindingFile; usage: string[] };
 
-const platformLine = (ctx: EmitContext) =>
-  `${ctx.platform.architecture.displayName}, ${ctx.platform.dataModel}, ${ctx.platform.os}${ctx.bigEndian ? ', big-endian' : ''}`;
+/** The target, as the files name it; the architecture's name says when it is big-endian. */
+const platformLine = (ctx: EmitContext) => `${ctx.platform.architecture.displayName}, ${ctx.platform.dataModel}, ${ctx.platform.os}`;
+
+const byteOrder = (ctx: EmitContext) => (ctx.bigEndian ? 'big-endian' : 'little-endian');
+
+/** Numbers as a comma-separated list, for the literals of byte arrays. */
+const list = (values: number[]) => values.join(', ');
 
 // ------------------------------------------------------------------ Rust
 
@@ -331,10 +456,22 @@ function rustType(t: BType, bytes: boolean, size: number): string {
 /** A type with no Rust equivalent, carried as a byte array: aligned to 1 in Rust. */
 const carriedAsBytes = (t: BType): boolean => t.kind === 'bytes' || (t.kind === 'array' && carriedAsBytes(t.element));
 
+/** The Rust (or Zig, Go) expression for a value under `base`: its fields and indices. */
+function valuePath(base: string, path: Step[], name: (s: Extract<Step, { kind: 'field' }>) => string): string {
+  return base + path.map((s) => (s.kind === 'field' ? `.${name(s)}` : s.kind === 'index' ? s.index.map((i) => `[${i}]`).join('') : '.Raw')).join('');
+}
+
 const emitRust: Emitter = (records, ctx) => {
   const triple = rustTarget(ctx.platform);
   if (!triple) throw new BindingError(`Rust has no target for ${platformLine(ctx)}.`);
-  const out = [`// ${ctx.root.cName} on ${platformLine(ctx)}.`, `// #[repr(C)] follows the target's C layout: compile it for ${triple}.`, ''];
+  const root = ctx.root;
+  const out = [
+    `// ${root.cName} on ${platformLine(ctx)}.`,
+    `// #[repr(C)] follows the target's C layout: compile it for ${triple}, where the layout is checked.`,
+    `// ${root.name}::from_bytes reads one from the bytes the target stores.`,
+    '',
+  ];
+  const carried = new Set<Item>();
   for (const r of records) {
     const pack = r.pack;
     const { placed, align } = placeNatural(r, (item) => {
@@ -352,7 +489,10 @@ const emitRust: Emitter = (records, ctx) => {
       if ('pad' in p) out.push(`    pub ${p.name}: [u8; ${p.pad}],`);
       else if (p.item.kind === 'bits') out.push(`    /// ${bitsComment(p.item, ctx.bigEndian)}`, `    pub ${ident(p.item.name, 'rust')}: [u8; ${p.item.size}],`);
       else {
-        if (p.bytes) ctx.notes.push(`'${p.item.name}' in ${r.cName} is at an offset Rust's alignment for it does not allow, so it is carried as ${p.item.size} bytes.`);
+        if (p.bytes) {
+          carried.add(p.item);
+          ctx.notes.push(`'${p.item.name}' in ${r.cName} is at an offset Rust's alignment for it does not allow, so it is carried as ${p.item.size} bytes.`);
+        }
         out.push(`    pub ${ident(p.item.name, 'rust')}: ${rustType(p.item.type, p.bytes === true, p.item.size)}, // offset ${p.item.offset}`);
       }
     }
@@ -362,7 +502,101 @@ const emitRust: Emitter = (records, ctx) => {
     }
     out.push('}', '');
   }
-  return out.join('\n');
+
+  out.push('// The layout, checked when this file is compiled: built for another target, it fails here.', 'const _: () = {');
+  for (const r of records) {
+    out.push(`    assert!(core::mem::size_of::<${r.name}>() == ${r.size});`);
+    for (const item of r.items) out.push(`    assert!(core::mem::offset_of!(${r.name}, ${ident(item.name, 'rust')}) == ${item.offset});`);
+  }
+  out.push('};', '');
+
+  // read_unaligned is sound only for bytes that are a valid value of every field: any are, but a
+  // bool's, which must be 0 or 1 (a union's fields hold any bytes).
+  const bools = boolOffsets(root);
+  out.push(`impl ${root.name} {`);
+  if (bools.length > 0) {
+    out.push(
+      `    /// One ${root.name} from the bytes the target stores for it, or None where a bool is neither 0 nor 1.`,
+      `    pub fn from_bytes(bytes: &[u8; ${root.size}]) -> Option<Self> {`,
+      `        const BOOLS: [usize; ${bools.length}] = [${list(bools)}];`,
+      '        if BOOLS.iter().any(|&i| bytes[i] > 1) {',
+      '            return None;',
+      '        }',
+      `        // SAFETY: the array is as large as ${root.name}, its bools are 0 or 1, and any bytes are a value of its other fields.`,
+      '        Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) })',
+    );
+  } else {
+    out.push(
+      `    /// One ${root.name} from the bytes the target stores for it.`,
+      `    pub fn from_bytes(bytes: &[u8; ${root.size}]) -> Self {`,
+      `        // SAFETY: the array is as large as ${root.name}, and any bytes are a value of each of its fields.`,
+      '        unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) }',
+    );
+  }
+  out.push('    }', '}', '');
+
+  const values = leaves(root, { asBytes: carried });
+  const suffix = ctx.bigEndian ? 'be' : 'le';
+  const writes: string[] = [];
+  const checks: string[] = [];
+  for (const l of values) {
+    const range = `bytes[${l.offset}..${l.offset + (l.type.kind === 'bool' ? 1 : l.type.size)}]`;
+    const read = l.inUnion ? `unsafe { ${valuePath('value', l.path, (s) => ident(s.item.name, 'rust'))} }` : `{ ${valuePath('value', l.path, (s) => ident(s.item.name, 'rust'))} }`;
+    switch (l.type.kind) {
+      case 'int':
+        writes.push(`${range}.copy_from_slice(&${l.value}${rustInt(l.type)}.to_${suffix}_bytes());`);
+        checks.push(`assert_eq!(${read}, ${l.value});`);
+        break;
+      case 'float':
+        writes.push(`${range}.copy_from_slice(&${l.value}f${l.type.size * 8}.to_${suffix}_bytes());`);
+        checks.push(`assert_eq!(${read}, ${l.value});`);
+        break;
+      case 'bool':
+        writes.push(`bytes[${l.offset}] = 1;`);
+        checks.push(`assert!(${read});`);
+        break;
+      case 'pointer':
+        if (l.type.function) checks.push(`assert!(${read}.is_none());`);
+        else {
+          writes.push(`${range}.copy_from_slice(&${l.value}u${l.type.size * 8}.to_${suffix}_bytes());`);
+          checks.push(`assert_eq!(${read} as usize, ${l.value});`);
+        }
+        break;
+      case 'bytes':
+        writes.push(`${range}.copy_from_slice(&[${list(l.value as number[])}]);`);
+        checks.push(`assert_eq!(${read}, [${list(l.value as number[])}]);`);
+        break;
+    }
+  }
+  // A test needs std and a machine to run on: a bare-metal target has neither.
+  const hosted = ctx.platform.os !== 'none';
+  if (hosted) {
+    out.push(
+      '#[cfg(test)]',
+      `mod ${unique('tests', new Set(records.map((r) => r.name)))} {`,
+      '    use super::*;',
+      '',
+      '    #[test]',
+      '    fn from_bytes_reads_each_field() {',
+      `        // ${root.cName} as the target stores it: each value at its offset, ${byteOrder(ctx)}.`,
+      `        let ${writes.length > 0 ? 'mut ' : ''}bytes = [0u8; ${root.size}];`,
+      ...writes.map((w) => `        ${w}`),
+      `        let value = ${root.name}::from_bytes(&bytes)${bools.length > 0 ? '.unwrap()' : ''};`,
+      ...checks.map((c) => `        ${c}`),
+      '    }',
+      '}',
+      '',
+    );
+  }
+  const file = `${root.name}.rs`;
+  return {
+    code: out.join('\n'),
+    usage: [
+      `Add ${file} to a crate built for ${triple}: compiling it checks the layout, and fails for another target.`,
+      `${root.name}::from_bytes(&bytes) reads one from the bytes the target stores.`,
+      ...(hosted ? [`cargo test runs its round trip, on a ${triple} machine.`] : []),
+    ],
+  };
 };
 
 // ------------------------------------------------------------------ Zig
@@ -383,7 +617,14 @@ function zigType(t: BType, bytes: boolean, size: number): string {
 const emitZig: Emitter = (records, ctx) => {
   const target = zigTarget(ctx.platform);
   if (!target) throw new BindingError(`Zig has no target for ${platformLine(ctx)}.`);
-  const out = [`// ${ctx.root.cName} on ${platformLine(ctx)}.`, `// extern structs follow the target's C layout: build for -target ${target}.`, ''];
+  const root = ctx.root;
+  const out = [
+    `// ${root.cName} on ${platformLine(ctx)}.`,
+    `// extern structs follow the target's C layout: build for -target ${target}, where the layout is checked.`,
+    `// std.mem.bytesToValue(${root.name}, &bytes) reads one from the bytes the target stores; std.mem.toBytes(value) gives them.`,
+    '',
+  ];
+  const carried = new Set<Item>();
   for (const r of records) {
     // Each field gets the alignment C gives it in this struct, so a natural placement reproduces C.
     const { placed, align } = placeNatural(r, (item) => (item.kind === 'bits' ? 1 : item.align));
@@ -396,6 +637,7 @@ const emitZig: Emitter = (records, ctx) => {
       if ('pad' in p) out.push(`    ${p.name}: [${p.pad}]u8${raise ? ` align(${raise})` : ''},`);
       else if (p.item.kind === 'bits') out.push(`    /// ${bitsComment(p.item, ctx.bigEndian)}`, `    ${ident(p.item.name, 'zig')}: [${p.item.size}]u8${raise ? ` align(${raise})` : ''},`);
       else {
+        if (p.bytes) carried.add(p.item);
         // Always the alignment C gives it here, so no field depends on Zig's own for its type.
         const a = raise ?? (p.bytes ? 1 : p.item.align);
         out.push(`    ${ident(p.item.name, 'zig')}: ${zigType(p.item.type, p.bytes === true, p.item.size)} align(${a}), // offset ${p.item.offset}`);
@@ -404,27 +646,111 @@ const emitZig: Emitter = (records, ctx) => {
     if (r.union) out.push(`    _size: [${r.size}]u8,`);
     out.push('};', '');
   }
-  return out.join('\n');
+
+  out.push('// The layout, checked when this file is compiled: built for another target, it fails here.', 'comptime {');
+  for (const r of records) {
+    out.push(`    if (@sizeOf(${r.name}) != ${r.size}) @compileError("${r.name} is not ${r.size} bytes on this target");`);
+    // @offsetOf takes a struct; a union's members are all at 0.
+    if (!r.union) for (const item of r.items) out.push(`    if (@offsetOf(${r.name}, "${item.name}") != ${item.offset}) @compileError("${r.name}.${item.name} is not at offset ${item.offset} on this target");`);
+  }
+  out.push('}', '');
+
+  // The test's locals may not shadow a declaration of the file: Zig forbids it.
+  const taken = new Set(records.map((r) => r.name));
+  const std = unique('std', taken);
+  const bytes = unique('bytes', taken);
+  const value = unique('value', taken);
+  const endian = ctx.bigEndian ? '.big' : '.little';
+  const writes: string[] = [];
+  const checks: string[] = [];
+  for (const l of leaves(root, { asBytes: carried })) {
+    const range = `${bytes}[${l.offset}..${l.offset + (l.type.kind === 'bool' ? 1 : l.type.size)}]`;
+    const read = valuePath(value, l.path, (s) => ident(s.item.name, 'zig'));
+    switch (l.type.kind) {
+      case 'int': {
+        const t = `${l.type.signed ? 'i' : 'u'}${l.type.size * 8}`;
+        writes.push(`${std}.mem.writeInt(${t}, ${range}, ${l.value}, ${endian});`);
+        checks.push(`try ${std}.testing.expectEqual(@as(${t}, ${l.value}), ${read});`);
+        break;
+      }
+      case 'float': {
+        const bits = l.type.size * 8;
+        writes.push(`${std}.mem.writeInt(u${bits}, ${range}, @bitCast(@as(f${bits}, ${l.value})), ${endian});`);
+        checks.push(`try ${std}.testing.expectEqual(@as(f${bits}, ${l.value}), ${read});`);
+        break;
+      }
+      case 'bool':
+        writes.push(`${bytes}[${l.offset}] = 1;`);
+        checks.push(`try ${std}.testing.expect(${read});`);
+        break;
+      case 'pointer':
+        if (l.type.function) checks.push(`try ${std}.testing.expect(${read} == null);`);
+        else {
+          writes.push(`${std}.mem.writeInt(u${l.type.size * 8}, ${range}, ${l.value}, ${endian});`);
+          checks.push(`try ${std}.testing.expectEqual(@as(usize, ${l.value}), @intFromPtr(${read}));`);
+        }
+        break;
+      case 'bytes':
+        writes.push(`@memcpy(${range}, &[_]u8{ ${list(l.value as number[])} });`);
+        checks.push(`try ${std}.testing.expectEqualSlices(u8, &[_]u8{ ${list(l.value as number[])} }, &${read});`);
+        break;
+    }
+  }
+  // A test needs an OS to run on (std.testing writes through it): a bare-metal target has none.
+  const hosted = ctx.platform.os !== 'none';
+  if (hosted) {
+    out.push(
+      `test "${root.name} from the bytes the target stores" {`,
+      `    const ${std} = @import("std");`,
+      `    // ${root.cName} as the target stores it: each value at its offset, ${byteOrder(ctx)}.`,
+      `    ${writes.length > 0 ? 'var' : 'const'} ${bytes} = [_]u8{0} ** ${root.size};`,
+      ...writes.map((w) => `    ${w}`),
+      `    const ${value} = ${std}.mem.bytesToValue(${root.name}, &${bytes});`,
+      ...checks.map((c) => `    ${c}`),
+      '}',
+      '',
+    );
+  }
+  return {
+    code: out.join('\n'),
+    usage: [
+      `Build ${root.name}.zig with -target ${target}: compiling it checks the layout, and fails for another target.`,
+      `std.mem.bytesToValue(${root.name}, &bytes) reads one from the bytes the target stores; std.mem.toBytes(value) gives them.`,
+      ...(hosted ? [`zig test ${root.name}.zig -target ${target} runs its round trip, on a ${target.split(' ')[0]} machine.`] : []),
+    ],
+  };
 };
 
 // ------------------------------------------------------------------ Go
 
-function goType(t: BType, bytes: boolean, size: number): string {
-  if (bytes) return `[${size}]byte`;
-  switch (t.kind) {
-    case 'int': return `${t.signed ? 'int' : 'uint'}${t.size * 8}`;
-    case 'float': return `float${t.size * 8}`;
-    case 'bool': return 'bool';
-    case 'pointer': return 'uintptr';
-    case 'record': return t.record.name;
-    case 'bytes': return `[${t.size}]byte`;
-    case 'array': return `${t.dims.map((d) => `[${d}]`).join('')}${goType(t.element, false, 0)}`;
-  }
+/** A C name exported in Go, as encoding/binary needs: an upper-case first letter, or an X before a name that starts with none. */
+export function goExportedName(name: string): string {
+  if (/^[a-z]/.test(name)) return name[0]!.toUpperCase() + name.slice(1);
+  return /^[A-Z]/.test(name) ? name : `X${name}`;
 }
 
 const emitGo: Emitter = (records, ctx) => {
   const target = goTarget(ctx.platform);
   if (!target) throw new BindingError(`Go has no port for ${platformLine(ctx)}.`);
+  const root = ctx.root;
+  const taken = new Set<string>();
+  const typeName = new Map(records.map((r) => [r, unique(goExportedName(r.name), taken)] as const));
+  const read = unique(`Read${typeName.get(root)}`, taken);
+  const write = unique(`Write${typeName.get(root)}`, taken);
+  const fieldName = new Map<Item, string>();
+  const goType = (t: BType, bytes: boolean, size: number): string => {
+    if (bytes) return `[${size}]byte`;
+    switch (t.kind) {
+      case 'int': return `${t.signed ? 'int' : 'uint'}${t.size * 8}`;
+      case 'float': return `float${t.size * 8}`;
+      case 'bool': return 'bool';
+      // An integer of the target's pointer size: encoding/binary takes fixed sizes only.
+      case 'pointer': return `uint${t.size * 8}`;
+      case 'record': return typeName.get(t.record)!;
+      case 'bytes': return `[${t.size}]byte`;
+      case 'array': return `${t.dims.map((d) => `[${d}]`).join('')}${goType(t.element, false, 0)}`;
+    }
+  };
   const goAligns = new Map<Record_, number>();
   const goAlign = (t: BType): number => {
     switch (t.kind) {
@@ -435,33 +761,129 @@ const emitGo: Emitter = (records, ctx) => {
       case 'array': return goAlign(t.element);
     }
   };
-  const out = [`// ${ctx.root.cName} on ${platformLine(ctx)}, for GOARCH=${target.arch}.`, '// Padding fields give each member its C offset; Go would not add the same padding itself.', '', 'package bindings', ''];
+  const order = ctx.bigEndian ? 'binary.BigEndian' : 'binary.LittleEndian';
+  const out = [
+    `// ${root.cName} on ${platformLine(ctx)}, for GOARCH=${target.arch}.`,
+    `// Every padding byte is a field, so the layout is the same in memory and in encoding/binary:`,
+    `// ${read} and ${write} read and write one as the target stores it.`,
+    '',
+    'package bindings',
+    '',
+    'import (',
+    '\t"encoding/binary"',
+    '\t"io"',
+    '\t"unsafe"',
+    ')',
+    '',
+  ];
+  const carried = new Set<Item>();
   for (const r of records) {
+    const name = typeName.get(r)!;
     if (r.union) {
       // Go has no unions: the union's bytes, with what it holds in a comment.
-      out.push(`// ${r.cName}: a union of ${r.items.map((i) => i.name).join(', ')}.`, `type ${r.name} struct {`, `\tRaw [${r.size}]byte`, '}', '');
+      out.push(`// ${name} is ${r.cName}, a union of ${r.items.map((i) => i.name).join(', ')}.`, `type ${name} struct {`, `\tRaw [${r.size}]byte`, '}', '');
       ctx.notes.push(`Go has no unions: ${r.cName} is its ${r.size} bytes.`);
       goAligns.set(r, 1);
       continue;
     }
     const items = r.items.filter((i) => !(i.kind === 'field' && i.type.kind === 'array' && i.type.dims[0] === 0));
     if (items.length < r.items.length) ctx.notes.push(`Go puts padding after a zero-size last field, so ${r.cName}'s flexible array member is left out.`);
-    const { placed, size, align } = placeNatural({ ...r, items }, (item) => (item.kind === 'bits' ? 1 : goAlign(item.type)));
+    const { placed, size, align } = placeNatural({ ...r, items }, (item) => (item.kind === 'bits' ? 1 : goAlign(item.type)), true);
     goAligns.set(r, align);
     if (size !== r.size) throw new BindingError(`Go would make ${r.cName} ${size} bytes, not ${r.size}: its alignment for a member differs from C's.`);
     if (align < r.align) ctx.notes.push(`Go aligns ${r.cName} to ${align}, C to ${r.align}: its size and member offsets are the same, but a variable of it may start at a different address.`);
-    out.push(`type ${r.name} struct {`);
+    const fields = new Set<string>();
+    // Cells of each line, aligned as gofmt aligns them; a comment on a line of its own is one cell.
+    const rows: string[][] = [];
     for (const p of placed) {
-      if ('pad' in p) out.push(`\t_ [${p.pad}]byte`);
-      else if (p.item.kind === 'bits') out.push(`\t// ${bitsComment(p.item, ctx.bigEndian)}`, `\t${ident(p.item.name, 'go')} [${p.item.size}]byte`);
+      if ('pad' in p) {
+        rows.push(['_', `[${p.pad}]byte`]);
+        continue;
+      }
+      const field = unique(goExportedName(p.item.name), fields);
+      fieldName.set(p.item, field);
+      const comment = `// ${field === p.item.name ? '' : `${p.item.name}, `}offset ${p.item.offset}`;
+      if (p.item.kind === 'bits') rows.push([`// ${bitsComment(p.item, ctx.bigEndian)}`], [field, `[${p.item.size}]byte`, comment]);
       else {
-        if (p.bytes) ctx.notes.push(`'${p.item.name}' in ${r.cName} is at an offset Go's alignment for it does not allow, so it is carried as ${p.item.size} bytes.`);
-        out.push(`\t${ident(p.item.name, 'go')} ${goType(p.item.type, p.bytes === true, p.item.size)} // offset ${p.item.offset}`);
+        if (p.bytes) {
+          carried.add(p.item);
+          ctx.notes.push(`'${p.item.name}' in ${r.cName} is at an offset Go's alignment for it does not allow, so it is carried as ${p.item.size} bytes.`);
+        }
+        rows.push([field, goType(p.item.type, p.bytes === true, p.item.size), comment]);
       }
     }
-    out.push('}', '');
+    out.push(`// ${name} is ${r.cName}.`, `type ${name} struct {`, ...alignColumns(rows).map((l) => `\t${l}`), '}', '');
   }
-  return out.join('\n');
+
+  out.push(`// The layout, checked when this file is compiled for GOARCH=${target.arch}: for another, it fails here.`);
+  for (const r of records) {
+    const name = typeName.get(r)!;
+    out.push(`var _ = [1]struct{}{}[unsafe.Sizeof(${name}{})-${r.size}]`);
+    for (const item of r.items) {
+      const field = fieldName.get(item);
+      if (field) out.push(`var _ = [1]struct{}{}[unsafe.Offsetof(${name}{}.${field})-${item.offset}]`);
+    }
+  }
+  const rootType = typeName.get(root)!;
+  out.push(
+    '',
+    `// ${read} reads one ${rootType} from r, as the target stores it (${byteOrder(ctx)}).`,
+    `func ${read}(r io.Reader) (${rootType}, error) {`,
+    `\tvar v ${rootType}`,
+    `\terr := binary.Read(r, ${order}, &v)`,
+    '\treturn v, err',
+    '}',
+    '',
+    `// ${write} writes v to w, as the target stores it (${byteOrder(ctx)}).`,
+    `func ${write}(w io.Writer, v *${rootType}) error {`,
+    `\treturn binary.Write(w, ${order}, v)`,
+    '}',
+    '',
+  );
+
+  const sets: string[] = [];
+  for (const l of leaves(root, { asBytes: carried, unionsAsBytes: true })) {
+    const at = valuePath('value', l.path, (s) => fieldName.get(s.item)!);
+    switch (l.type.kind) {
+      case 'int': case 'float': sets.push(`${at} = ${l.value}`); break;
+      case 'bool': sets.push(`${at} = true`); break;
+      case 'pointer': if (!l.type.function) sets.push(`${at} = ${l.value}`); break;
+      case 'bytes': sets.push(`${at} = [${l.type.size}]byte{${list(l.value as number[])}}`); break;
+    }
+  }
+  const example = [
+    'package bindings',
+    '',
+    'import (',
+    '\t"bytes"',
+    '\t"fmt"',
+    ')',
+    '',
+    `// A round trip through the bytes ${root.cName} has on ${platformLine(ctx)}.`,
+    `func Example${read}() {`,
+    `\tvar value ${rootType}`,
+    ...sets.map((s) => `\t${s}`),
+    '',
+    '\tvar data bytes.Buffer',
+    `\tif err := ${write}(&data, &value); err != nil {`,
+    '\t\tpanic(err)',
+    '\t}',
+    '\tsize := data.Len()',
+    `\tback, err := ${read}(&data)`,
+    '\tfmt.Println(size, err, back == value)',
+    `\t// Output: ${root.size} <nil> true`,
+    '}',
+    '',
+  ];
+  return {
+    code: out.join('\n'),
+    example: { filename: `${root.name}_example_test.go`, code: example.join('\n') },
+    usage: [
+      `Put both files in one package and build it with GOARCH=${target.arch}: compiling it checks the layout, and fails for another GOARCH.`,
+      `${read}(r) reads one from the bytes the target stores, and ${write}(w, &v) writes them.`,
+      `go test runs the example's round trip, with GOARCH=${target.arch}.`,
+    ],
+  };
 };
 
 // ------------------------------------------------------------------ C#
@@ -483,12 +905,27 @@ function multiByte(t: BType): boolean {
   return (t.kind === 'int' || t.kind === 'float' || t.kind === 'pointer') && t.size > 1;
 }
 
+/** Members C# gives the root struct, which a field may not be named. */
+const CS_MEMBERS = new Set(['FromBytes', 'ToBytes']);
+
 const emitCSharp: Emitter = (records, ctx) => {
+  const root = ctx.root;
   // C# has no way to declare a byte order: fields are read in the machine's.
   if (ctx.bigEndian && records.some((r) => r.items.some((i) => i.kind !== 'bits' && multiByte(i.type)))) {
     ctx.notes.push("C# reads each field in the machine's byte order: on a little-endian machine, reverse the multi-byte fields of this big-endian target's data (BinaryPrimitives.ReverseEndianness).");
   }
-  const out = [`// ${ctx.root.cName} on ${platformLine(ctx)}.`, '// Every field has its C offset: the same on any machine. Pointers are integers of the target\'s pointer size.', '// Compile with AllowUnsafeBlocks (fixed-size buffers).', '', 'using System.Runtime.InteropServices;', ''];
+  // A C# member may not have its type's name, nor that of the root's own members.
+  const fieldName = (r: Record_, item: Item) => (item.name === r.name || (r === root && CS_MEMBERS.has(item.name)) ? `${item.name}_` : ident(item.name, 'csharp'));
+  const out = [
+    `// ${root.cName} on ${platformLine(ctx)}.`,
+    "// Every field has its C offset: the same on any machine. Pointers are integers of the target's pointer size.",
+    `// ${root.name}.FromBytes reads one from the bytes the target stores, and ToBytes gives them.`,
+    '// Compile with AllowUnsafeBlocks (fixed-size buffers).',
+    '',
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    '',
+  ];
   for (const r of records) {
     out.push(`[StructLayout(LayoutKind.Explicit, Size = ${r.size})]`, `public unsafe struct ${r.name}`, '{');
     for (const item of r.items) {
@@ -498,8 +935,7 @@ const emitCSharp: Emitter = (records, ctx) => {
         continue;
       }
       const t = item.type;
-      // A C# member may not have its type's name.
-      const name = item.name === r.name ? `${item.name}_` : ident(item.name, 'csharp');
+      const name = fieldName(r, item);
       if (t.kind === 'array') {
         const count = t.dims.reduce((a, b) => a * b, 1);
         if (count === 0) {
@@ -524,10 +960,124 @@ const emitCSharp: Emitter = (records, ctx) => {
       else if (t.kind === 'record') out.push(`    ${at} public ${t.record.name} ${name};`);
       else out.push(`    ${at} public fixed byte ${name}[${item.size}];`);
     }
+    if (r === root) {
+      out.push(
+        '',
+        `    /// <summary>One ${r.name} from the bytes the target stores for it.</summary>`,
+        `    public static ${r.name} FromBytes(ReadOnlySpan<byte> bytes) => MemoryMarshal.Read<${r.name}>(bytes);`,
+        '',
+        `    /// <summary>The bytes the target stores for this ${r.name}.</summary>`,
+        '    public readonly byte[] ToBytes()',
+        '    {',
+        `        var bytes = new byte[${r.size}];`,
+        '        MemoryMarshal.Write(bytes, in this);',
+        '        return bytes;',
+        '    }',
+      );
+    }
     out.push('}', '');
   }
-  return out.join('\n');
+
+  // Where each value is in C#: a field, an element of a fixed buffer, or a field per element of an
+  // array of structs; the bytes of a value C# carries as bytes start at `first` in its buffer.
+  const place = (l: Leaf): { at: string; first: number } => {
+    let at = '';
+    let first = 0;
+    for (let k = 0; k < l.path.length; k++) {
+      const s = l.path[k]!;
+      if (s.kind === 'field') {
+        const next = l.path[k + 1];
+        if (next?.kind === 'index' && next.type.element.kind === 'record') {
+          at += `.${s.item.name}_${next.flat}`;
+          k++;
+        } else at += `.${s.item.kind === 'bits' ? ident(s.item.name, 'csharp') : fieldName(s.record, s.item)}`;
+      } else if (s.kind === 'index') {
+        if (s.type.element.kind === 'bytes') first = s.flat * s.type.element.size;
+        else at += `[${s.flat}]`;
+      }
+    }
+    return { at, first };
+  };
+  // Locals with no type's name: C# would read such a name as the type in some places.
+  const taken = new Set(records.map((r) => r.name));
+  const [value, data, back] = ['value', 'data', 'back'].map((n) => unique(n, taken));
+  const sets: string[] = [];
+  const checks: string[] = [];
+  const fail = (what: string) => `throw new InvalidOperationException("${what} came back different.");`;
+  for (const l of leaves(root)) {
+    const { at: below, first } = place(l);
+    const at = `${value}${below}`;
+    const read = `${back}${below}`;
+    const what = `${root.name}${below}`;
+    switch (l.type.kind) {
+      case 'int': case 'pointer': {
+        sets.push(`${at} = ${l.value};`);
+        checks.push(`if (${read} != ${l.value}) ${fail(what)}`);
+        break;
+      }
+      case 'float': {
+        const literal = `${l.value}${l.type.size === 4 ? 'f' : ''}`;
+        sets.push(`${at} = ${literal};`);
+        checks.push(`if (${read} != ${literal}) ${fail(what)}`);
+        break;
+      }
+      case 'bool':
+        sets.push(`${at} = 1;`);
+        checks.push(`if (${read} != 1) ${fail(what)}`);
+        break;
+      case 'bytes': {
+        const start = (l.value as number[])[0]!;
+        const index = first > 0 ? `${first} + j` : 'j';
+        sets.push(`for (var j = 0; j < ${l.type.size}; j++) ${at}[${index}] = (byte)((${start} + j) % 256);`);
+        checks.push(`for (var j = 0; j < ${l.type.size}; j++) if (${read}[${index}] != (byte)((${start} + j) % 256)) ${fail(what)}`);
+        break;
+      }
+    }
+  }
+  const runner = unique(`${root.name}RoundTrip`, new Set(records.map((r) => r.name)));
+  const example = [
+    `// A round trip through the bytes ${root.cName} has on ${platformLine(ctx)}: call ${runner}.Run().`,
+    'using System;',
+    '',
+    `public static class ${runner}`,
+    '{',
+    '    public static unsafe void Run()',
+    '    {',
+    `        var ${value} = new ${root.name}();`,
+    ...sets.map((s) => `        ${s}`),
+    '',
+    `        byte[] ${data} = ${value}.ToBytes();`,
+    `        ${root.name} ${back} = ${root.name}.FromBytes(${data});`,
+    `        if (!${back}.ToBytes().AsSpan().SequenceEqual(${data})) ${fail(root.name)}`,
+    ...checks.map((c) => `        ${c}`),
+    `        Console.WriteLine($"${root.name}: {${data}.Length} bytes, the same after a round trip.");`,
+    '    }',
+    '}',
+    '',
+  ];
+  return {
+    code: out.join('\n'),
+    example: { filename: `${runner}.cs`, code: example.join('\n') },
+    usage: [
+      'Add both files to a project with AllowUnsafeBlocks: every field is at its C offset on any machine.',
+      `${root.name}.FromBytes(bytes) reads one from the bytes the target stores, and value.ToBytes() gives them.`,
+      `${runner}.Run() runs the round trip.`,
+    ],
+  };
 };
+
+// ------------------------------------------------------------------ Python
+
+const PYTHON_KEYWORDS = new Set(['False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield']);
+
+/** `base.name`, or getattr where the name is a Python keyword. */
+const pyAttr = (base: string, name: string) => (PYTHON_KEYWORDS.has(name) ? `getattr(${base}, '${name}')` : `${base}.${name}`);
+
+/** A Python literal for a sample value. */
+function pyValue(v: Leaf['value']): string {
+  if (typeof v === 'boolean') return 'True';
+  return Array.isArray(v) ? `bytes([${list(v)}])` : String(v);
+}
 
 // ------------------------------------------------------------------ Python struct
 
@@ -571,15 +1121,28 @@ function flattenStruct(r: Record_, prefix: string): Array<{ code: string; names:
   return codes;
 }
 
+/** The example's value for one struct code, the k-th: as sampleValue gives it for that type. */
+function structSample(code: string, k: number): Leaf['value'] {
+  const [, count, letter] = /^(\d*)([a-zA-Z?])$/.exec(code)!;
+  if (letter === 's') return sampleValue({ kind: 'bytes', size: Number(count) }, k);
+  if (letter === 'f' || letter === 'd') return sampleValue({ kind: 'float', size: letter === 'f' ? 4 : 8 }, k);
+  if (letter === '?') return true;
+  return sampleValue({ kind: 'int', size: 1, signed: true }, k);
+}
+
 const emitPythonStruct: Emitter = (records, ctx) => {
   const r = ctx.root;
-  const codes = flattenStruct(r, '');
+  // A union is one value of its bytes, named after the union itself when it is the root.
+  const codes = flattenStruct(r, r.union ? `${r.name}.` : '');
   const order = ctx.bigEndian ? '>' : '<';
   const constant = r.name.toUpperCase();
   for (const rec of records) if (rec.union) ctx.notes.push(`struct has no unions: ${rec.cName} is read as its ${rec.size} bytes.`);
   for (const rec of records) for (const item of rec.items) if (item.kind === 'bits') ctx.notes.push(`Bit-fields are read as the bytes they share: ${bitsComment(item, ctx.bigEndian)}.`);
-  const names = codes.flatMap((c) => c.names);
-  return [
+  const named = codes.filter((c) => c.names.length > 0);
+  const names = named.flatMap((c) => c.names);
+  const lower = r.name.toLowerCase();
+  const sample = named.map((c, k) => `'${c.names[0]}': ${pyValue(structSample(c.code, k + 1))}`);
+  const code = [
     `# ${r.cName} on ${platformLine(ctx)}: ${r.size} bytes.`,
     `# Standard sizes in the target's byte order ('${order}'), with C's padding as pad bytes (x).`,
     'import struct',
@@ -590,11 +1153,32 @@ const emitPythonStruct: Emitter = (records, ctx) => {
     `assert ${constant}.size == ${r.size}`,
     '',
     '',
-    `def unpack_${r.name.toLowerCase()}(buffer, offset=0):`,
+    `def unpack_${lower}(buffer, offset=0):`,
     `    """The members of one ${r.cName} at \`offset\` in \`buffer\`, by name."""`,
     `    return dict(zip(${constant}_FIELDS, ${constant}.unpack_from(buffer, offset)))`,
     '',
-  ].join('\n');
+    '',
+    `def pack_${lower}(members):`,
+    `    """The bytes of one ${r.cName}, from its members by name (as unpack_${lower} gives them)."""`,
+    `    return ${constant}.pack(*(members[name] for name in ${constant}_FIELDS))`,
+    '',
+    '',
+    "if __name__ == '__main__':",
+    `    # A round trip through the bytes ${r.cName} has on the target.`,
+    `    members = {${sample.join(', ')}}`,
+    `    data = pack_${lower}(members)`,
+    `    assert len(data) == ${r.size} and unpack_${lower}(data) == members`,
+    `    print(unpack_${lower}(data))`,
+    '',
+  ];
+  return {
+    code: code.join('\n'),
+    usage: [
+      `Import ${r.name}.py: it checks the size of the format.`,
+      `unpack_${lower}(buffer) reads one from the bytes the target stores, and pack_${lower}(members) writes them.`,
+      `python ${r.name}.py runs its round trip.`,
+    ],
+  };
 };
 
 // ------------------------------------------------------------------ Python ctypes
@@ -614,27 +1198,80 @@ function ctypesType(t: BType, bigEndian: boolean): string {
 }
 
 const emitPythonCtypes: Emitter = (records, ctx) => {
+  const root = ctx.root;
   const endian = ctx.bigEndian ? 'BigEndian' : 'LittleEndian';
   const out = [
-    `# ${ctx.root.cName} on ${platformLine(ctx)}.`,
+    `# ${root.cName} on ${platformLine(ctx)}.`,
     '# Packed, with C\'s padding written out: the layout is the same on any machine. In the',
     '# target\'s byte order, and with pointers as integers of its pointer size.',
+    `# ${root.name}.from_buffer_copy(data) reads one from the bytes the target stores; bytes(value) gives them.`,
     'import ctypes',
     '',
   ];
+  const field = (item: Item) => ident(item.name, 'python-ctypes');
   for (const r of records) {
     const { placed } = placeNatural(r, () => 1);
     out.push('', `class ${r.name}(ctypes.${endian}${r.union ? 'Union' : 'Structure'}):`, '    _pack_ = 1', "    _layout_ = 'ms'", '    _fields_ = [');
     for (const p of placed) {
       if ('pad' in p) out.push(`        ('${p.name}', ctypes.c_uint8 * ${p.pad}),`);
-      else if (p.item.kind === 'bits') out.push(`        # ${bitsComment(p.item, ctx.bigEndian)}`, `        ('${p.item.name}', ctypes.c_uint8 * ${p.item.size}),`);
-      else out.push(`        ('${p.item.name}', ${ctypesType(p.item.type, ctx.bigEndian)}),  # offset ${p.item.offset}`);
+      else if (p.item.kind === 'bits') out.push(`        # ${bitsComment(p.item, ctx.bigEndian)}`, `        ('${field(p.item)}', ctypes.c_uint8 * ${p.item.size}),`);
+      else out.push(`        ('${field(p.item)}', ${ctypesType(p.item.type, ctx.bigEndian)}),  # offset ${p.item.offset}`);
     }
     if (r.union) out.push(`        ('_size', ctypes.c_uint8 * ${r.size}),`);
     out.push('    ]', '', '', `assert ctypes.sizeof(${r.name}) == ${r.size}`);
+    for (const item of r.items) out.push(`assert ${pyAttr(r.name, field(item))}.offset == ${item.offset}`);
   }
-  out.push('');
-  return out.join('\n');
+
+  // The example runs at module level: its names may not be a class's, nor ctypes.
+  const taken = new Set([...records.map((r) => r.name), 'ctypes']);
+  const [value, data, back] = ['value', 'data', 'back'].map((n) => unique(n, taken));
+  const path = (base: string, steps: Step[]) =>
+    steps.reduce((at, s) => (s.kind === 'field' ? pyAttr(at, field(s.item)) : s.kind === 'index' ? at + s.index.map((i) => `[${i}]`).join('') : at), base);
+  const sets: string[] = [];
+  const checks: string[] = [];
+  for (const l of leaves(root)) {
+    const at = path(value, l.path);
+    const read = path(back, l.path);
+    // A keyword member is set with setattr: the last step is its name.
+    const last = l.path[l.path.length - 1]!;
+    const assign = (v: string) =>
+      last.kind === 'field' && PYTHON_KEYWORDS.has(field(last.item)) ? `setattr(${path(value, l.path.slice(0, -1))}, '${field(last.item)}', ${v})` : `${at} = ${v}`;
+    switch (l.type.kind) {
+      case 'bytes':
+        sets.push(`${at}[:] = ${pyValue(l.value)}`);
+        checks.push(`assert bytes(${read}) == ${pyValue(l.value)}`);
+        break;
+      case 'bool':
+        sets.push(assign(ctx.bigEndian ? '1' : 'True'));
+        checks.push(`assert ${read}`);
+        break;
+      default:
+        sets.push(assign(pyValue(l.value)));
+        checks.push(`assert ${read} == ${pyValue(l.value)}`);
+    }
+  }
+  out.push(
+    '',
+    '',
+    "if __name__ == '__main__':",
+    `    # A round trip through the bytes ${root.cName} has on the target.`,
+    `    ${value} = ${root.name}()`,
+    ...sets.map((s) => `    ${s}`),
+    `    ${data} = bytes(${value})`,
+    `    ${back} = ${root.name}.from_buffer_copy(${data})`,
+    `    assert len(${data}) == ${root.size} and bytes(${back}) == ${data}`,
+    ...checks.map((c) => `    ${c}`),
+    `    print(f'${root.name}: {len(${data})} bytes, the same after a round trip')`,
+    '',
+  );
+  return {
+    code: out.join('\n'),
+    usage: [
+      `Import ${root.name}.py: it checks the size and every offset of each Structure.`,
+      `${root.name}.from_buffer_copy(data) reads one from the bytes the target stores, and bytes(value) gives them.`,
+      `python ${root.name}.py runs its round trip.`,
+    ],
+  };
 };
 
 const EMITTERS: Record<BindingLanguage, Emitter> = {

@@ -60,10 +60,10 @@ describe("Go tool family", () => {
   it("generates a verification program for the declared or optimized struct", () => {
     const tool = goToolDefinition(TOOL_GO_VERIFICATION_CODE);
     const code = "package geo\ntype S struct { a bool; b int64; c bool }";
-    const plain = tool.compute(tool.createSpec(), code).text!;
+    const plain = tool.compute(tool.createSpec(), code).files![0]!.content;
     expect(plain).toContain("package main");
     expect(plain).toContain("spunsafe.Offsetof(v.b)");
-    const opt = tool.compute(tool.createSpec({ [OPTION_MODE]: "optimized" }), code).text!;
+    const opt = tool.compute(tool.createSpec({ [OPTION_MODE]: "optimized" }), code).files![0]!.content;
     expect(opt).toContain("type SOptimized struct {\n\tb int64\n\ta bool\n\tc bool\n}");
     expect(opt).toContain("var v SOptimized");
     expect(tool.compute(tool.createSpec(), `${code}\nfunc main() {}`).error).toMatch(/func main/);

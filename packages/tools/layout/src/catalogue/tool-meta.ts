@@ -51,7 +51,7 @@ export const LAYOUT_TOOLS: readonly LayoutToolMeta[] = [
     category: "Calculators",
     tags: ["ffi", "bindings", "rust", "zig", "go", "c#", "python", "ctypes", "repr(C)"],
     summary:
-      "Write a C struct in Rust, Zig, Go, C# or Python with exactly the same size and member offsets on the selected target.",
+      "Write a C struct in Rust, Zig, Go, C# or Python with exactly the same size and member offsets on the selected target, a check of that layout, a way to read and write its bytes, and a round-trip example.",
     readsInput: true,
     supportsVariants: false,
   },

@@ -16,6 +16,6 @@ export { examples } from './examples';
 export type { StructExample } from './examples';
 export * from './go';
 export * from './rust';
-export { bindingLanguages, bindingTargetName, generateBindings } from './bindings/bindings';
-export type { BindingLanguage, BindingOutput } from './bindings/bindings';
+export { bindingLanguages, bindingTargetName, generateBindings, goExportedName } from './bindings/bindings';
+export type { BindingFile, BindingLanguage, BindingOutput } from './bindings/bindings';
 export * from './zig';
