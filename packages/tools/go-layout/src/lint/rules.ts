@@ -144,15 +144,6 @@ const unusedTypes: Rule = {
   },
 };
 
-/** GO006 — parser warnings. */
-const parserWarnings: Rule = {
-  code: "GO006",
-  check: ({ result }) =>
-    (result.data?.analysis.warnings ?? []).map(
-      (w): Diag => ({ code: "GO006", level: "warning", message: w.message, line: w.line }),
-    ),
-};
-
 export const GO_LAYOUT_RULES: readonly Rule[] = [
   syntaxErrors,
   typeErrors,
@@ -160,7 +151,6 @@ export const GO_LAYOUT_RULES: readonly Rule[] = [
   atomicAlignment,
   trailingZeroSize,
   unusedTypes,
-  parserWarnings,
 ];
 
-export const GO_VERIFICATION_RULES: readonly Rule[] = [syntaxErrors, typeErrors, parserWarnings];
+export const GO_VERIFICATION_RULES: readonly Rule[] = [syntaxErrors, typeErrors];

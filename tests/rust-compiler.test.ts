@@ -342,10 +342,12 @@ for (const target of RUST_TARGETS) {
     }, 900_000);
 
     for (const c of cases) {
+      const key = `${target.id} | ${c.label}`;
+      refs.declare(key);
       it(c.label, () => {
         if (checked?.failure) throw new Error(checked.failure);
         if (!c.root) throw new Error(c.errors.join("; "));
-        const truth = refs.answer(`${target.id} | ${c.label}`, checked?.answers.get(c.index));
+        const truth = refs.answer(key, checked?.answers.get(c.index));
         if ("rejected" in truth) {
           // What rustc refuses on this target (a type core does not have here), the engine must refuse.
           expect(c.errors.length, `rustc rejects it on ${target.id} (${truth.rejected}); the engine does not`).toBeGreaterThan(0);

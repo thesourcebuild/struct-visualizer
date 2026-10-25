@@ -129,6 +129,8 @@ describe(`Go layouts match go/types (gc) for every architecture${compile ? "" : 
   }, 600_000);
 
   entries.forEach(([label, code], index) => {
+    refs.declare(label);
+    for (const target of GC_TARGETS) refs.declare(`${label} | reordered for ${target.id}`);
     it(label, () => {
       const now = compile ? truths[index]! : undefined;
       const answer = refs.answer(label, now && ("error" in now ? { rejected: now.error } : { layout: now }));

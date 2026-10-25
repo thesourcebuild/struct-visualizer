@@ -1,6 +1,6 @@
 {
   "name": "@sp/config",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "exports": {
     "./tsconfig/base.json": "./tsconfig/base.json",

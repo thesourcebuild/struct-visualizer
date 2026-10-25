@@ -79,7 +79,11 @@ export type Stmt =
 
 export interface FnDecl {
   params: Param[];
+  /** The return type; with `inferredErrorSet`, the payload of `!T`. */
   ret: Expr;
+  callconv?: Expr;
+  /** `fn f() !T`: the error set is inferred from the body. */
+  inferredErrorSet?: boolean;
   /** null for `extern fn` prototypes. */
   body: Stmt[] | null;
   /** The body uses statements the evaluator does not run (loops, switches, assignments). */
@@ -434,10 +438,11 @@ class Parser {
     const line = this.expect('fn').line;
     const name = this.identifier();
     const params = this.params();
-    this.protoTail();
-    // `!T` (inferred error set) or `E!T`.
-    const ret = this.accept('!') ? this.typeExpr() : this.typeExpr();
-    const fn: FnDecl = { params, ret, body: null };
+    const callconv = this.protoTail();
+    // `!T`: an error set inferred from the body. `E!T` is an ordinary type.
+    const inferredErrorSet = this.accept('!');
+    const ret = this.typeExpr();
+    const fn: FnDecl = { params, ret, body: null, ...(callconv && { callconv }), ...(inferredErrorSet && { inferredErrorSet }) };
     if (this.is('{')) {
       if (isExtern) throw new ZigParseError('An extern function has no body.', line);
       const bodyStart = this.pos;
@@ -812,7 +817,8 @@ class Parser {
       this.next();
       const params = this.params();
       const callconv = this.protoTail();
-      const ret = this.accept('!') ? this.typeExpr() : this.typeExpr();
+      if (this.is('!')) throw new ZigParseError('A function type cannot infer its error set (!T): name it, as in anyerror!T.', t.line);
+      const ret = this.typeExpr();
       return { k: 'fnType', params, ret, callconv, line: t.line };
     }
     if (t.kind === 'ident') {

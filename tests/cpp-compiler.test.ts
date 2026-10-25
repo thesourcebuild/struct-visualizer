@@ -370,6 +370,8 @@ for (const target of TARGETS) {
 
     entries.forEach((entry, i) => {
       if (!applies(entry)) return;
+      const key = `${target.name} | ${entry.label}`;
+      refs.declare(key);
       it(entry.label, (ctx) => {
         if (target.oldGcc && entry.code.includes("[[no_unique_address]]")) {
           // GCC added [[no_unique_address]] in version 9; avr-g++ 7 ignores it.
@@ -381,7 +383,7 @@ for (const target of TARGETS) {
           const reported = results.get(i)!;
           now = typeof reported === "string" ? { rejected: reported.split("\n").find((l) => /error/i.test(l)) ?? reported } : { layout: reported };
         }
-        const truth = refs.answer(`${target.name} | ${entry.label}`, now);
+        const truth = refs.answer(key, now);
         if ("rejected" in truth) {
           if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${entry.label} | ${truth.rejected}`);
           ctx.skip(`${target.cc} rejects it: ${truth.rejected}`);

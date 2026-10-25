@@ -401,6 +401,8 @@ for (const target of TARGETS) {
       if (!appliesTo(entry, target)) return;
       const { label } = entry;
       const code = source(entry);
+      const key = `${target.name} | ${label}`;
+      refs.declare(key);
       it(label, (ctx) => {
         if (!parsable.includes(i)) {
           // Not parsable by the engine: report the parser's errors.
@@ -421,7 +423,7 @@ for (const target of TARGETS) {
             }
           }
         }
-        const truth = refs.answer(`${target.name} | ${label}`, now);
+        const truth = refs.answer(key, now);
         if ("rejected" in truth) {
           // The compiler does not accept this declaration, so it has no layout to compare.
           if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${truth.rejected}`);

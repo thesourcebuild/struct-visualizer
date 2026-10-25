@@ -477,7 +477,17 @@ function csScalar(t: BType): string | undefined {
   }
 }
 
+/** Whether a value of this type has a byte order: a scalar of more than one byte, or an array of them. */
+function multiByte(t: BType): boolean {
+  if (t.kind === 'array') return multiByte(t.element);
+  return (t.kind === 'int' || t.kind === 'float' || t.kind === 'pointer') && t.size > 1;
+}
+
 const emitCSharp: Emitter = (records, ctx) => {
+  // C# has no way to declare a byte order: fields are read in the machine's.
+  if (ctx.bigEndian && records.some((r) => r.items.some((i) => i.kind !== 'bits' && multiByte(i.type)))) {
+    ctx.notes.push("C# reads each field in the machine's byte order: on a little-endian machine, reverse the multi-byte fields of this big-endian target's data (BinaryPrimitives.ReverseEndianness).");
+  }
   const out = [`// ${ctx.root.cName} on ${platformLine(ctx)}.`, '// Every field has its C offset: the same on any machine. Pointers are integers of the target\'s pointer size.', '// Compile with AllowUnsafeBlocks (fixed-size buffers).', '', 'using System.Runtime.InteropServices;', ''];
   for (const r of records) {
     out.push(`[StructLayout(LayoutKind.Explicit, Size = ${r.size})]`, `public unsafe struct ${r.name}`, '{');

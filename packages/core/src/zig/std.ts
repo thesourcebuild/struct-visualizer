@@ -15,6 +15,13 @@ const std = @import("std");
 
 // ---- builtin.zig
 pub const builtin = struct {
+    pub const OptimizeMode = enum {
+        Debug,
+        ReleaseSafe,
+        ReleaseFast,
+        ReleaseSmall,
+    };
+
     pub const Signedness = enum(u1) {
         signed,
         unsigned,
@@ -154,6 +161,158 @@ pub const builtin = struct {
         };
         pub const Declaration = struct {
             name: [:0]const u8,
+        };
+    };
+};
+
+// ---- Target.zig: what @import("builtin") describes the target with
+pub const Target = struct {
+    pub const Os = struct {
+        pub const Tag = enum {
+            freestanding,
+            other,
+
+            contiki,
+            fuchsia,
+            hermit,
+            managarm,
+
+            haiku,
+            hurd,
+            illumos,
+            linux,
+            plan9,
+            rtems,
+            serenity,
+
+            dragonfly,
+            freebsd,
+            netbsd,
+            openbsd,
+
+            driverkit,
+            ios,
+            maccatalyst,
+            macos,
+            tvos,
+            visionos,
+            watchos,
+
+            windows,
+            uefi,
+
+            @"3ds",
+
+            ps3,
+            ps4,
+            ps5,
+            psp,
+            vita,
+
+            emscripten,
+            wasi,
+
+            amdhsa,
+            amdpal,
+            cuda,
+            mesa3d,
+            nvcl,
+            opencl,
+            opengl,
+            vulkan,
+        };
+    };
+
+    pub const Abi = enum {
+        none,
+        gnu,
+        gnuabin32,
+        gnuabi64,
+        gnueabi,
+        gnueabihf,
+        gnuf32,
+        gnusf,
+        gnux32,
+        eabi,
+        eabihf,
+        ilp32,
+        android,
+        androideabi,
+        musl,
+        muslabin32,
+        muslabi64,
+        musleabi,
+        musleabihf,
+        muslf32,
+        muslsf,
+        muslx32,
+        msvc,
+        itanium,
+        simulator,
+        ohos,
+        ohoseabi,
+    };
+
+    pub const Cpu = struct {
+        pub const Arch = enum {
+            aarch64,
+            aarch64_be,
+            alpha,
+            amdgcn,
+            arc,
+            arceb,
+            arm,
+            armeb,
+            avr,
+            bpfeb,
+            bpfel,
+            csky,
+            hexagon,
+            hppa,
+            hppa64,
+            kalimba,
+            kvx,
+            lanai,
+            loongarch32,
+            loongarch64,
+            m68k,
+            microblaze,
+            microblazeel,
+            mips,
+            mipsel,
+            mips64,
+            mips64el,
+            msp430,
+            nvptx,
+            nvptx64,
+            or1k,
+            powerpc,
+            powerpcle,
+            powerpc64,
+            powerpc64le,
+            propeller,
+            riscv32,
+            riscv32be,
+            riscv64,
+            riscv64be,
+            s390x,
+            sh,
+            sheb,
+            sparc,
+            sparc64,
+            spirv32,
+            spirv64,
+            thumb,
+            thumbeb,
+            ve,
+            wasm32,
+            wasm64,
+            x86_16,
+            x86,
+            x86_64,
+            xcore,
+            xtensa,
+            xtensaeb,
         };
     };
 };

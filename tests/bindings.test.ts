@@ -445,6 +445,8 @@ for (const language of LANGUAGES) {
     }, 900_000);
 
     for (const p of prepared) {
+      const key = `${language} | ${p.target.name} | ${p.label}`;
+      refs.declare(key);
       it(`${p.target.name}: ${p.label}`, (ctx) => {
         const binding = p.bindings.get(language)!;
         if (binding.error) {
@@ -462,7 +464,7 @@ for (const language of LANGUAGES) {
           const failure = failures.get(language)!.get(p.index);
           now = failure !== undefined ? { rejected: failure } : { layout: want };
         }
-        const truth = refs.answer(`${language} | ${p.target.name} | ${p.label}`, now);
+        const truth = refs.answer(key, now);
         if ("rejected" in truth) expect.fail(`${truth.rejected}\n${binding.code}`);
         if (!("layout" in truth)) throw new Error("no layout");
         if (truth.layout.code !== want.code) {
@@ -473,3 +475,21 @@ for (const language of LANGUAGES) {
     }
   });
 }
+
+describe("binding notes", () => {
+  const notes = (code: string, selection: PlatformSelection) => {
+    const analysis = analyzeStruct(code, selection);
+    return generateBindings(analysis.result!, analysis.platform, new PaddingCalculator(analysis.platform.architecture, analysis.platform.dataModel), "csharp").notes;
+  };
+  const be = TARGETS.find((t) => t.name === "PowerPC 32 Linux")!.selection;
+  const le = TARGETS.find((t) => t.name === "x86-64 Linux")!.selection;
+  const byteOrder = /machine's byte order/;
+
+  it("C# says when a big-endian target's multi-byte fields need their bytes reversed", () => {
+    expect(notes("struct S { char a; int b; };", be).some((n) => byteOrder.test(n))).toBe(true);
+    expect(notes("struct S { char a; short b[2]; };", be).some((n) => byteOrder.test(n))).toBe(true);
+    // Single bytes have no byte order, and a little-endian target's data reads as it is.
+    expect(notes("struct S { char a; unsigned char b[3]; };", be).some((n) => byteOrder.test(n))).toBe(false);
+    expect(notes("struct S { char a; int b; };", le).some((n) => byteOrder.test(n))).toBe(false);
+  });
+});

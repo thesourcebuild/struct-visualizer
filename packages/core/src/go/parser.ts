@@ -51,7 +51,6 @@ export interface GoFile {
   order: string[];
   consts: Map<string, number>;
   errors: ParseError[];
-  warnings: ParseError[];
 }
 
 class Recover extends Error {}
@@ -109,7 +108,6 @@ export function parseGo(code: string): GoFile {
     order: [],
     consts: new Map(),
     errors: [],
-    warnings: [],
   };
   const tokens = insertSemicolons(tokenize(stripComments(code)));
   let pos = 0;

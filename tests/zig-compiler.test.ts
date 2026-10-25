@@ -146,7 +146,7 @@ for (const target of ZIG_TARGETS) {
   for (const mode of MODES) {
     for (const cpu of cpusFor(target)) {
       for (const [label, code] of Object.entries(CASES)) {
-        const analysis = analyzeZig(code, target.id, mode, cpu);
+        const analysis = analyzeZig(code, target.id, { mode, cpu });
         prepared.push({ index: prepared.length, label, code, target, mode, cpu, analysis, expected: analysis.result ? facts(analysis) : "" });
       }
     }
@@ -236,6 +236,14 @@ const REJECTED: Record<string, string> = {
   "non-exhaustive enum without a tag type": "const E = enum { a, _ };",
   "union fields not matching the tag": "const Tag = enum { a, b };\nconst U = union(Tag) { a: u8, c: u16 };",
   "undeclared type": "const S = struct { a: Missing };",
+  "switch on an integer without else": "fn P(comptime n: u8) type {\n    return switch (n) {\n        0 => u8,\n        1 => u16,\n    };\n}\nconst S = struct { a: P(0) };",
+  "duplicate switch prong": "fn P(comptime n: u8) type {\n    return switch (n) {\n        0 => u8,\n        0 => u16,\n        else => u32,\n    };\n}\nconst S = struct { a: P(0) };",
+  "switch over an enum missing a field": "const E = enum { a, b, c };\nfn P(comptime e: E) type {\n    return switch (e) {\n        .a => u8,\n        .b => u16,\n    };\n}\nconst S = struct { a: P(.a) };",
+  "typed integer overflow": "const a: u8 = 200;\nconst S = struct { b: [a + a]u8 };",
+  "shift amount too large": "const x: u8 = 1;\nconst S = struct { a: [x << 9]u8 };",
+  "capture of a non-optional": "fn F(comptime T: type) type {\n    if (T) |t| return t;\n    return u8;\n}\nconst S = struct { a: F(u16) };",
+  "inactive union field": "const S = struct { a: [@typeInfo(u8).float.bits]u8 };",
+  "unwrapping null": "const n: ?u8 = null;\nconst S = struct { a: [n.?]u8 };",
 };
 
 it.runIf(requireZig)("zig 0.16 is installed", () => {
@@ -243,7 +251,7 @@ it.runIf(requireZig)("zig 0.16 is installed", () => {
 });
 
 describe(`Zig rejects what the engine rejects${compileHere ? "" : " (recorded answers)"}`, () => {
-  const cases = Object.entries(REJECTED).map(([label, code], i) => ({ label, code, i, a: analyzeZig(code, "x86_64-linux-gnu", "Debug") }));
+  const cases = Object.entries(REJECTED).map(([label, code], i) => ({ label, code, i, a: analyzeZig(code, "x86_64-linux-gnu") }));
   const rejected = new Map<number, string>();
 
   beforeAll(async () => {
@@ -264,6 +272,7 @@ describe(`Zig rejects what the engine rejects${compileHere ? "" : " (recorded an
   }, 600_000);
 
   for (const c of cases) {
+    refs.declare(`rejected | ${c.label}`);
     it(c.label, () => {
       const now = compileHere ? (rejected.has(c.i) ? { rejected: rejected.get(c.i)! } : { layout: "compiled" }) : undefined;
       const truth = refs.answer(`rejected | ${c.label}`, now);
@@ -279,14 +288,76 @@ describe(`Zig layout matches zig 0.16${compileHere ? "" : " (recorded answers)"}
   }, 1_800_000);
 
   for (const p of prepared) {
+    const key = `${p.target.id} ${p.mode}${p.cpu ? ` ${p.cpu}` : ""} | ${p.label}`;
+    refs.declare(key);
     it(`${p.target.label} ${p.mode}${p.cpu ? ` ${p.cpu}` : ""}: ${p.label}`, () => {
       expect(p.analysis.errors, p.code).toEqual([]);
       const error = groupErrors.get(p.index);
       if (error) throw new Error(error);
-      const truth = refs.answer(`${p.target.id} ${p.mode}${p.cpu ? ` ${p.cpu}` : ""} | ${p.label}`, compileHere ? observed.get(p.index) : undefined);
+      const truth = refs.answer(key, compileHere ? observed.get(p.index) : undefined);
       if ("rejected" in truth) throw new Error(`zig rejects it: ${truth.rejected}`);
       if (!("layout" in truth)) throw new Error("zig gave no layout");
       expect(p.expected, "the engine's facts, then zig's").toBe(truth.layout);
+    });
+  }
+});
+
+/** Definitions whose layout depends on --error-limit, which sets the width of error codes. */
+const ERROR_LIMIT_CASES: Record<string, string> = {
+  "anyerror": "const S = struct { a: anyerror, b: u8, c: ?anyerror };",
+  "error unions": "const E = error{ A, B };\nconst S = struct { a: anyerror!u8, b: E!u64, c: anyerror!void, d: E!?u32, e: E, f: anyerror![3]u16 };",
+  "three error names": "const S = struct { a: error{ A, B, C }!u8, b: u8 };",
+};
+const ERROR_LIMITS = [0, 1, 2, 3, 255, 256, 65535, 65536, 4294967295];
+const ERROR_LIMIT_TARGETS = ["x86_64-linux-gnu", "avr-freestanding-none"];
+
+describe(`--error-limit matches zig 0.16${compileHere ? "" : " (recorded answers)"}`, () => {
+  const cases = ERROR_LIMIT_TARGETS.flatMap((targetId) =>
+    ERROR_LIMITS.flatMap((limit) =>
+      Object.entries(ERROR_LIMIT_CASES).map(([label, code]) => {
+        const a = analyzeZig(code, targetId, { errorLimit: limit });
+        return { key: `${targetId} Debug --error-limit ${limit} | ${label}`, label, code, targetId, limit, a, expected: a.result ? facts(a) : "" };
+      }),
+    ),
+  );
+  const answers = new Map<string, Answer<string>>();
+
+  beforeAll(async () => {
+    if (!compileHere) return;
+    // zig counts the error names of the whole compilation, so each case is a file of its own;
+    // @compileLog reports the facts without std, whose formatting has error names of its own.
+    const queue = cases.map((c, i) => ({ c, i }));
+    const worker = async () => {
+      for (let next = queue.shift(); next; next = queue.shift()) {
+        const { c, i } = next;
+        const T = `case.${c.a.definition?.name ?? [...c.code.matchAll(/const (\w+) =/g)].pop()![1]}`;
+        const offsets = (c.a.offsets ?? []).map((o) => `@offsetOf(${T}, "${o.name}")`);
+        const file = join(dir, `error_limit_${i}.zig`);
+        writeFileSync(file, ["const case = struct {", c.code, "};", `comptime { @compileLog(${[`@sizeOf(${T})`, `@alignOf(${T})`, `@sizeOf(?${T})`, ...offsets].join(", ")}); }`].join("\n"));
+        const output = await compile(file, ["-target", c.targetId, "-O", "Debug", "--error-limit", String(c.limit)]);
+        const refused = /error: (ZCU used more errors than possible.*)$/m.exec(output);
+        const logged = /Compile Log Output:\r?\n(.*)/.exec(output);
+        if (refused) answers.set(c.key, { rejected: refused[1]! });
+        else if (logged && c.a.result) {
+          const [size, align, opt, ...rest] = [...logged[1]!.matchAll(/comptime_int, (\d+)/g)].map((m) => m[1]);
+          answers.set(c.key, { layout: [`size ${size}`, `align ${align}`, `opt ${opt}`, ...c.a.offsets.map((o, j) => `${o.name} ${rest[j]}`)].join(" ") });
+        } else answers.set(c.key, { rejected: output.slice(0, 2000) || "no compile log output" });
+      }
+    };
+    await Promise.all(Array.from({ length: 6 }, worker));
+  }, 900_000);
+
+  for (const c of cases) {
+    refs.declare(c.key);
+    it(`${c.targetId} --error-limit ${c.limit}: ${c.label}`, () => {
+      const truth = refs.answer(c.key, compileHere ? answers.get(c.key) : undefined);
+      if ("rejected" in truth) {
+        expect(c.a.errors.length, `zig: ${truth.rejected}`).toBeGreaterThan(0);
+        return;
+      }
+      expect(c.a.errors, c.code).toEqual([]);
+      if (!("layout" in truth)) throw new Error("zig gave no layout");
+      expect(c.expected, "the engine's facts, then zig's").toBe(truth.layout);
     });
   }
 });
@@ -297,7 +368,7 @@ const host = process.arch === "x64" ? (process.platform === "win32" ? "x86_64-wi
 describe.skipIf(!compileHere || !host)("generated Zig verification programs", () => {
   for (const mode of ["Debug", "ReleaseFast"] as const) {
     const cases = Object.entries(CASES)
-      .map(([label, code], i) => ({ label, code, i, a: analyzeZig(code, host!, mode) }))
+      .map(([label, code], i) => ({ label, code, i, a: analyzeZig(code, host!, { mode }) }))
       .filter((c) => c.a.result);
     const outputs = new Map<number, string>();
 

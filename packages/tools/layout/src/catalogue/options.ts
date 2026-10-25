@@ -92,7 +92,7 @@ const PACKING: OptionDef<LayoutGroup> = {
   kind: "enum",
   // Narrowed per platform by choicesFor: MSVC and the 8051 compilers accept only #pragma pack.
   choices: Object.values(packingSyntaxes).map((s) => ({ value: s.id, label: s.code, summary: `Accepted by ${s.compilers}` })),
-  summary: "How the packing is written. Compilers accept different ones, and they differ for zero-width bit-fields.",
+  summary: "How the packing is written. Compilers accept different ones, and under GCC #pragma pack caps the alignment a member asks for, which packed does not.",
   availableOn: [TAG_PACKED],
   order: 1,
   colSpan: 2,

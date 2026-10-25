@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { zigToolDefinition } from "@sp/zig-layout/definition";
 import { applyAllFixes, lint } from "@sp/zig-layout/lint";
-import { OPTION_BUILD_MODE, OPTION_MODE, OPTION_ZIG_CPU, OPTION_ZIG_TARGET, TOOL_ZIG_STRUCT_LAYOUT, TOOL_ZIG_VERIFICATION_CODE } from "@sp/zig-layout";
+import { OPTION_BUILD_MODE, OPTION_ERROR_LIMIT, OPTION_MODE, OPTION_ZIG_CPU, OPTION_ZIG_TARGET, TOOL_ZIG_STRUCT_LAYOUT, TOOL_ZIG_VERIFICATION_CODE } from "@sp/zig-layout";
 import { TOOL_MANIFESTS, loadTool } from "@sp/registry";
 
 const createSpec = zigToolDefinition(TOOL_ZIG_STRUCT_LAYOUT).createSpec;
@@ -50,6 +50,31 @@ describe("Zig tool family", () => {
     expect(size({ [OPTION_ZIG_TARGET]: "x86_64-macos-none" })).toBe(64);
     const code = zigToolDefinition(TOOL_ZIG_VERIFICATION_CODE);
     expect(code.compute(code.createSpec({ [OPTION_ZIG_CPU]: "x86_64_v3" }), v).fields!.find((f) => f.label === "Run")!.value).toContain("-mcpu=x86_64_v3");
+  });
+
+  it("sizes error codes by --error-limit, and refuses a definition with more error names than it allows", () => {
+    const e = "const S = struct { e: anyerror!u8 };";
+    const tool = zigToolDefinition(TOOL_ZIG_STRUCT_LAYOUT);
+    const compute = (limit?: number) => tool.compute(tool.createSpec(limit === undefined ? {} : { [OPTION_ERROR_LIMIT]: limit }), e);
+    expect(compute().data!.display!.totalSize).toBe(4);
+    expect(compute(255).data!.display!.totalSize).toBe(2);
+    expect(compute(0).data!.display!.totalSize).toBe(1);
+    expect(tool.info!(tool.createSpec({ [OPTION_ERROR_LIMIT]: 256 })).find((f) => f.label === "Error codes")!.value).toBe("u9 (--error-limit 256)");
+    expect(tool.compute(tool.createSpec({ [OPTION_ERROR_LIMIT]: 1 }), "const S = struct { e: error{ A, B }!u8 };").error).toMatch(/uses 2 error names, more than --error-limit 1 allows/);
+
+    const code = zigToolDefinition(TOOL_ZIG_VERIFICATION_CODE);
+    const defaults = code.compute(code.createSpec(), e);
+    expect(defaults.fields!.find((f) => f.label === "Run")!.value).not.toContain("--error-limit");
+    const small = code.compute(code.createSpec({ [OPTION_ERROR_LIMIT]: 255 }), e);
+    expect(small.fields!.find((f) => f.label === "Run")!.value).toContain("--error-limit 255");
+    // std.debug.print has error names of its own, which zig counts too.
+    expect(small.working).toMatch(/std\.debug\.print's own included/);
+  });
+
+  it("shows a field's type as written", () => {
+    const tool = zigToolDefinition(TOOL_ZIG_STRUCT_LAYOUT);
+    const r = tool.compute(tool.createSpec(), "const S = struct { a: usize, b: ?  *const   u8 };").data!.display!;
+    expect(r.struct.members.map((m) => m.type)).toEqual(["usize", "? *const u8"]);
   });
 
   it("says which std types it does not model, rather than laying out a stand-in", () => {

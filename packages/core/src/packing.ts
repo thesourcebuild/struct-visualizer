@@ -2,8 +2,8 @@ import type { DataModel, OSType } from './abi/data-models';
 
 /**
  * How a packed layout is asked for in source. The three are not interchangeable: compilers accept
- * different ones, and GCC and MSVC lay out zero-width bit-fields differently under `packed` than
- * under `#pragma pack(1)` (checked in tests/cross-compiler.test.ts).
+ * different ones, and under GCC `#pragma pack` caps the alignment a member asks for (`aligned`,
+ * `_Alignas`) where `packed` does not (checked in tests/cross-compiler.test.ts).
  */
 export type PackingSyntax = 'pragma' | 'attribute' | 'keyword';
 

@@ -10,6 +10,10 @@ export const SPEC_VERSION = 1;
 export const OPTION_ZIG_TARGET = "zigTarget";
 /** -mcpu, for x86-64 targets: the microarchitecture level. */
 export const OPTION_ZIG_CPU = "zigCpu";
+/** --error-limit: the number of error names, which sizes error codes. */
+export const OPTION_ERROR_LIMIT = "errorLimit";
+/** zig's default: error codes are u16. */
+export const DEFAULT_ERROR_LIMIT = 65535;
 /** -O: Debug, ReleaseSafe, ReleaseFast or ReleaseSmall. */
 export const OPTION_BUILD_MODE = "buildMode";
 export const OPTION_MODE = "mode";

@@ -1,8 +1,8 @@
 import { ZIG_OPTIMIZED_SUFFIX, analyzeZig, declaresZigMain, formatZigStruct, generateZigVerificationCode, getZigTarget, zigTargetFlags } from "@sp/core";
 import type { CalculationResult, ZigAnalysis } from "@sp/core";
 import type { ToolResult, ToolResultField } from "@sp/engine";
-import { readZigCpu, readZigTarget } from "./create-spec";
-import { readBuildMode, readMode } from "./pure";
+import { readBuild, readZigTarget } from "./create-spec";
+import { DEFAULT_ERROR_LIMIT, readMode } from "./pure";
 import type { ZigLayoutMode } from "./pure";
 import type { ZigLayoutSpec } from "./spec";
 
@@ -42,7 +42,7 @@ export function describeUnionTag(a: ZigAnalysis): string | null {
 }
 
 export function buildZigLayoutData(spec: ZigLayoutSpec, input: string): ZigLayoutData {
-  const analysis = analyzeZig(input, readZigTarget(spec.options), readBuildMode(spec.options), readZigCpu(spec.options));
+  const analysis = analyzeZig(input, readZigTarget(spec.options), readBuild(spec.options));
   const mode = readMode(spec.options);
   const display = mode === "optimized" ? (analysis.optimized ?? analysis.result) : analysis.result;
   const def = analysis.definition;
@@ -93,7 +93,8 @@ export function computeZigVerificationCode(spec: ZigLayoutSpec, input: string): 
   const expected = optimized ? a.optimized! : a.result;
   const filename = `${name.toLowerCase()}_verify.zig`;
   const target = getZigTarget(a.target.id);
-  const flags = zigTargetFlags(target, a.cpu.id).join(" ");
+  const errorLimit = a.errorLimit === DEFAULT_ERROR_LIMIT ? [] : ["--error-limit", String(a.errorLimit)];
+  const flags = [...zigTargetFlags(target, a.cpu.id), ...errorLimit].join(" ");
   const command = `zig run ${flags} -O ${a.mode} ${filename}`;
 
   return {
@@ -108,6 +109,9 @@ export function computeZigVerificationCode(spec: ZigLayoutSpec, input: string): 
       "1. Download or copy the program.",
       `2. On a ${target.label} machine, run it with \`${command}\` (Zig 0.16). For another machine, build it with \`zig build-exe ${flags} -O ${a.mode} ${filename}\` and run it there.`,
       "3. Compare the printed size, align and offsets with the Zig Type Layout tool.",
+      ...(errorLimit.length
+        ? ["zig counts every error name in the program against --error-limit, std.debug.print's own included, so with a small limit zig may refuse the program; its message says the limit it needs."]
+        : []),
       layoutGuaranteed(a)
         ? "This layout is defined by the language."
         : "A plain struct's field order is what this compiler chooses; other Zig versions may choose differently.",

@@ -58,7 +58,10 @@ export class References<T> {
     this.stored = new Map(Object.entries(data));
   }
 
-  /** A case this run knows about. Recording drops the ones no test names any more. */
+  /**
+   * A case this suite has, declared where its test is defined: vitest defines the tests a filter
+   * skips too, so a filtered recording keeps their answers and drops only the ones no test names.
+   */
   declare(key: string): void {
     this.known.add(key);
   }

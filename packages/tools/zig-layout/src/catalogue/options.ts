@@ -4,6 +4,7 @@ import { ZIG_TARGETS, ZIG_X86_64_CPUS } from "@sp/core";
 import {
   OPTION_BUILD_MODE,
   OPTION_COMPARE,
+  OPTION_ERROR_LIMIT,
   OPTION_EXPLAIN,
   OPTION_MODE,
   OPTION_ZIG_CPU,
@@ -40,6 +41,17 @@ const BUILD_MODE: OptionDef<ZigGroup> = {
   ],
   summary: "-O: whether bare unions (and std types holding a SafetyLock) carry safety state.",
   order: 1,
+  colSpan: 2,
+};
+
+const ERROR_LIMIT: OptionDef<ZigGroup> = {
+  id: OPTION_ERROR_LIMIT,
+  label: "Error limit",
+  group: "platform",
+  kind: "number",
+  arg: { min: 0, max: 4294967295, step: 1 },
+  summary: "--error-limit: how many error names the program may have. Error codes take log2 of it plus one bits: u16 by default (65535), u8 for 255.",
+  order: 3,
   colSpan: 2,
 };
 
@@ -94,8 +106,8 @@ const EXPLAIN: OptionDef<ZigGroup> = {
 };
 
 const CATALOGUES: Record<string, readonly OptionDef<ZigGroup>[]> = {
-  [TOOL_ZIG_STRUCT_LAYOUT]: [TARGET, BUILD_MODE, CPU, MODE, COMPARE, EXPLAIN],
-  [TOOL_ZIG_VERIFICATION_CODE]: [MODE, TARGET, BUILD_MODE, CPU],
+  [TOOL_ZIG_STRUCT_LAYOUT]: [TARGET, BUILD_MODE, CPU, ERROR_LIMIT, MODE, COMPARE, EXPLAIN],
+  [TOOL_ZIG_VERIFICATION_CODE]: [MODE, TARGET, BUILD_MODE, CPU, ERROR_LIMIT],
 };
 
 export function zigCatalogueFor(toolId: string): OptionCatalogue<ZigGroup> {

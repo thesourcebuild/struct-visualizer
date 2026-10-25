@@ -83,7 +83,7 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec vitest run tests/cross-compiler.test.ts tests/cpp-compiler.test.ts tests/compiler.test.ts tests/verification-program.test.ts
+      - run: pnpm exec vitest run tests/cross-compiler.test.ts tests/cpp-compiler.test.ts tests/verification-program.test.ts
         env:
           SP_REQUIRE_MSVC: "1"
 

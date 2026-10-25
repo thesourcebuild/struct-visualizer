@@ -238,7 +238,6 @@ export interface GoAnalysis {
   target: GoTarget;
   file: GoFile;
   errors: ParseError[];
-  warnings: ParseError[];
   /** The struct type being laid out: the last non-generic struct type declared. */
   definition: { name: string; line: number } | null;
   result: CalculationResult | null;
@@ -262,7 +261,6 @@ export function analyzeGo(code: string, targetId: string): GoAnalysis {
     target,
     file,
     errors: [...file.errors],
-    warnings: [...file.warnings],
     definition: null,
     result: null,
     optimized: null,
