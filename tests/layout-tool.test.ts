@@ -7,6 +7,7 @@ import {
   OPTION_ENUM_SIZE,
   OPTION_MODE,
   OPTION_OS,
+  OPTION_REFERENCE_MODEL,
   OPTION_TARGET,
   TAG_HAS_ENUM,
   TAG_OS_SELECTABLE,
@@ -67,6 +68,35 @@ describe("struct-layout spec", () => {
     const bare = tool.createSpec({ [OPTION_TARGET]: "8051-8bit" });
     expect(tool.variantTag!(bare, PADDED)).not.toContain(TAG_OS_SELECTABLE);
   });
+
+  // Names every object inherits are not targets: a stale or hand-edited link falls back to the default.
+  for (const name of ["toString", "constructor", "__proto__", "hasOwnProperty"]) {
+    it(`treats target "${name}" as unknown`, () => {
+      const spec = tool.createSpec({ [OPTION_TARGET]: name });
+      expect(spec).toEqual(tool.createSpec());
+      const current = tool.variants!(spec, PADDED).rows.filter((r) => r.current);
+      expect(current).toHaveLength(1);
+      expect(current[0]!.options[OPTION_TARGET]).toBe("intel-x64-amd");
+    });
+  }
+});
+
+describe("data-models reference tool", () => {
+  const reference = layoutToolDefinition("data-models");
+
+  it("lists the chosen model's primitive types", () => {
+    const result = reference.compute(reference.createSpec({ [OPTION_REFERENCE_MODEL]: "LLP64" }), "");
+    expect(result.tables![0]!.title).toMatch(/LLP64/);
+  });
+
+  for (const name of ["toString", "constructor", "__proto__", "hasOwnProperty"]) {
+    it(`treats reference model "${name}" as unknown`, () => {
+      const spec = reference.createSpec({ [OPTION_REFERENCE_MODEL]: name });
+      expect(spec).toEqual(reference.createSpec());
+      expect(reference.compute(spec, "")).toEqual(reference.compute(reference.createSpec(), ""));
+      expect(reference.describe(spec)).toBe(reference.describe(reference.createSpec()));
+    });
+  }
 });
 
 describe("struct-layout compute", () => {

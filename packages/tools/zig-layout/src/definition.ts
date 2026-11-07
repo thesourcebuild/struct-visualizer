@@ -79,7 +79,7 @@ export function zigToolDefinition(toolId: string): ToolDefinition<ZigLayoutSpec,
       return {
         ...base,
         lintRules: ZIG_LAYOUT_RULES,
-        describe: (spec) => `Memory layout on ${targetPhrase(spec)}, as Zig 0.16 lays it out.`,
+        describe: (spec) => `Memory layout on ${targetPhrase(spec)}, as Zig 0.17 lays it out.`,
         info: targetInfo,
         compute: computeZigLayout,
         variants: zigLayoutVariants,

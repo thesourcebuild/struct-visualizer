@@ -10,10 +10,8 @@ import { tokenize } from "../packages/core/src/parser/tokens";
  */
 function expand(source: string): string {
   const pre = preprocess(source);
-  const errors: ParseError[] = [];
-  const out = expandMacros(tokenize(pre.text), pre.macros, errors);
-  expect([...pre.errors, ...errors]).toEqual([]);
-  return out.map((t) => t.value).join(" ");
+  expect(pre.errors).toEqual([]);
+  return pre.tokens.map((t) => t.value).join(" ");
 }
 const spelled = (code: string) => tokenize(code).map((t) => t.value).join(" ");
 
@@ -144,8 +142,9 @@ describe("macro expansion (C11 6.10.3)", () => {
 
   it("reports pasting that does not make one token", () => {
     const pre = preprocess("#define P(a, b) a ## b\nP(x, +)");
+    expect(pre.errors.map((e) => e.message)).toEqual(["Pasting 'x' and '+' does not give a valid token."]);
     const errors: ParseError[] = [];
-    expandMacros(tokenize(pre.text), pre.macros, errors);
+    expandMacros(tokenize("P(x, +)"), pre.macros, errors);
     expect(errors.map((e) => e.message)).toEqual(["Pasting 'x' and '+' does not give a valid token."]);
   });
 
@@ -153,5 +152,38 @@ describe("macro expansion (C11 6.10.3)", () => {
     expect(preprocess("#define S(a) # b").errors[0]?.message).toMatch(/'#' in macro 'S' must be followed by a parameter/);
     expect(preprocess("#define P(a) ## a").errors[0]?.message).toMatch(/'##' cannot be at either end of macro 'P'/);
     expect(preprocess("#define Q a ##").errors[0]?.message).toMatch(/'##' cannot be at either end of macro 'Q'/);
+  });
+});
+
+describe("translation phases", () => {
+  it("expands each macro with the definition in effect where it is used", () => {
+    expect(expand("#define N 2\na N\n#undef N\n#define N 5\nb N\n#undef N\nc N")).toBe("a 2 b 5 c N");
+    expect(expand("M\n#define M 4\nM")).toBe("M 4");
+  });
+
+  it("lets an invocation's arguments run over a directive", () => {
+    expect(expand("#define F(a, b) a + b\nF(1,\n#define X 2\nX)")).toBe("1 + 2");
+  });
+
+  it("splices lines before removing comments, and without a space", () => {
+    expect(expand("#define N 1\\\n2\nN")).toBe("12");
+    expect(expand("#define N 4 /* one\n two */ + 1\nN")).toBe("4 + 1");
+    expect(expand("#define N 2\n// note \\\nN N\nN")).toBe("2");
+  });
+
+  it("gives each token the line its logical line starts on", () => {
+    const pre = preprocess("#define N 4 /* one\n two */ + 1\nint a; /* x\n y */ int b;\nint c;");
+    expect(pre.tokens.map((t) => `${t.value}@${t.line}`)).toEqual(["int@3", "a@3", ";@3", "int@3", "b@3", ";@3", "int@5", "c@5", ";@5"]);
+  });
+
+  it("does not evaluate what && || and ?: do not select in #if", () => {
+    expect(expand("#if 0 && (1 / 0)\nno\n#elif 1 || (1 / 0)\nyes\n#endif")).toBe("yes");
+    expect(expand("#if 1 ? 2 : 1 / 0\nyes\n#endif")).toBe("yes");
+  });
+
+  it("computes #if in intmax_t and uintmax_t", () => {
+    expect(expand("#if -1 > 0u\nyes\n#endif")).toBe("yes");
+    expect(expand("#if (0x80000000 | 0) > 0 && 0xFFFFFFFFFFFFFFFF > 0\nyes\n#endif")).toBe("yes");
+    expect(preprocess("#if 1.5 > 1\n#endif").errors[0]?.message).toMatch(/floating constant/);
   });
 });

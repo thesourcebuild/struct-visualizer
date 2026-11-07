@@ -19,7 +19,7 @@ export function memberTypeLabel(member: StructMember): string {
 /** Name plus array dimensions and bit width, e.g. `grid[3][4]`, `data[]`, `flags:3`. */
 export function memberDeclarator(member: StructMember): string {
   const dims = member.arrayDims
-    ? member.arrayDims.map((d, i) => (i === 0 && d === 0 && member.arraySize === 0 ? '[]' : `[${d}]`)).join('')
+    ? member.arrayDims.map((d, i) => (i === 0 && member.flexible ? '[]' : `[${d}]`)).join('')
     : member.arraySize !== undefined
       ? `[${member.arraySize}]`
       : '';

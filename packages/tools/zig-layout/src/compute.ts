@@ -106,7 +106,7 @@ export function computeZigVerificationCode(spec: ZigLayoutSpec, input: string): 
     ],
     working: [
       "1. Download or copy the program.",
-      `2. On a ${target.label} machine, run it with \`${command}\` (Zig 0.16). For another machine, build it with \`zig build-exe ${flags} -O ${a.mode} ${filename}\` and run it there.`,
+      `2. On a ${target.label} machine, run it with \`${command}\` (Zig 0.17). For another machine, build it with \`zig build-exe ${flags} -O ${a.mode} ${filename}\` and run it there.`,
       "3. Compare the printed size, align and offsets with the Zig Type Layout tool.",
       ...(errorLimit.length
         ? ["zig counts every error name in the program against --error-limit, std.debug.print's own included, so with a small limit zig may refuse the program; its message says the limit it needs."]

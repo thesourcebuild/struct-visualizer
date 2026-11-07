@@ -10,7 +10,7 @@ import { References, useReferences } from "./support/references";
 import type { Answer } from "./support/references";
 
 /**
- * Ground truth for Zig, from the installed compiler (0.16):
+ * Ground truth for Zig, from the installed compiler (0.17):
  * - every case on every target, in Debug, ReleaseSafe and ReleaseFast (which differ in the safety
  *   tag of bare unions, in std types holding a SafetyLock, and in the code generator that lays
  *   out vectors): size, alignment, the size of ?T and each field's @offsetOf (@bitOffsetOf for
@@ -26,7 +26,7 @@ const requireZig = Boolean(process.env.SP_REQUIRE_COMPILERS);
 
 let zig = false;
 try {
-  zig = execFileSync("zig", ["version"], { encoding: "utf8" }).trim().startsWith("0.16");
+  zig = execFileSync("zig", ["version"], { encoding: "utf8" }).trim().startsWith("0.17");
 } catch {
   zig = false;
 }
@@ -36,6 +36,8 @@ const TYPES = ["u8", "u16", "u32", "u64", "bool", "u24", "i48", "f32", "u128", "
 
 const CASES: Record<string, string> = {
   ...Object.fromEntries(zigExamples.map((e) => [e.name, e.code])),
+  // A carriage return is white space between tokens, and part of a CRLF line end.
+  "carriage returns as white space": "const S = extern struct { a: u8,\rb: u64,\r\nc: u16 };\r\n// note\r\n",
   // Field order: the compiler's pdq sort, through insertion sort (up to 24 fields) and beyond.
   "equal alignments": "const S = struct { a: u8, b: u32, c: u8, d: u32, e: u16, f: u8, g: u16 };",
   "30 fields": `const S = struct { ${fields(30, (i) => `f${i}: ${TYPES[(i * 7) % TYPES.length]}`)} };`,
@@ -77,8 +79,11 @@ const CASES: Record<string, string> = {
   "generic with @This": "fn List(comptime T: type) type {\n    return struct {\n        const Self = @This();\n        head: ?*Node,\n        len: usize,\n        const Node = struct { value: T, next: ?*Node };\n    };\n}\nconst S = struct { a: List(u8), b: List(u64), c: u8 };",
   "generic with if": "fn Small(comptime n: comptime_int) type {\n    if (n <= 255) return u8;\n    return u32;\n}\nconst S = struct { a: Small(10), b: Small(1000), c: u16 };",
   "nested declarations": "const Outer = struct {\n    pub const Inner = struct { x: u16, y: u8 };\n    a: Inner,\n    b: u64,\n};\nconst S = struct { o: Outer, i: Outer.Inner };",
-  "@Int and std.meta.Int": "const std = @import(\"std\");\nconst S = struct { a: @Int(.unsigned, 12), b: std.meta.Int(.signed, 40), c: [std.math.maxInt(u4)]u8, d: u8 };",
-  "builtin mode": "const builtin = @import(\"builtin\");\nconst S = struct { a: if (builtin.mode == .Debug) u64 else u8, b: u8 };",
+  "@Int and std.math": "const std = @import(\"std\");\nconst S = struct { a: @Int(.unsigned, 12), b: @Int(.signed, 40), c: [std.math.maxInt(u4)]u8, d: [std.math.minInt(i3) + 9]u8, e: std.math.Log2Int(u24) };",
+  "builtin mode": "const builtin = @import(\"builtin\");\nconst S = struct { a: if (builtin.mode == .debug) u64 else u8, b: u8 };",
+  // A switch prong's item has the subject's type, so `.Debug` there is the declaration Optimize.Debug.
+  "builtin mode, switch with decl literals": "const builtin = @import(\"builtin\");\nconst std = @import(\"std\");\nconst S = struct { a: switch (builtin.mode) { .Debug, .ReleaseSafe => u64, .ReleaseFast, .ReleaseSmall => u8 }, b: if (std.debug.runtime_safety) u32 else u8, c: u8 };",
+  "decl literals": "const E = enum(u8) { a, b, c, pub const default: E = .c; };\nconst x: E = .default;\nconst S = struct { a: [@intFromEnum(x) + 1]u16, b: [@backingInt(x)]u8, c: u8 };",
   // std types
   "std: ArrayList and Allocator": "const std = @import(\"std\");\nconst S = struct { a: std.ArrayList(u8), b: std.ArrayListUnmanaged(u32), c: std.array_list.Managed(u16), d: std.mem.Allocator, e: u8 };",
   "std: hash maps": "const std = @import(\"std\");\nconst S = struct { a: std.AutoHashMap(u32, u64), b: std.StringHashMap(u8), c: std.AutoHashMapUnmanaged(u8, u8), d: std.StringHashMapUnmanaged(void), e: u8 };",
@@ -91,6 +96,15 @@ const CASES: Record<string, string> = {
   "switch and captures": "fn Pick(comptime n: comptime_int) type {\n    return switch (n) {\n        0 => void,\n        1...8 => u8,\n        9, 10 => u16,\n        else => u64,\n    };\n}\nfn Or(comptime T: ?type) type {\n    if (T) |t| return t;\n    return u32;\n}\nconst S = struct { a: Pick(0), b: Pick(5), c: Pick(10), d: Pick(100), e: Or(u8), f: Or(null) };",
   "typed comptime integers": "const bits: u16 = 12;\nconst W = @Int(.unsigned, 16 - @clz(bits - 1));\nconst S = struct { a: W, b: [@popCount(@as(u8, 0b1011))]u8, c: [@ctz(@as(u32, 8))]u16, d: u8 };",
   "std: PriorityQueue": "const std = @import(\"std\");\nfn lessThan(_: void, a: u32, b: u32) std.math.Order {\n    return std.math.order(a, b);\n}\nconst S = struct { q: std.PriorityQueue(u32, void, lessThan), f: u8 };",
+  "std: Deque and dynamic bit sets": "const std = @import(\"std\");\nconst S = struct { a: std.Deque(u16), b: std.DynamicBitSet, c: std.DynamicBitSetUnmanaged, d: std.bit_set.Static(100), e: std.bit_set.Integer(9), f: u8 };",
+  // The comptime evaluator: casts, shifts, builtins and their result types, as Sema computes them.
+  "typed shifts drop the bits shifted out": "const x: u8 = 0x81;\nconst S = struct { a: [x << 1]u8, b: [@as(u8, 3) << 7]u8, c: [@as(u8, 0x81) <<| 1]u8, d: [@as(u8, 200) >> 3]u8, e: [@as(u8, 1) <<| 9]u8 };",
+  "@TypeOf of typed values and peers": "const a: u16 = 3;\nconst E = enum { x, y };\nconst n: ?u8 = 5;\nconst S = struct { x: @TypeOf(a), y: u8, z: @TypeOf(E.x), w: @TypeOf(a, @as(u32, 1)), v: @TypeOf(@as(i8, 1), @as(u8, 1)), o: @TypeOf(null, a), p: @TypeOf(n, 3), q: @TypeOf(E.x, .y) };",
+  "@min and @max narrow, division keeps the width": "const a: u8 = 200;\nconst m = @min(a, 10);\nconst S = struct { a: @TypeOf(m), b: @TypeOf(@max(a, 300)), c: [m + 5]u8, d: @TypeOf(@min(@as(u8, 200), @as(i8, -3))), e: [@divTrunc(a, 7)]u8, f: [@divCeil(a, 7)]u8, g: [@mod(@as(i16, -7), 3)]u8, h: @TypeOf(@divFloor(a, 2)) };",
+  "@bitSizeOf of arrays and vectors": "const S = struct { a: [@bitSizeOf([3]bool)]u8, b: [@bitSizeOf([3]u7)]u8, c: [@bitSizeOf([2:0]u7)]u8, d: [@bitSizeOf(@Vector(3, u7))]u8, e: [@bitSizeOf(?*u8)]u8, f: [@bitSizeOf([2]packed struct { a: u3, b: u2 })]u8 };",
+  "@intCast and @truncate take the result type": "const a: u16 = 0x1234;\nconst b: u8 = @truncate(a);\nconst c: u8 = @intCast(a >> 8);\nfn F(comptime n: u8) type {\n    return [n]u8;\n}\nconst S = struct { x: [b]u8, y: [c]u8, z: F(@intCast(a & 0xf)), w: [@intCast(a & 3)]u8, v: [@as(u4, @truncate(a))]u8 };",
+  "orelse": "const T: ?type = null;\nconst n: ?u8 = 5;\nconst U = T orelse u16;\nconst S = struct { a: U, b: [n orelse 1]u8, c: [@as(?u8, null) orelse 3]u8 };",
+  "sentinels of enums, floats and optionals": "const E = enum(u8) { a, b };\nconst S = struct { a: [2:.b]E, b: [2:0]f32, c: [2:null]?*u8, d: [3:false]bool, e: [1:0.5]f64 };",
 };
 
 const MODES: ZigBuildMode[] = ["Debug", "ReleaseSafe", "ReleaseFast"];
@@ -244,9 +258,37 @@ const REJECTED: Record<string, string> = {
   "capture of a non-optional": "fn F(comptime T: type) type {\n    if (T) |t| return t;\n    return u8;\n}\nconst S = struct { a: F(u16) };",
   "inactive union field": "const S = struct { a: [@typeInfo(u8).float.bits]u8 };",
   "unwrapping null": "const n: ?u8 = null;\nconst S = struct { a: [n.?]u8 };",
+  "shift amount not below the width": "const x: u7 = 1;\nconst S = struct { a: [x << 7]u8 };",
+  "shift by a negative amount": "const S = struct { a: [1 << -1]u8 };",
+  "@max overflowing in the sum": "const a: u8 = 200;\nconst S = struct { x: [@max(a, 100) + @max(a, 100)]u8 };",
+  "@min narrowed to u4": "const a: u8 = 200;\nconst m = @min(a, 10);\nconst S = struct { x: [m + 10]u8 };",
+  "@divTrunc keeps the width": "const a: u8 = 200;\nconst S = struct { x: [@divTrunc(a, 1) + 100]u8 };",
+  "@divTrunc operand out of the peer type": "const a: u8 = 200;\nconst S = struct { x: [@divTrunc(a, 300)]u8 };",
+  "@mod by zero": "const S = struct { x: [@mod(7, 0)]u8 };",
+  "@intCast out of range": "const a: u16 = 300;\nconst b: u8 = @intCast(a);\nconst S = struct { x: [b]u8 };",
+  "@intCast without a result type": "const a: u16 = 30;\nconst S = struct { x: [@intCast(a) + 1]u8 };",
+  "@truncate changing signedness": "const a: u16 = 0xff;\nconst b: i8 = @truncate(a);\nconst S = struct { x: [@as(u8, @bitCast(b))]u8 };",
+  "@enumFromInt of no tag": "const E = enum(u8) { a, b };\nconst x: E = @enumFromInt(7);\nconst S = struct { y: [@intFromEnum(x)]u8 };",
+  "@bitCast of comptime_int": "const b: i8 = @bitCast(255);\nconst S = struct { x: [@as(u8, @bitCast(b))]u8 };",
+  "@sizeOf of comptime_int": "const S = struct { x: [@sizeOf(comptime_int) + 1]u8 };",
+  "@sizeOf of type": "const S = struct { x: [@sizeOf(type) + 1]u8 };",
+  "@sizeOf of noreturn": "const S = struct { x: [@sizeOf(noreturn) + 1]u8 };",
+  "@bitSizeOf of a plain struct": "const P = struct { a: u8 };\nconst S = struct { x: [@bitSizeOf(P)]u8 };",
+  "@bitSizeOf of an optional integer": "const S = struct { x: [@bitSizeOf(?u8)]u8 };",
+  "negating an unsigned integer": "const a: u8 = 0;\nconst S = struct { x: [-a + 3]u8 };",
+  "~ of comptime_int": "const S = struct { x: [~5 & 7]u8 };",
+  "@TypeOf of incompatible peers": "const a: u16 = 3;\nconst S = struct { x: @TypeOf(a, true) };",
+  "orelse of a non-optional": "const a: u8 = 5;\nconst S = struct { x: [a orelse 1]u8 };",
+  "struct sentinel": "const P = struct { a: u8 };\nconst S = struct { x: [2:.{ .a = 0 }]P };",
+  "array sentinel": "const S = struct { x: [2:.{ 0, 0 }][2]u8 };",
+  "sentinel out of range": "const S = struct { x: [2:300]u8 };",
+  "sentinel not exactly a float": "const S = struct { x: [2:16777217]f32 };",
+  "comparing the mode with a declaration name": "const builtin = @import(\"builtin\");\nconst S = struct { a: if (builtin.mode == .Debug) u64 else u8, b: u8 };",
+  "std.meta.Int is gone": "const std = @import(\"std\");\nconst S = struct { a: std.meta.Int(.unsigned, 8) };",
+  "return value out of the return type": "fn F() u8 {\n    return 300;\n}\nconst S = struct { x: [F()]u8 };",
 };
 
-it.runIf(requireZig)("zig 0.16 is installed", () => {
+it.runIf(requireZig)("zig 0.17 is installed", () => {
   expect(zig).toBe(true);
 });
 
@@ -282,7 +324,7 @@ describe(`Zig rejects what the engine rejects${compileHere ? "" : " (recorded an
   }
 });
 
-describe(`Zig layout matches zig 0.16${compileHere ? "" : " (recorded answers)"}`, () => {
+describe(`Zig layout matches zig 0.17${compileHere ? "" : " (recorded answers)"}`, () => {
   beforeAll(async () => {
     if (compileHere) await compileAll();
   }, 1_800_000);
@@ -311,7 +353,7 @@ const ERROR_LIMIT_CASES: Record<string, string> = {
 const ERROR_LIMITS = [0, 1, 2, 3, 255, 256, 65535, 65536, 4294967295];
 const ERROR_LIMIT_TARGETS = ["x86_64-linux-gnu", "avr-freestanding-none"];
 
-describe(`--error-limit matches zig 0.16${compileHere ? "" : " (recorded answers)"}`, () => {
+describe(`--error-limit matches zig 0.17${compileHere ? "" : " (recorded answers)"}`, () => {
   const cases = ERROR_LIMIT_TARGETS.flatMap((targetId) =>
     ERROR_LIMITS.flatMap((limit) =>
       Object.entries(ERROR_LIMIT_CASES).map(([label, code]) => {

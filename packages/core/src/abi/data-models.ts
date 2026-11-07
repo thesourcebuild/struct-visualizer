@@ -634,12 +634,17 @@ export function getStandardTypeMap(dataModel: DataModel): Record<string, { size:
         'double': { size: model.dataTypes.doubleSize, alignment: model.dataTypes.doubleSize },
         'float64': { size: model.dataTypes.doubleSize, alignment: model.dataTypes.doubleSize },
         'f64': { size: model.dataTypes.doubleSize, alignment: model.dataTypes.doubleSize },
-        'long double': { size: model.dataTypes.doubleSize, alignment: model.dataTypes.doubleSize },
+        // As double unless the target sets its own (resolveArchitectureForSelection). SDCC has none:
+        // it rejects `long` on a floating type.
+        ...(dataModel !== 'SDCC' && { 'long double': { size: model.dataTypes.doubleSize, alignment: model.dataTypes.doubleSize } }),
         'size_t': { size: model.dataTypes.pointerSize, alignment: model.dataTypes.pointerSize },
         'ssize_t': { size: model.dataTypes.pointerSize, alignment: model.dataTypes.pointerSize },
         'intptr_t': { size: model.dataTypes.pointerSize, alignment: model.dataTypes.pointerSize },
         'uintptr_t': { size: model.dataTypes.pointerSize, alignment: model.dataTypes.pointerSize },
         'ptrdiff_t': { size: model.dataTypes.pointerSize, alignment: model.dataTypes.pointerSize },
+        // The type of nullptr (std::nullptr_t, decltype(nullptr)): a pointer's size and alignment
+        // with g++ and MSVC (tests/cpp-compiler.test.ts).
+        'nullptr_t': { size: model.dataTypes.pointerSize, alignment: model.dataTypes.pointerSize },
         'bool': { size: 1, alignment: 1 },
         '_Bool': { size: 1, alignment: 1 },
         // wchar_t is 16-bit on Windows (LLP64) and 32-bit on Unix-like and most embedded ABIs.
@@ -724,14 +729,21 @@ export function resolveArchitectureForSelection(
             }
             break;
         case 'arm32':
-        case 'riscv32':
+            // AAPCS: long double is double (arm-linux-gnueabihf-gcc, arm-none-eabi-gcc).
             defaultAlignment = 4;
             maxAlignment = 8;
             break;
+        case 'riscv32':
         case 'arm64':
         case 'riscv64':
-            defaultAlignment = 8;
+            // long double is IEEE binary128, 16 bytes and 16-aligned, on Linux and bare metal alike
+            // (aarch64-linux-gnu-gcc; riscv64-linux-gnu-gcc and riscv64-unknown-elf-gcc, ilp32 and lp64).
+            defaultAlignment = targetArchitecture === 'riscv32' ? 4 : 8;
             maxAlignment = 16;
+            dataTypes = {
+                ...(dataTypes ?? {}),
+                'long double': { name: 'long double', size: 16, alignment: 16, category: 'primitive' as const },
+            };
             break;
         case 'microchip-8bit':
             // AVR (avr-gcc, which XC8 for AVR is built on) aligns every type to 1.
@@ -768,12 +780,50 @@ export function resolveArchitectureForSelection(
             break;
     }
 
+    // GCC's __BIGGEST_ALIGNMENT__, measured with each target's gcc: 16 where SSE or a 16-byte long
+    // double needs it (above the largest scalar alignment on i386), 8 on ARM32 and MIPS, 1 on AVR.
+    const biggestAlignment = targetArchitecture === 'intel-x86' ? 16 : maxAlignment;
+    // Plain char: unsigned on ARM, AArch64, RISC-V and PowerPC (their gcc) and on SDCC; signed on
+    // x86 (gcc, MSVC), MIPS and AVR. Not measured for XC16 and Keil C51.
+    const charSigned = dataModel === 'SDCC' ? false
+        : ['arm32', 'arm64', 'riscv32', 'riscv64', 'powerpc32'].includes(targetArchitecture) ? false
+        : ['intel-x86', 'intel-x64-amd', 'mips32-be', 'microchip-32bit', 'microchip-8bit'].includes(targetArchitecture) ? true
+        : undefined;
+    // wchar_t: MSVC's is unsigned short; gcc's is a 4-byte int, unsigned on ARM and AArch64, except
+    // AVR's 2-byte int; SDCC's is a 4-byte unsigned long. Not measured for XC16 and Keil C51.
+    const wchar = osType === 'windows' ? { size: 2, signed: false }
+        : dataModel === 'SDCC' ? { size: 4, signed: false }
+        : targetArchitecture === 'microchip-8bit' ? { size: 2, signed: true }
+        : targetArchitecture === 'arm32' || targetArchitecture === 'arm64' ? { size: 4, signed: false }
+        : ['intel-x86', 'intel-x64-amd', 'riscv32', 'riscv64', 'powerpc32', 'mips32-be', 'microchip-32bit'].includes(targetArchitecture) ? { size: 4, signed: true }
+        : undefined;
+    if (wchar) {
+        dataTypes = { ...(dataTypes ?? {}), 'wchar_t': { name: 'wchar_t', size: wchar.size, alignment: wchar.size, category: 'primitive' as const } };
+    }
+    // GCC's __int128 and its typedef names __int128_t and __uint128_t: 16 bytes, 16-aligned, on its
+    // 64-bit targets (x86-64, AArch64, RISC-V 64, Linux and bare metal). Every 32-bit and 8-bit gcc
+    // here says "'__int128' is not supported on this target", MSVC (x64 and x86) "C4235: '__int128'
+    // keyword not supported on this architecture", and SDCC takes it for an unknown name.
+    if (osType !== 'windows' && dataModel !== 'SDCC' && ['intel-x64-amd', 'arm64', 'riscv64'].includes(targetArchitecture)) {
+        const int128 = (name: string) => ({ name, size: 16, alignment: 16, category: 'primitive' as const });
+        dataTypes = {
+            ...(dataTypes ?? {}),
+            '__int128': int128('__int128'),
+            'unsigned __int128': int128('unsigned __int128'),
+            '__int128_t': int128('__int128_t'),
+            '__uint128_t': int128('__uint128_t'),
+        };
+    }
+
     return {
         ...baseArchitecture,
         dataTypes,
         pointerSize,
         defaultAlignment,
         maxAlignment,
+        ...(biggestAlignment !== undefined && { biggestAlignment }),
+        ...(charSigned !== undefined && { charSigned }),
+        ...(wchar && { wcharSize: wchar.size, wcharSigned: wchar.signed }),
         ...((targetArchitecture === 'powerpc32' || targetArchitecture === 'mips32-be') && { endianness: 'big' as const }),
         ...(preferredAlignment && { preferredAlignment }),
         ...bitfieldAndEnumRules(dataModel, targetArchitecture, osType),

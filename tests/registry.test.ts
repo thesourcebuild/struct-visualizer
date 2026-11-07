@@ -49,5 +49,30 @@ describe("registry", () => {
         expect(result.error, `${manifest.id}/${sample.id}`).toBeUndefined();
       }
     });
+
+    // A share link or saved state can carry any string. Names every object inherits are no
+    // option's ids, so each option given one behaves exactly as if it had been left out.
+    it(`${manifest.id}: treats inherited object names as unknown option values`, async () => {
+      const tool = await loadTool(manifest.id);
+      const input = tool.samples?.[0]?.input ?? "";
+      const run = (spec: ReturnType<typeof tool.createSpec>) => ({
+        describe: tool.describe(spec),
+        info: tool.info?.(spec),
+        choices: tool.catalogue.all.map((def) => tool.choicesFor?.(spec, def.id)),
+        result: tool.compute(spec, input),
+        variants: tool.variants?.(spec, input),
+        tags: tool.variantTag?.(spec, input),
+      });
+      const expected = run(tool.createSpec());
+      for (const def of tool.catalogue.all) {
+        for (const name of ["toString", "constructor", "__proto__", "hasOwnProperty"]) {
+          const spec = tool.createSpec({ [def.id]: name });
+          expect(tool.specSchema.safeParse(spec).success, `${def.id}=${name}`).toBe(true);
+          expect(run(spec), `${def.id}=${name}`).toEqual(expected);
+          const changed = tool.onOptionChange?.(tool.createSpec(), def.id, name);
+          if (changed) expect(run(changed), `onOptionChange ${def.id}=${name}`).toEqual(expected);
+        }
+      }
+    });
   }
 });

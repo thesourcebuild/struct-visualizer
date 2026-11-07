@@ -4,6 +4,7 @@ import type {
   CalculationResult,
   CppBase,
   EnumMember,
+  MsInheritanceModel,
   SourceLanguage,
   ParseError,
   ParsedEnum,
@@ -13,10 +14,13 @@ import type {
 } from '../types';
 import type { DataModel } from '../abi/data-models';
 import { PaddingCalculator } from '../layout/padding-calculator';
-import { ConstExprError, evaluateConstExpr } from './const-expr';
-import type { ConstExprContext, TypeOracle } from './const-expr';
-import { expandMacros, packAt, preprocess } from './preprocess';
+import { msInheritanceModel } from '../layout/cpp-layout';
+import { dataModels } from '../abi/data-models';
+import { ConstExprError, evaluateConstExpr, evaluateIntegerConstExpr, expressionType, integerType } from './const-expr';
+import type { ConstantValue, ConstExprContext, IntegerModel, IntType, ScalarType, TypeOracle } from './const-expr';
+import { packAt, preprocess } from './preprocess';
 import type { Preprocessed } from './preprocess';
+import { MAX_NESTING, Nesting, NestingError } from '../nesting';
 import { findClosing, tokenize } from './tokens';
 import type { Token } from './tokens';
 
@@ -48,6 +52,8 @@ const STANDARD_TYPEDEFS: ReadonlyMap<string, 'signed' | 'unsigned'> = new Map([
   ['intptr_t', 'signed'], ['uintptr_t', 'unsigned'], ['ptrdiff_t', 'signed'], ['size_t', 'unsigned'],
   ['ssize_t', 'signed'],
 ]);
+/** GCC's typedef names for __int128, built in on the targets that have the type. */
+const INT128_TYPEDEFS: ReadonlyMap<string, 'signed' | 'unsigned'> = new Map([['__int128_t', 'signed'], ['__uint128_t', 'unsigned']]);
 
 const QUALIFIERS = new Set([
   'const', 'volatile', 'restrict', '__restrict', '__restrict__', '_Atomic', 'mutable', 'register',
@@ -75,7 +81,10 @@ const UNMODELLED_LAYOUT_ATTRIBUTES = new Set(['mode', 'vector_size', 'ms_struct'
 
 interface Attributes {
   packed?: boolean;
+  /** `aligned` attributes and alignas specifiers: the strictest of them counts (GCC, MSVC). */
   aligned?: AlignRequest;
+  /** `__declspec(align(n))`: MSVC keeps the last one, then the stricter of it and `aligned`. */
+  declspecAlign?: AlignRequest;
   noUniqueAddress?: 'std' | 'msvc';
   /** `__declspec(empty_bases)`. */
   emptyBases?: boolean;
@@ -88,7 +97,9 @@ type BaseSpec =
   | { kind: 'builtin'; words: string[] }
   | { kind: 'name'; name: string }
   | { kind: 'record'; keyword: RecordKeyword; tag?: string; def?: ParsedStruct }
-  | { kind: 'enum'; tag?: string; def?: ParsedEnum };
+  | { kind: 'enum'; tag?: string; def?: ParsedEnum }
+  /** `typeof(...)` / `__typeof__(...)`: the type of a type-name or of an expression. */
+  | { kind: 'typeof'; type: TypeInfo; spelled: string };
 
 interface Specifiers {
   base?: BaseSpec;
@@ -106,8 +117,11 @@ interface Specifiers {
 }
 
 type Derivation =
-  /** A pointer, or a C++ reference (`&`, `&&`); `cv` are the qualifiers written after it. */
-  | { kind: 'ptr'; ref?: '&' | '&&'; cv?: string[] }
+  /**
+   * A pointer, a C++ reference (`&`, `&&`), or a C++ pointer to a member of class `memberOf`
+   * (`A::*`); `cv` are the qualifiers written after it.
+   */
+  | { kind: 'ptr'; ref?: '&' | '&&'; memberOf?: string; cv?: string[] }
   | { kind: 'array'; size: number | null }
   /** `quals`: what follows the parameters: const, volatile, &, &&, override, final, noexcept. */
   | { kind: 'func'; params: string; paramTokens: Token[]; quals: string[] };
@@ -129,6 +143,8 @@ interface TypeInfo {
   /** A pointer to a function, not to data. Kept through typedefs and arrays of the type. */
   functionPointer?: boolean;
   dims: number[];
+  /** The first dimension was left empty: a flexible array member (dims[0] is 0). */
+  flexible?: boolean;
   recordRef?: { keyword: RecordKeyword; name: string };
   nestedStruct?: ParsedStruct;
   enumRef?: string;
@@ -137,6 +153,8 @@ interface TypeInfo {
   typeAlignment?: AlignRequest;
   /** For a data pointer: what it points to, for `->` and `*` in constant expressions. */
   pointee?: TypeInfo;
+  /** A C++ pointer to member (StructMember.memberPointer), whose class is looked at where it is used. */
+  memberPointer?: { className: string; function: boolean };
 }
 
 class Recover extends Error {}
@@ -156,19 +174,61 @@ export class StructParser {
   private typedefSpellings: Map<string, string> = new Map();
   /** Alignment set by an aligned typedef of a struct, union or enum, by alias name. */
   private aliasAlignments: Map<string, AlignRequest> = new Map();
-  private enumConstants: Map<string, number> = new Map();
+  private enumConstants: Map<string, ConstantValue> = new Map();
   private definitionOrder: Array<{ name: string; isUnion: boolean }> = [];
   private anonymousTypeCounter = 0;
+  /** C++: the classes whose bodies are being parsed, innermost last. */
+  private defining: ParsedStruct[] = [];
+  /** C++: classes a pointer to member named before they were defined (MSVC's 'unspecified'). */
+  private usedIncomplete: Set<string> = new Set();
   private pre: Preprocessed | null = null;
   private tokens: Token[] = [];
   private pos = 0;
+  /** How deeply nested what is being parsed is, its constant expressions included. */
+  private nesting = new Nesting();
   /** Measures types for `sizeof` and friends, with the definitions parsed so far. */
   private readonly calculator: PaddingCalculator;
   private readonly oracle: TypeOracle<TypeInfo>;
+  /** The target's integer types and its compiler's constant folding. */
+  private readonly integers: IntegerModel;
 
   constructor(private readonly target: ParserTarget) {
     this.calculator = new PaddingCalculator(target.architecture, target.dataModel);
     this.oracle = this.createOracle();
+    this.integers = this.integerModel();
+  }
+
+  /** Whether the target has GCC's __int128 (its type tables say so: data-models.ts). */
+  private get hasInt128(): boolean {
+    return this.target.architecture.dataTypes?.['__int128'] !== undefined;
+  }
+
+  /** The compiler the target's rules are measured on, which bitfieldLayout names. */
+  private get compiler(): 'gcc' | 'msvc' | 'sdcc' {
+    const rules = this.target.architecture.bitfieldLayout;
+    return rules === 'ms' ? 'msvc' : rules === 'sdcc' ? 'sdcc' : 'gcc';
+  }
+
+  private integerModel(): IntegerModel {
+    const types = dataModels[this.target.dataModel].dataTypes;
+    const bytes = (type: string) => this.calculator.measure({ name: '', type }).size;
+    const pointer = this.target.architecture.pointerSize ?? types.pointerSize;
+    // size_t is the unsigned type of a pointer's size (SDCC's 3-byte generic pointers aside:
+    // its size_t is unsigned int, and its folding gives sizeof its own type anyway).
+    const sizeType = (['unsigned int', 'unsigned long', 'unsigned long long'] as const).find((t) => bytes(t) === pointer) ?? 'unsigned int';
+    return {
+      short: 8 * types.shortSize,
+      int: 8 * types.intSize,
+      long: 8 * types.longSize,
+      longLong: 8 * types.longLongSize,
+      charSigned: this.target.architecture.charSigned,
+      sizeType,
+      floatBytes: { float: bytes('float'), double: bytes('double'), 'long double': this.compiler === 'sdcc' ? bytes('double') : bytes('long double') },
+      // GCC: no constant (measured with every gcc here); SDCC and MSVC fold to the wrapped value.
+      overflow: this.compiler === 'gcc' ? 'not-constant' : 'wrap',
+      folding: this.compiler === 'sdcc' ? 'sdcc' : 'iso',
+      ...(this.compiler !== 'gcc' && { shiftPastWidth: this.compiler === 'msvc' ? ('zero' as const) : ('host32' as const) }),
+    };
   }
 
   parse(code: string): ValidationResult {
@@ -186,18 +246,27 @@ export class StructParser {
     this.enumConstants.clear();
     this.definitionOrder = [];
     this.anonymousTypeCounter = 0;
+    this.defining = [];
+    this.usedIncomplete.clear();
 
-    this.pre = preprocess(code);
+    this.pre = preprocess(code, { integers: this.integers, bareCrEndsLine: this.compiler !== 'msvc' });
     this.errors.push(...this.pre.errors);
     this.warnings.push(...this.pre.warnings);
-    this.tokens = expandMacros(tokenize(this.pre.text), this.pre.macros, this.errors);
+    this.tokens = this.pre.tokens;
     this.pos = 0;
+    this.nesting = new Nesting();
 
     while (this.pos < this.tokens.length) {
       const start = this.pos;
       try {
         this.parseTopLevel();
       } catch (err) {
+        if (err instanceof NestingError) {
+          // Past the limit, what follows is not read: it is inside what could not be.
+          this.errors.push({ message: err.message, line: err.line ?? this.currentLine(), type: 'syntax' });
+          this.pos = this.tokens.length;
+          break;
+        }
         if (!(err instanceof Recover)) throw err;
         this.skipDeclaration(start);
       }
@@ -286,15 +355,16 @@ export class StructParser {
   }
 
   private exprContext(): ConstExprContext<TypeInfo> {
-    return { identifier: (name) => this.enumConstants.get(name), types: this.oracle };
+    return { identifier: (name) => this.enumConstants.get(name), types: this.oracle, integers: this.integers, nesting: this.nesting };
   }
 
   private evaluate(tokens: Token[], what: string, line: number): number {
     try {
       return evaluateConstExpr(tokens, this.exprContext());
     } catch (err) {
-      const reason = err instanceof ConstExprError ? err.message : String(err);
-      return this.fail(`${what} '${tokens.map((t) => t.value).join(' ')}' is not an integer constant: ${reason}.`, line);
+      // A type in the expression that is already reported (Recover), or nesting past the limit.
+      if (!(err instanceof ConstExprError)) throw err;
+      return this.fail(`${what} '${tokens.map((t) => t.value).join(' ')}' is not an integer constant: ${err.message}.`, line);
     }
   }
 
@@ -345,6 +415,10 @@ export class StructParser {
     }
     if (t.kind === 'id' && (t.value === 'using' || t.value === 'template')) {
       this.requireCpp(`'${t.value}'`, t.line);
+      if (t.value === 'using' && this.parseAliasDeclaration()) {
+        this.expectPunct(';', 'after the alias declaration');
+        return;
+      }
       if (t.value === 'template') {
         this.warnings.push({ message: 'Templates are not laid out: a template has no layout until it is instantiated.', line: t.line, type: 'warning' });
       }
@@ -369,6 +443,20 @@ export class StructParser {
       declarators.push(decl);
       // Function definition at top level: skip its body.
       if (decl.derivations[0]?.kind === 'func' && this.isPunct('{')) {
+        this.skipDeclaration(this.pos);
+        this.finishTopLevelRecord(spec, declarators);
+        return;
+      }
+      // A K&R definition (C before C23): its parameters' declarations, then its body.
+      if (decl.derivations[0]?.kind === 'func' && !this.isCpp && declarators.length === 1 && (this.isId('register') || this.startsTypeName(this.peek()))) {
+        if (this.compiler === 'sdcc') {
+          this.fail(`SDCC rejects the old-style definition of '${decl.name ?? ''}': declare its parameters' types in the parameter list.`, decl.line);
+        }
+        while (this.pos < this.tokens.length && !this.isPunct('{')) {
+          if (this.isPunct('(') || this.isPunct('[')) this.pos = findClosing(this.tokens, this.pos);
+          this.pos += 1;
+        }
+        if (!this.isPunct('{')) this.fail(`Expected the body of '${decl.name ?? ''}' after its parameter declarations.`, decl.line);
         this.skipDeclaration(this.pos);
         this.finishTopLevelRecord(spec, declarators);
         return;
@@ -491,7 +579,7 @@ export class StructParser {
     this.typedefNames.add(name);
     this.typedefSpellings.set(name, this.spellType(spec, decl.derivations, false));
     // `typedef int a8 __attribute__((aligned(8)));` gives the new type its own alignment.
-    const aligned = decl.attrs.aligned ?? spec.attrs.aligned;
+    const aligned = this.requestedAlignment(spec.attrs, decl.attrs);
     if (decl.derivations.length === 0 && base.kind === 'record') {
       const target = base.def?.name ?? base.tag;
       // `typedef struct Tag Alias;` may precede Tag's definition; references resolve at the end.
@@ -507,11 +595,30 @@ export class StructParser {
     }
     if (decl.derivations[0]?.kind === 'func') return; // function type alias: never a member type
     const info = this.applyDeclarator(this.baseTypeInfo(spec), decl, name);
-    if (info.dims.includes(0)) {
-      this.errors.push({ message: `Typedef '${name}' cannot have an array of unknown size.`, line: decl.line, type: 'semantic' });
+    if (this.compiler === 'msvc' && info.dims.includes(0)) {
+      this.errors.push({ message: `MSVC rejects the zero-length array type '${name}' (C2466).`, line: decl.line, type: 'semantic' });
       return;
     }
     this.typeAliases.set(name, { ...info, declaredType: name, ...(aligned !== undefined && { typeAlignment: aligned }) });
+  }
+
+  /**
+   * C++ `using Name = type-id` at `using`, up to its ';': an alias, registered as a typedef is.
+   * False, consuming nothing, for any other `using` (a using-directive or using-declaration).
+   */
+  private parseAliasDeclaration(): boolean {
+    const nameTok = this.peek(1);
+    if (nameTok?.kind !== 'id' || KEYWORDS.has(nameTok.value)) return false;
+    let k = 2;
+    if (this.isPunct('[', k) && this.isPunct('[', k + 1)) k = findClosing(this.tokens, this.pos + k) - this.pos + 1;
+    if (!this.isPunct('=', k)) return false;
+    this.pos += k + 1;
+    const spec = this.parseSpecifiers(null, false);
+    if (!spec.base) this.fail(`Expected a type after 'using ${nameTok.value} ='.`, nameTok.line);
+    const decl = this.parseDeclarator(true);
+    if (decl.name !== undefined) this.fail(`Expected a type after 'using ${nameTok.value} =' but found the name '${decl.name}'.`, nameTok.line);
+    this.registerTypedef(spec, { ...decl, name: nameTok.value });
+    return true;
   }
 
   // ------------------------------------------------------------------ specifiers
@@ -590,6 +697,34 @@ export class StructParser {
         written.push(`enum ${spec.base.def?.name ?? spec.base.tag ?? ''}`.trim());
         continue;
       }
+      if (v === 'decltype' && !spec.base && this.isPunct('(', 1)) {
+        // C++: decltype(nullptr) is std::nullptr_t; the type of any other expression is not worked out.
+        this.requireCpp("'decltype'", t.line);
+        const close = findClosing(this.tokens, this.pos + 1);
+        if (close === -1) this.fail("Unterminated 'decltype(...)'.", t.line);
+        const inner = this.tokens.slice(this.pos + 2, close);
+        if (inner.length !== 1 || inner[0].value !== 'nullptr') {
+          this.fail(`decltype(${inner.map((x) => x.value).join(' ')}) is not supported: only decltype(nullptr), std::nullptr_t, is.`, t.line);
+        }
+        this.pos = close + 1;
+        spec.base = { kind: 'name', name: 'nullptr_t' };
+        written.push('decltype(nullptr)');
+        continue;
+      }
+      if ((v === 'typeof' || v === '__typeof__' || v === '__typeof') && !spec.base && this.isPunct('(', 1)) {
+        // GCC (gnu11) has all three; MSVC only __typeof__; SDCC none (each measured).
+        const accepted = this.compiler === 'gcc' || (this.compiler === 'msvc' && v === '__typeof__');
+        if (!accepted) this.fail(`${this.compiler === 'msvc' ? 'MSVC' : 'SDCC'} does not accept '${v}'.`, t.line);
+        const close = findClosing(this.tokens, this.pos + 1);
+        if (close === -1) this.fail(`Unterminated '${v}(...)'.`, t.line);
+        const inner = this.tokens.slice(this.pos + 2, close);
+        const spelled = `${v}(${inner.map((x) => x.value).join(' ')})`;
+        const type = this.typeOf(inner, spelled, t.line);
+        this.pos = close + 1;
+        spec.base = { kind: 'typeof', type, spelled };
+        written.push(spelled);
+        continue;
+      }
       if (!spec.base && !KEYWORDS.has(v)) {
         // A typedef name, possibly qualified (std::uint8_t): the last component names the type.
         let name = v;
@@ -611,6 +746,27 @@ export class StructParser {
 
     spec.written = written.join(' ');
     return spec;
+  }
+
+  /** What `typeof(inner)` names: a type-name, or the type of an expression this evaluator can type. */
+  private typeOf(inner: Token[], spelled: string, line: number): TypeInfo {
+    return this.nesting.in(() => this.typeOfAt(inner, spelled, line), line);
+  }
+
+  private typeOfAt(inner: Token[], spelled: string, line: number): TypeInfo {
+    const named = this.oracle.typeName(inner, 0);
+    if (named && named.end === inner.length) return named.type;
+    try {
+      const t = expressionType(inner, this.exprContext());
+      if ('object' in t) return t.object;
+      if ('string' in t) return { type: 'char', isPointer: false, dims: [t.string] };
+      const scalar = this.oracle.typeName(tokenize(t.scalar), 0);
+      if (!scalar) throw new ConstExprError(`its type '${t.scalar}' has no name here`);
+      return scalar.type;
+    } catch (err) {
+      if (!(err instanceof ConstExprError)) throw err;
+      return this.fail(`${spelled}: ${err.message}.`, line);
+    }
   }
 
   private parseRecordSpecifier(ownerName: string | null, topLevel: boolean): Extract<BaseSpec, { kind: 'record' }> {
@@ -650,10 +806,8 @@ export class StructParser {
     }
 
     const name = tag ?? (topLevel ? '' : this.createAnonymousTypeName(keyword, ownerName ?? 'anon'));
-    const pragmaPack = this.pre ? packAt(this.pre.packEvents, kwToken.line) : undefined;
     const def: ParsedStruct = { name, members: [], line: kwToken.line };
     if (keyword === 'union') def.isUnion = true;
-    if (pragmaPack !== undefined) def.pragmaPack = pragmaPack;
     if (this.isCpp) {
       def.cpp = {
         key: kwToken.value === 'class' ? 'class' : keyword,
@@ -670,23 +824,55 @@ export class StructParser {
         nonPublicData: false,
         defaultMemberInitializer: false,
         referenceMember: false,
+        // MSVC fixes the model of a class a pointer to member named before its definition.
+        ...(tag !== undefined && this.usedIncomplete.has(tag) && { inheritanceModel: 'unspecified' as const }),
       };
     }
 
+    // MSVC takes 16 levels of nested record definitions, the outermost included: one more is fatal
+    // error C1046, "struct nested too deeply" (measured with cl 19.44, C and C++, tagged, anonymous
+    // and union; Microsoft documents the limit as 16 against the C++ standard's 256).
+    if (this.compiler === 'msvc' && this.defining.length >= 16) {
+      this.fail(`MSVC does not take this ${keyword}: it is nested inside 16 others (fatal error C1046, ${keyword} nested too deeply).`, kwToken.line);
+    }
     this.pos = open + 1;
-    def.members = this.parseBody(close, def.name || `${keyword} (anonymous)`, def);
+    this.defining.push(def);
+    try {
+      def.members = this.nesting.in(() => this.parseBody(close, def.name || `${keyword} (anonymous)`, def), kwToken.line);
+    } finally {
+      this.defining.pop();
+    }
     this.pos = close + 1;
 
     this.parseAttributes(attrs);
     if (attrs.packed) def.packed = true;
-    if (attrs.aligned !== undefined) def.alignAttribute = attrs.aligned;
+    const aligned = this.requestedAlignment(attrs);
+    if (aligned !== undefined) def.alignAttribute = aligned;
     def.source = { head: this.spell(kwIndex, open), tail: this.spell(close + 1, this.pos) };
+    this.applyPragmaPack(def, this.tokens[this.pos - 1]!.line);
 
     // Tagged definitions are visible by tag immediately; anonymous top-level ones are named by
     // their typedef in finishTopLevelRecord.
     if (tag) this.registerRecord(def, false);
     else if (!topLevel) this.registerRecord(def, false);
     return { kind: 'record', keyword, tag, def };
+  }
+
+  /**
+   * The #pragma pack a record is laid out under, measured mid-record with gcc and MSVC: GCC lays
+   * the record out where it ends (`end`: its '}' or the attributes after it), under the pack in
+   * effect there, members declared before a change included. MSVC caps each member by the pack in
+   * effect at its declaration and rounds the size by the one in effect at the end; recorded on
+   * a member (StructMember.pragmaPack) where the two differ.
+   */
+  private applyPragmaPack(def: ParsedStruct, end: number): void {
+    if (!this.pre) return;
+    const pack = packAt(this.pre.packEvents, end);
+    if (pack !== undefined) def.pragmaPack = pack;
+    for (const m of def.members) {
+      const own = m.line !== undefined ? packAt(this.pre.packEvents, m.line) : pack;
+      if (own !== pack) m.pragmaPack = own ?? null;
+    }
   }
 
   /** `: public A, virtual B, ...`: each base must be a class defined before this point. */
@@ -716,7 +902,10 @@ export class StructParser {
         this.pos += 2;
       }
       if (this.isPunct('<')) this.fail(`Base class '${name}<...>' of '${what}' is a template, which is not supported.`, line);
-      const def = this.resolveStructTypeByName(name);
+      // A class named by its own name or by an alias of it (`using B = A;`, `typedef A B;`).
+      const alias = this.typeAliases.get(name);
+      const aliased = alias?.recordRef && !alias.isPointer && !alias.memberPointer && alias.dims.length === 0 ? alias.nestedStruct ?? this.resolveStructTypeByName(alias.recordRef.name) : undefined;
+      const def = this.resolveStructTypeByName(name) ?? aliased;
       if (!def) this.fail(`Base class '${name}' of '${what}' has no definition before it.`, line);
       if (def!.isUnion) this.fail(`Base class '${name}' of '${what}' is a union, which cannot be a base class.`, line);
       if (bases.some((b) => b.def === def)) this.fail(`'${name}' is a direct base of '${what}' more than once.`, line);
@@ -778,6 +967,7 @@ export class StructParser {
     const def: ParsedEnum = { name, members };
     if (underlyingType) def.underlyingType = underlyingType;
     else if (attrs.packed) def.packed = true;
+    this.retypeEnumerators(def);
 
     if (name) {
       if (this.enums.has(name) && tag) {
@@ -790,7 +980,13 @@ export class StructParser {
 
   private parseEnumerators(close: number, enumName: string): EnumMember[] {
     const members: EnumMember[] = [];
-    let next = 0;
+    const int = integerType(this.integers, 'int');
+    let next: { value: bigint; type: IntType } = { value: 0n, type: int };
+    /** An enumeration constant is an int where its value fits one; otherwise it keeps its value's type. */
+    const constant = (c: { value: bigint; type: IntType }) => {
+      const fits = c.value >= -(1n << BigInt(int.bits - 1)) && c.value < 1n << BigInt(int.bits - 1);
+      return { value: c.value, type: fits ? int : c.type };
+    };
     while (this.pos < close) {
       const t = this.peek()!;
       if (t.kind !== 'id') {
@@ -808,8 +1004,9 @@ export class StructParser {
         while (this.pos < close && !this.isPunct(',')) exprTokens.push(this.tokens[this.pos++]);
         member.valueRaw = exprTokens.map((x) => x.value).join(' ');
         try {
-          next = evaluateConstExpr(exprTokens, this.exprContext());
-          member.value = next;
+          // A signed overflow here only warns: GCC takes the wrapped value.
+          next = constant(evaluateIntegerConstExpr(exprTokens, { ...this.exprContext(), allowOverflow: true }));
+          member.value = Number(next.value);
         } catch (err) {
           if (!(err instanceof ConstExprError)) throw err;
           // The values decide the enum's size, so one that cannot be worked out is an error.
@@ -821,16 +1018,35 @@ export class StructParser {
           member.value = undefined;
         }
       } else {
-        member.value = next;
+        member.value = Number(next.value);
       }
       if (member.value !== undefined) {
-        this.enumConstants.set(member.name, member.value);
-        next = member.value + 1;
+        this.enumConstants.set(member.name, next);
+        next = constant({ value: next.value + 1n, type: next.type });
       }
       members.push(member);
       if (this.isPunct(',')) this.pos += 1;
     }
     return members;
+  }
+
+  /**
+   * After its definition, an enumeration constant whose value does not fit an int has the enum's
+   * type under GCC (unsigned when no value is negative), and is an int under MSVC (measured: the
+   * enum stays int-sized there).
+   */
+  private retypeEnumerators(def: ParsedEnum): void {
+    const int = integerType(this.integers, 'int');
+    const values = def.members.flatMap((m) => (m.value === undefined ? [] : [BigInt(m.value)]));
+    const unsigned = values.every((v) => v >= 0n);
+    const bits = 8 * this.calculator.measure({ name: '', type: `enum ${def.name}`, enumType: def }).size;
+    const enumType: IntType = { name: def.underlyingType ?? `enum ${def.name}`, bits, unsigned, rank: bits > int.bits ? (bits > this.integers.long ? 5 : 4) : 3 };
+    for (const m of def.members) {
+      const c = this.enumConstants.get(m.name);
+      if (typeof c !== 'object' || c.type.name === int.name) continue;
+      if (this.compiler === 'msvc') this.enumConstants.set(m.name, { value: BigInt.asIntN(int.bits, c.value), type: int });
+      else if (this.compiler === 'gcc') this.enumConstants.set(m.name, { value: c.value, type: enumType });
+    }
   }
 
   // ------------------------------------------------------------------ attributes
@@ -853,6 +1069,13 @@ export class StructParser {
     if (this.target.architecture.bitfieldLayout === 'ms' && (t.value === '__attribute__' || t.value === '__attribute' || t.value === '__packed')) {
       this.fail(`MSVC does not accept '${t.value}': on Windows use #pragma pack, alignas or __declspec(align(n)).`, t.line);
     }
+    // SDCC has no attributes either, and GCC no __declspec (syntax errors, measured).
+    if (this.compiler === 'sdcc' && (t.value === '__attribute__' || t.value === '__attribute' || t.value === '__packed' || t.value === '__declspec')) {
+      this.fail(`SDCC does not accept '${t.value}': use #pragma pack.`, t.line);
+    }
+    if (this.compiler === 'gcc' && t.value === '__declspec') {
+      this.fail("GCC does not accept '__declspec' outside Windows: use __attribute__((aligned(n))) or _Alignas.", t.line);
+    }
     this.pos += 1;
     if (t.value === '__packed') {
       attrs.packed = true;
@@ -865,7 +1088,7 @@ export class StructParser {
     this.pos = close + 1;
 
     if (t.value === 'alignas' || t.value === '_Alignas') {
-      attrs.aligned = this.alignRequestFrom(inner, t);
+      attrs.aligned = this.strictest(attrs.aligned, this.alignRequestFrom(inner, t));
       return;
     }
     if (t.value === '__declspec') {
@@ -873,7 +1096,8 @@ export class StructParser {
       for (let i = 0; i < inner.length; i++) {
         if (inner[i].value === 'align' && inner[i + 1]?.value === '(') {
           const end = findClosing(inner, i + 1);
-          attrs.aligned = this.evaluate(inner.slice(i + 2, end), 'Alignment', t.line);
+          // MSVC keeps the last of several (warning C4141).
+          attrs.declspecAlign = this.evaluate(inner.slice(i + 2, end), 'Alignment', t.line);
         }
         if (inner[i].value === 'empty_bases') attrs.emptyBases = true;
       }
@@ -897,7 +1121,7 @@ export class StructParser {
       }
       if (name === 'packed') attrs.packed = true;
       else if (name === 'aligned') {
-        attrs.aligned = args.length === 0 ? 'max' : this.evaluate(args, 'Alignment', nameTok.line);
+        attrs.aligned = this.strictest(attrs.aligned, args.length === 0 ? 'max' : this.evaluate(args, 'Alignment', nameTok.line));
       } else if (UNMODELLED_LAYOUT_ATTRIBUTES.has(name)) {
         this.warnings.push({ message: `__attribute__((${name})) changes layout and is not modelled.`, line: nameTok.line, type: 'warning' });
       }
@@ -921,6 +1145,23 @@ export class StructParser {
     }
   }
 
+  /**
+   * The stricter of two alignment requests: several on one declaration (`aligned`, alignas, and
+   * MSVC's last `__declspec(align)`) all count, so the largest wins (GCC and MSVC). alignas(0) asks
+   * for nothing (C11 6.7.5p6).
+   */
+  private strictest(a: AlignRequest | undefined, b: AlignRequest | undefined): AlignRequest | undefined {
+    const value = (r: AlignRequest) => this.calculator.resolveAlignRequest(r);
+    if (a === undefined || (b !== undefined && value(a) === 0)) return b;
+    if (b === undefined || value(b) === 0) return a;
+    return value(b) > value(a) ? b : a;
+  }
+
+  /** The alignment requested by a declaration's attributes and specifiers together. */
+  private requestedAlignment(...sets: Attributes[]): AlignRequest | undefined {
+    return sets.reduce<AlignRequest | undefined>((r, s) => this.strictest(this.strictest(r, s.aligned), s.declspecAlign), undefined);
+  }
+
   /** `alignas(type)` (the type's alignment) or `alignas(constant-expression)`. */
   private alignRequestFrom(inner: Token[], at: Token): AlignRequest {
     const parsed = this.oracle.typeName(inner, 0);
@@ -936,6 +1177,21 @@ export class StructParser {
   }
 
   // ------------------------------------------------------------------ declarators
+
+  /**
+   * C++ `A::*` or `N::A::*` at `offset` from the current token: the start of a pointer to member.
+   * The class it names (the last name) and the tokens it takes, the '*' included.
+   */
+  private memberPointerScope(offset: number): { name: string; length: number } | undefined {
+    let k = offset;
+    if (this.isPunct('::', k)) k += 1;
+    let name: string | undefined;
+    while (this.peek(k)?.kind === 'id' && !KEYWORDS.has(this.peek(k)!.value) && this.isPunct('::', k + 1)) {
+      name = this.peek(k)!.value;
+      k += 2;
+    }
+    return name !== undefined && this.isPunct('*', k) ? { name, length: k + 1 - offset } : undefined;
+  }
 
   /**
    * Parse one declarator. Derivations are collected from the name outward, following C's
@@ -954,6 +1210,13 @@ export class StructParser {
         this.pos += 1;
         continue;
       }
+      const scope = this.memberPointerScope(0);
+      if (scope) {
+        this.requireCpp(`A pointer to member ('${scope.name}::*')`);
+        prefix.push({ kind: 'ptr', memberOf: scope.name });
+        this.pos += scope.length;
+        continue;
+      }
       const t = this.peek();
       if (t?.kind === 'id' && QUALIFIERS.has(t.value)) {
         const last = prefix[prefix.length - 1];
@@ -969,9 +1232,9 @@ export class StructParser {
     }
 
     let inner: Declarator = { derivations: [], attrs: {}, line };
-    if (this.isPunct('(') && (this.isPunct('*', 1) || this.isPunct('&', 1) || this.isPunct('^', 1) || this.isPunct('(', 1))) {
+    if (this.isPunct('(') && (this.isPunct('*', 1) || this.isPunct('&', 1) || this.isPunct('^', 1) || this.isPunct('(', 1) || this.memberPointerScope(1))) {
       this.pos += 1;
-      inner = this.parseDeclarator(allowAbstract);
+      inner = this.nesting.in(() => this.parseDeclarator(allowAbstract), line);
       this.expectPunct(')', 'to close the parenthesized declarator');
     } else if (this.peek()?.kind === 'id' && !KEYWORDS.has(this.peek()!.value)) {
       inner.name = this.peek()!.value;
@@ -1049,9 +1312,12 @@ export class StructParser {
       name: inner.name,
       // The pointer written last is the one nearest the name.
       derivations: [...inner.derivations, ...suffixes, ...prefix.reverse()],
-      attrs: { ...inner.attrs, ...attrs },
+      attrs: { ...inner.attrs, ...attrs, aligned: this.strictest(inner.attrs.aligned, attrs.aligned) },
       line,
     };
+    if (result.attrs.aligned === undefined) delete result.attrs.aligned;
+    // Pointer, array and function declarators in one declaration: 256 is C++'s [implimits] minimum.
+    if (result.derivations.length > MAX_NESTING) throw new NestingError(line);
 
     if (this.isPunct(':')) {
       this.pos += 1;
@@ -1082,7 +1348,20 @@ export class StructParser {
     const base = spec.base!;
     switch (base.kind) {
       case 'builtin':
+        // Complex types: GCC's; MSVC and SDCC reject `_Complex` (measured).
+        if (base.words.includes('_Complex') && this.compiler !== 'gcc') {
+          this.fail(`${this.compiler === 'msvc' ? 'MSVC' : 'SDCC'} does not accept '_Complex'.`, spec.line);
+        }
+        // __int128: GCC's 64-bit targets only (measured on each, and with MSVC and SDCC).
+        if (base.words.includes('__int128') && !this.hasInt128) {
+          this.fail(
+            this.compiler === 'gcc' ? "GCC does not support '__int128' on this target: only on 64-bit ones." : `${this.compiler === 'msvc' ? 'MSVC' : 'SDCC'} does not accept '__int128'.`,
+            spec.line,
+          );
+        }
         return { type: canonicalBuiltin(base.words), isPointer: false, dims: [] };
+      case 'typeof':
+        return { ...base.type, dims: [...base.type.dims] };
       case 'record': {
         const name = base.def?.name ?? base.tag ?? '';
         return {
@@ -1118,6 +1397,26 @@ export class StructParser {
     }
   }
 
+  /**
+   * GCC rejects an array whose element type is aligned beyond its size ("alignment of array
+   * elements is greater than element size"), as an aligned typedef can make it; MSVC accepts it and
+   * keeps the elements at the type's size apart (both measured).
+   */
+  private checkArrayElement(element: TypeInfo, name: string, line: number): void {
+    if (this.compiler !== 'gcc' || element.typeAlignment === undefined) return;
+    let size: number;
+    try {
+      size = this.calculator.measure(this.measurable(element)).size;
+    } catch (err) {
+      if (err instanceof ConstExprError) return; // an incomplete element is reported where it is used
+      throw err;
+    }
+    const alignment = this.calculator.resolveAlignRequest(element.typeAlignment);
+    if (alignment > size) {
+      this.fail(`The elements of '${name}' are aligned to ${alignment} bytes, more than their size (${size}): GCC rejects such an array.`, line);
+    }
+  }
+
   /** Apply a declarator's derivations to a base type. */
   private applyDeclarator(base: TypeInfo, decl: Declarator, name: string): TypeInfo {
     const d = decl.derivations;
@@ -1132,23 +1431,44 @@ export class StructParser {
       i += 1;
     }
     const rest = d.slice(i);
+    // `[]` first is a flexible array member; `[0]` is GNU's zero-length array, an array of no
+    // elements, except under SDCC, which takes it for a flexible array member (measured).
+    const first = d[0]?.kind === 'array' ? (d[0] as { size: number | null }).size : undefined;
+    const flexible = first === null || (first === 0 && this.compiler === 'sdcc');
+    // MSVC: only the first dimension may be 0 (C2087).
+    if (this.compiler === 'msvc' && [...dims.slice(1), ...base.dims].includes(0)) {
+      this.fail(`MSVC rejects a zero-length inner dimension in '${name}' (C2087).`, decl.line);
+    }
+    if (dims.length > 0) this.checkArrayElement(base, name, decl.line);
 
     if (rest.length === 0) {
       // An array of the type, which may itself be an array (or an array of pointers) by typedef.
-      return { ...base, dims: [...dims, ...base.dims] };
+      return { ...base, dims: [...dims, ...base.dims], ...(flexible && { flexible: true }) };
     }
     if (rest[0].kind === 'func') {
       this.fail(`'${name}' is declared as a function returning ${base.type}; only pointers to functions can be members.`, decl.line);
     }
+    const memberOf = (x: Derivation | undefined) => (x?.kind === 'ptr' ? x.memberOf : undefined);
+    const cls = memberOf(rest[0]);
+    if (cls !== undefined) {
+      // A pointer to member: to a member function, or to data of the type the rest declares.
+      const fn = rest[1]?.kind === 'func' ? rest[1] : undefined;
+      const of = (from: number) => this.describeType(this.applyDeclarator(base, { ...decl, derivations: rest.slice(from) }, name));
+      const quals = fn ? fn.quals.filter((q) => q === 'const' || q === 'volatile' || q === '&' || q === '&&').map((q) => ` ${q}`).join('') : '';
+      const type = fn ? `${of(2)} (${cls}::*)(${fn.params})${quals}` : `${of(1)} ${cls}::*`;
+      return { type, isPointer: false, memberPointer: { className: cls, function: fn !== undefined }, dims };
+    }
     // Pointer (to anything, including arrays and functions): the member stores an address.
-    const func = rest.find((x): x is Extract<Derivation, { kind: 'func' }> => x.kind === 'func');
     // One '*' per pointer level before any function/array derivation: char** stays char**.
     let levels = 0;
-    while (rest[levels]?.kind === 'ptr') levels += 1;
+    while (rest[levels]?.kind === 'ptr' && memberOf(rest[levels]) === undefined) levels += 1;
+    const func = memberOf(rest[levels]) === undefined ? rest.find((x): x is Extract<Derivation, { kind: 'func' }> => x.kind === 'func') : undefined;
     // One pointer straight onto a function; a pointer to a function pointer points at data.
     const functionPointer = levels === 1 && rest[1]?.kind === 'func';
+    // A pointer to a pointer to member points at that type.
+    const pointedType = memberOf(rest[levels]) !== undefined ? this.applyDeclarator(base, { ...decl, derivations: rest.slice(levels) }, name).type : base.type;
     return {
-      type: `${base.type}${'*'.repeat(Math.max(1, levels))}`,
+      type: `${pointedType}${'*'.repeat(Math.max(1, levels))}`,
       declaredType: func ? `${base.declaredType ?? base.type} (*)(${func.params})` : base.declaredType ? `${base.declaredType}*` : undefined,
       isPointer: true,
       ...(functionPointer && { functionPointer: true }),
@@ -1188,7 +1508,9 @@ export class StructParser {
         }
         if (t.kind === 'id' && (t.value === 'using' || t.value === 'friend')) {
           this.requireCpp(`'${t.value}'`, t.line);
-          this.skipMember(close);
+          // A member alias declares a type name and takes no space; a using-declaration names a base's members.
+          if (t.value === 'using' && this.parseAliasDeclaration()) this.endMember(close, ownerName, undefined);
+          else this.skipMember(close);
           continue;
         }
         let templated = false;
@@ -1339,18 +1661,38 @@ export class StructParser {
       if (this.pos === start) this.pos += 1;
     }
 
-    // A flexible array member is only valid last, and only in a struct.
+    this.checkFlexibleMembers(members, owner, ownerName);
+    return members;
+  }
+
+  /**
+   * Where a flexible array member may be, as each compiler has it (measured). GCC: last in a struct
+   * with another named member, never in a union; a GNU zero-length array goes anywhere. SDCC (whose
+   * `[0]` is a flexible member too): last in a struct with another member, or in a union; a struct
+   * ending in one is no member. MSVC: a flexible or zero-length array last in a struct, or in a
+   * union; a struct ending in one is no member (C2229).
+   */
+  private checkFlexibleMembers(members: StructMember[], owner: ParsedStruct, ownerName: string): void {
+    const c = this.compiler;
+    const unsized = (m: StructMember) => m.flexible === true || (c === 'msvc' && m.arrayDims?.[0] === 0);
+    const error = (m: StructMember, message: string) => this.errors.push({ message, line: m.line, type: 'semantic' });
     members.forEach((m, i) => {
-      if (m.arraySize === 0 && m.arrayDims?.[0] === 0) {
+      if (unsized(m)) {
         if (owner.isUnion) {
-          this.errors.push({ message: `Flexible array member '${m.name}' is not allowed in union '${ownerName}'.`, line: m.line, type: 'semantic' });
+          if (c === 'gcc') error(m, `Flexible array member '${m.name}' is not allowed in union '${ownerName}'.`);
+          // SDCC: a union of nothing but flexible array members is incomplete.
+          else if (c === 'sdcc' && members.every(unsized) && i === 0) error(m, `Union '${ownerName}' has only flexible array members, which SDCC takes for an incomplete type.`);
         } else if (i !== members.length - 1) {
-          this.errors.push({ message: `Flexible array member '${m.name}' must be the last member of '${ownerName}'.`, line: m.line, type: 'semantic' });
+          error(m, `${m.flexible ? 'Flexible' : 'Zero-length'} array member '${m.name}' must be the last member of '${ownerName}'.`);
+        } else if (c !== 'msvc' && !members.some((o) => o !== m && (o.name || c === 'sdcc'))) {
+          error(m, `Flexible array member '${m.name}' needs another named member in '${ownerName}'.`);
         }
       }
+      const inner = m.nestedStruct ?? (m.isNested && !m.type.includes('*') ? this.resolveStructTypeByName(m.type.replace(/^(struct|union)\s+/, '')) : undefined);
+      if (c !== 'gcc' && inner && !inner.isUnion && inner.members.length > 0 && unsized(inner.members[inner.members.length - 1]!)) {
+        error(m, `'${m.name}' is a struct ending in a flexible array member, which ${c === 'msvc' ? 'MSVC' : 'SDCC'} does not accept as a member.`);
+      }
     });
-
-    return members;
   }
 
   /** `template < ... >`, nested angle brackets and parentheses included. */
@@ -1443,7 +1785,19 @@ export class StructParser {
     }
     const tryBlock = this.isId('try');
     if (tryBlock) this.pos += 1;
-    if (this.isPunct(':')) this.takeUntil(['{']);
+    if (this.isPunct(':')) {
+      // Member initializers, `name(args)` or `name{args}`, each perhaps a pack expansion (`...`).
+      this.pos += 1;
+      for (;;) {
+        this.takeUntil(['(', '{', ';']);
+        const end = this.isPunct('(') || this.isPunct('{') ? findClosing(this.tokens, this.pos) : -1;
+        if (end === -1) break;
+        this.pos = end + 1;
+        if (this.isPunct('...')) this.pos += 1;
+        if (!this.isPunct(',')) break;
+        this.pos += 1;
+      }
+    }
     if (this.isPunct('{')) {
       this.pos = findClosing(this.tokens, this.pos) + 1;
       tail.body = true;
@@ -1480,6 +1834,11 @@ export class StructParser {
   }
 
   private parameterType(tokens: readonly Token[]): string {
+    return this.nesting.in(() => this.parameterTypeAt(tokens), tokens[0]?.line);
+  }
+
+  /** parameterType, one parameter list deeper. */
+  private parameterTypeAt(tokens: readonly Token[]): string {
     if (tokens.length === 1 && tokens[0].value === '...') return '...';
     // A default argument does not change the type.
     let depth = 0;
@@ -1509,13 +1868,14 @@ export class StructParser {
     if (!base) name = '?';
     else if (base.kind === 'builtin') name = canonicalBuiltin(base.words);
     else if (base.kind === 'record' || base.kind === 'enum') name = base.def?.name ?? base.tag ?? '';
+    else if (base.kind === 'typeof') name = this.describeType(base.type);
     else name = this.typedefSpellings.get(base.name) ?? base.name;
     const spell = (k: number, topLevel: boolean): string => {
       const d = derivations[k];
       if (!d) return `${topLevel && parameter ? '' : [...spec.cv].sort().map((q) => `${q} `).join('')}${name}`;
       if (d.kind === 'ptr') {
         const cv = topLevel && parameter ? '' : (d.cv ?? []).slice().sort().map((q) => ` ${q}`).join('');
-        return `${d.ref ?? '*'}${cv}(${spell(k + 1, false)})`;
+        return `${d.ref ?? (d.memberOf !== undefined ? `${d.memberOf}::*` : '*')}${cv}(${spell(k + 1, false)})`;
       }
       // A parameter of array or function type is a pointer (C11 6.7.6.3p7-8).
       if (d.kind === 'array') return `${topLevel && parameter ? '*' : `[${d.size ?? ''}]`}(${spell(k + 1, false)})`;
@@ -1568,17 +1928,18 @@ export class StructParser {
 
     const member = this.memberOfType(info, name, false);
     member.line = decl.line;
-    const declared = spec.base!.kind === 'name' ? (info.isPointer ? info.declaredType ?? undefined : spec.base!.name) : info.declaredType;
+    const declared = spec.base!.kind === 'name' ? (info.isPointer || info.memberPointer ? info.declaredType ?? undefined : spec.base!.name) : info.declaredType;
     if (declared && declared !== info.type) member.declaredType = declared;
 
     if (decl.bitWidth !== undefined) {
-      if (info.dims.length > 0 || info.isPointer) {
+      if (info.dims.length > 0 || info.isPointer || info.memberPointer) {
         this.fail(`Bit-field '${name || '(unnamed)'}' must have an integer type.`, decl.line);
       }
       member.bitField = decl.bitWidth;
+      this.checkBitfieldWidth(info, name, decl.bitWidth, decl.line);
     }
 
-    const aligned = decl.attrs.aligned ?? spec.attrs.aligned;
+    const aligned = this.requestedAlignment(spec.attrs, decl.attrs);
     if (aligned !== undefined) member.alignAttribute = aligned;
     if (decl.attrs.packed || spec.attrs.packed) member.packed = true;
     const first = decl.derivations[0];
@@ -1589,6 +1950,25 @@ export class StructParser {
   }
 
   /**
+   * A bit-field may not be wider than its type (C11 6.7.2.1p4): its bits, an enum's those of the
+   * integer type it is laid out as; a _Bool's 1 under GCC and SDCC, its 8 under MSVC (measured).
+   */
+  private checkBitfieldWidth(info: TypeInfo, name: string, width: number, line: number): void {
+    let bits: number;
+    if ((info.type === '_Bool' || info.type === 'bool') && this.compiler !== 'msvc') {
+      bits = 1;
+    } else {
+      try {
+        bits = 8 * this.calculator.measure(this.measurable(info)).size;
+      } catch (err) {
+        if (err instanceof ConstExprError) return; // an incomplete type is reported where it is laid out
+        throw err;
+      }
+    }
+    if (width > bits) this.fail(`Bit-field '${name || '(unnamed)'}' is ${width} bits wide, more than its type '${this.describeType(info)}' has (${bits}).`, line);
+  }
+
+  /**
    * A member of type `info`. Records and enums are linked to their definitions now when `resolve`
    * is set, as measuring needs; members are linked at the end (resolveReferences), so a typedef
    * may name a record defined after it.
@@ -1596,10 +1976,15 @@ export class StructParser {
   private memberOfType(info: TypeInfo, name: string, resolve: boolean): StructMember {
     const member: StructMember = { name, type: info.type };
     if (info.functionPointer) member.functionPointer = true;
+    if (info.memberPointer) member.memberPointer = { ...info.memberPointer, inheritance: this.inheritanceModel(info.memberPointer.className) };
     if (info.dims.length > 0) {
       member.arrayDims = info.dims;
       member.arraySize = info.dims.reduce((a, b) => a * b, 1);
+      if (info.flexible) member.flexible = true;
     }
+    // An aligned typedef's own alignment, a pointer typedef's too (GCC and MSVC); a pointer to an
+    // aligned typedef carries none, since applyDeclarator does not pass it on to a pointer.
+    if (info.typeAlignment !== undefined) member.typeAlignment = info.typeAlignment;
     if (!info.isPointer) {
       if (info.recordRef) {
         member.isNested = true;
@@ -1610,21 +1995,36 @@ export class StructParser {
         const enumType = info.enumType ?? this.resolveEnumTypeByName(info.enumRef);
         if (enumType) member.enumType = enumType;
       }
-      // A pointer to an aligned typedef is an ordinary pointer.
-      if (info.typeAlignment !== undefined) member.typeAlignment = info.typeAlignment;
     }
     return member;
   }
 
+  /**
+   * MSVC's inheritance model of the class a pointer to member names, where a member of that type
+   * is declared, which fixes it for the class (CppClass.inheritanceModel): from its bases while it
+   * is being defined, and 'unspecified' for good while it has no definition. A typedef of the
+   * pointer type fixes nothing (measured with MSVC).
+   */
+  private inheritanceModel(className: string): MsInheritanceModel {
+    const def = this.defining.find((d) => d.name === className) ?? this.resolveStructTypeByName(className);
+    if (!def?.cpp) {
+      this.usedIncomplete.add(this.structAliases.get(className) ?? className);
+      return 'unspecified';
+    }
+    return (def.cpp.inheritanceModel ??= msInheritanceModel(def, this.defining.includes(def)));
+  }
+
   /** The type of a laid-out member, to go on from it in `offsetof(T, a.b[2])`. */
   private typeOfMember(m: StructMember): TypeInfo {
-    const isPointer = m.type.includes('*');
+    const isPointer = m.type.includes('*') && !m.memberPointer;
     return {
       type: m.type,
       ...(m.declaredType !== undefined && { declaredType: m.declaredType }),
       isPointer,
       ...(m.functionPointer && { functionPointer: true }),
+      ...(m.memberPointer && { memberPointer: { className: m.memberPointer.className, function: m.memberPointer.function } }),
       dims: m.arrayDims ?? [],
+      ...(m.flexible && { flexible: true }),
       ...(!isPointer && m.isNested && { recordRef: { keyword: m.nestedStruct?.isUnion ? 'union' as const : 'struct' as const, name: m.nestedStruct?.name ?? m.type.replace(/^(struct|union)\s+/, '') } }),
       ...(m.nestedStruct && { nestedStruct: m.nestedStruct }),
       ...(m.enumType && { enumRef: m.enumType.name, enumType: m.enumType }),
@@ -1642,17 +2042,19 @@ export class StructParser {
       BUILTIN_WORDS.has(v) ||
       TYPE_NAME_QUALIFIERS.has(v) ||
       v === 'struct' || v === 'union' || v === 'enum' || v === 'class' ||
+      v === 'typeof' || v === '__typeof__' || v === '__typeof' ||
       STANDARD_TYPEDEFS.has(v) ||
+      (this.hasInt128 && INT128_TYPEDEFS.has(v)) ||
       this.typeAliases.has(v) || this.structAliases.has(v) || this.enumAliases.has(v) ||
-      // C++: a class or enum is a type name without its keyword.
-      (this.isCpp && (this.structs.has(v) || this.unions.has(v) || this.enums.has(v)))
+      // C++: a class or enum is a type name without its keyword; so is the type of nullptr.
+      (this.isCpp && (this.structs.has(v) || this.unions.has(v) || this.enums.has(v) || v === 'nullptr_t' || v === 'decltype'))
     );
   }
 
   /** A record or enum type that has no definition yet, which `sizeof` and friends cannot measure. */
   private requireComplete(info: TypeInfo): void {
     if (info.isPointer) return;
-    if (info.dims.includes(0)) throw new ConstExprError(`'${this.describeType(info)}' is an array of unknown size`);
+    if (info.flexible) throw new ConstExprError(`'${this.describeType(info)}' is an array of unknown size`);
     if (info.type === 'void') throw new ConstExprError("'void' has no size");
     if (info.recordRef && !(info.nestedStruct ?? this.resolveStructTypeByName(info.recordRef.name))) {
       throw new ConstExprError(`'${this.describeType(info)}' is incomplete here: it has no definition before this point`);
@@ -1675,11 +2077,39 @@ export class StructParser {
 
   /** Whether a value of the integer type is signed: undefined where the target decides and it is not modelled. */
   private signedness(info: TypeInfo): 'signed' | 'unsigned' | undefined {
-    if (info.enumType || info.enumRef !== undefined) return undefined;
+    const enumType = info.enumType ?? (info.enumRef !== undefined ? this.resolveEnumTypeByName(info.enumRef) : undefined);
+    if (enumType || info.enumRef !== undefined) {
+      if (enumType?.underlyingType) return this.signedness({ type: enumType.underlyingType, isPointer: false, dims: [] });
+      // GCC: unsigned when no value is negative; MSVC: int. Not measured for SDCC.
+      if (this.compiler === 'msvc') return 'signed';
+      if (this.compiler === 'gcc' && enumType) return enumType.members.every((m) => (m.value ?? 0) >= 0) ? 'unsigned' : 'signed';
+      return undefined;
+    }
     const type = info.type;
     if (type.startsWith('unsigned ') || ['char8_t', 'char16_t', 'char32_t'].includes(type)) return 'unsigned';
     if (['signed char', 'short', 'int', 'long', 'long long', '__int128'].includes(type)) return 'signed';
-    return STANDARD_TYPEDEFS.get(type);
+    const wchar = this.target.architecture.wcharSigned;
+    if (type === 'wchar_t' && wchar !== undefined) return wchar ? 'signed' : 'unsigned';
+    return STANDARD_TYPEDEFS.get(type) ?? INT128_TYPEDEFS.get(type);
+  }
+
+  /** The arithmetic type `info` is, for a cast: a floating type, or an integer type by its size and signedness. */
+  private scalarType(info: TypeInfo): ScalarType {
+    const t = info.type;
+    if (info.isPointer || info.dims.length > 0 || info.recordRef || info.memberPointer || t === 'void' || t.endsWith('_Complex')) {
+      throw new ConstExprError(`a cast to '${this.describeType(info)}' does not give an arithmetic value`);
+    }
+    if (t === 'float' || t === 'double' || t === 'long double') return { kind: 'float', name: t };
+    const named = ['_Bool', 'bool', 'char', 'signed char', 'unsigned char', 'short', 'unsigned short', 'int', 'unsigned int', 'long', 'unsigned long', 'long long', 'unsigned long long', '__int128', 'unsigned __int128'];
+    if (named.includes(t) && info.enumRef === undefined) return { kind: 'int', type: integerType(this.integers, t) };
+    // Any other integer type (a <stdint.h> type, an enum, wchar_t) is the standard one of its size and sign.
+    const bits = 8 * this.calculator.measure(this.measurable(info)).size;
+    const signedness = this.signedness(info);
+    if (!signedness) throw new ConstExprError(`whether '${this.describeType(info)}' is signed on this target is not modelled`);
+    const standard = ['char', 'short', 'int', 'long', 'long long', ...(this.hasInt128 ? ['__int128'] : [])].find((n) => integerType(this.integers, n).bits === bits);
+    if (!standard) throw new ConstExprError(`'${this.describeType(info)}' has no integer type of its size here`);
+    const name = signedness === 'unsigned' ? `unsigned ${standard}` : standard === 'char' ? 'signed char' : standard;
+    return { kind: 'int', type: integerType(this.integers, name) };
   }
 
   private createOracle(): TypeOracle<TypeInfo> {
@@ -1721,25 +2151,7 @@ export class StructParser {
       element: (info) => (info.dims.length > 0 ? { ...info, dims: info.dims.slice(1) } : info.isPointer ? info.pointee : undefined),
       isArray: (info) => info.dims.length > 0,
       isPointer: (info) => info.isPointer && info.dims.length === 0,
-      convert: (info, value) => {
-        if (info.isPointer || info.dims.length > 0 || info.recordRef) {
-          throw new ConstExprError(`a cast to '${this.describeType(info)}' does not give an integer`);
-        }
-        if (/\b(float|double)\b/.test(info.type)) throw new ConstExprError(`'${this.describeType(info)}' is not an integer type`);
-        if (info.type === '_Bool' || info.type === 'bool') return value ? 1 : 0;
-        // Exact for 64-bit types, where doubles would round.
-        const bits = 8 * this.calculator.measure(this.measurable(info)).size;
-        const exact = BigInt(Math.trunc(value));
-        const asUnsigned = Number(BigInt.asUintN(bits, exact));
-        const asSigned = Number(BigInt.asIntN(bits, exact));
-        const signedness = this.signedness(info);
-        if (signedness === 'unsigned') return asUnsigned;
-        if (signedness === 'signed') return asSigned;
-        if (asUnsigned !== asSigned) {
-          throw new ConstExprError(`converting ${value} to '${this.describeType(info)}' depends on whether that type is signed on this target, which is not modelled`);
-        }
-        return asUnsigned;
-      },
+      scalar: (info) => this.scalarType(info),
       describe: (info) => this.describeType(info),
     };
   }
@@ -1869,10 +2281,12 @@ function canonicalBuiltin(words: readonly string[]): string {
   if (has('_Bool')) return '_Bool';
   if (has('bool')) return 'bool';
   for (const w of ['wchar_t', 'char8_t', 'char16_t', 'char32_t']) if (has(w)) return w;
-  if (has('__int128')) return unsigned ? 'unsigned __int128' : '__int128';
-  if (has('float')) return has('_Complex') ? 'float _Complex' : 'float';
-  if (has('double')) return `${longs > 0 ? 'long double' : 'double'}${has('_Complex') ? ' _Complex' : ''}`;
-  if (has('char')) return unsigned ? 'unsigned char' : signed ? 'signed char' : 'char';
+  // `_Complex` makes the type complex; alone it is `double _Complex`, as GCC takes it.
+  const complex = has('_Complex') ? ' _Complex' : '';
+  if (has('__int128')) return `${unsigned ? 'unsigned __int128' : '__int128'}${complex}`;
+  if (has('float')) return `float${complex}`;
+  if (has('double') || (complex && words.every((w) => w === '_Complex' || w === 'long'))) return `${longs > 0 ? 'long double' : 'double'}${complex}`;
+  if (has('char')) return `${unsigned ? 'unsigned char' : signed ? 'signed char' : 'char'}${complex}`;
   const base = has('short') ? 'short' : longs >= 2 ? 'long long' : longs === 1 ? 'long' : 'int';
-  return unsigned ? `unsigned ${base}` : base;
+  return `${unsigned ? `unsigned ${base}` : base}${complex}`;
 }

@@ -3,6 +3,7 @@ import { zigToolDefinition } from "@sp/zig-layout/definition";
 import { applyAllFixes, lint } from "@sp/zig-layout/lint";
 import { OPTION_BUILD_MODE, OPTION_ERROR_LIMIT, OPTION_MODE, OPTION_ZIG_CPU, OPTION_ZIG_TARGET, TOOL_ZIG_STRUCT_LAYOUT, TOOL_ZIG_VERIFICATION_CODE } from "@sp/zig-layout";
 import { TOOL_MANIFESTS, loadTool } from "@sp/registry";
+import { parseZig } from "@sp/core";
 
 const createSpec = zigToolDefinition(TOOL_ZIG_STRUCT_LAYOUT).createSpec;
 const codes = (code: string, options = {}) => lint(createSpec(options), code).map((d) => d.code);
@@ -114,5 +115,21 @@ describe("Zig tool family", () => {
     expect(size("x86_64-linux-gnu")).toBe(24);
     expect(size("x86-linux-gnu")).toBe(16);
     expect(size("avr-freestanding-none")).toBe(11);
+  });
+});
+
+describe("Zig line ends", () => {
+  // zig 0.17 (measured with ast-check and build-obj): a carriage return is white space between
+  // tokens and part of a CRLF; in a comment or a literal, one without a line feed is an invalid byte.
+  // A multiline string line ending in CRLF ends before the CR.
+  const compute = (code: string) => zigToolDefinition(TOOL_ZIG_STRUCT_LAYOUT).compute(createSpec(), code);
+  it("reads a carriage return as a space, and rejects one in a comment or a literal", () => {
+    expect(compute("const S = extern struct { a: u8,\rb: u64 };\r\n// note\r\n").fields?.[0]?.value).toBe("16 bytes");
+    const invalid = (what: string) => `${what} contains invalid byte: '\\r'.`;
+    expect(compute("// note\rconst S = extern struct { a: u8 };").error).toBe(invalid("Comment"));
+    expect(compute("const s = \"a\rb\";\nconst S = struct { a: u8 };").error).toBe(invalid("String literal"));
+    expect(compute("const c = '\r';\nconst S = struct { a: u8 };").error).toBe(invalid("Character literal"));
+    expect(compute("const s =\n    \\\\a\rb\n;\nconst S = struct { a: u8 };").error).toBe(invalid("String literal"));
+    expect(parseZig("const s =\n    \\\\ab\r\n    \\\\cd\r\n;\n").root.decls[0]?.value).toMatchObject({ k: "string", v: "ab\ncd" });
   });
 });

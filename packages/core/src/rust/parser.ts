@@ -7,6 +7,7 @@
  * Constant expressions are kept as trees: array lengths and discriminants may use size_of,
  * which depends on the target, so they are evaluated by the layout engine.
  */
+import { Nesting, NestingError } from '../nesting';
 import type { ParseError } from '../types';
 import { RustLexError, lexRust } from './lexer';
 import type { RustToken } from './lexer';
@@ -169,8 +170,11 @@ export function parseRust(code: string): RustFile {
     }
     return fail(`Expected a path in a use item${found()}.`);
   };
+  /** Every nested type, operand, use path segment and module is one level deeper (nesting.ts). */
+  const nesting = new Nesting();
   /** UseTree: `a::b::C`, `a::{B, c::D as E}`, `a::*`, recording each name it imports. */
-  const parseUseTree = (prefix: string[], at: number): void => {
+  const parseUseTree = (prefix: string[], at: number): void => nesting.in(() => parseUseTreeHere(prefix, at), line());
+  const parseUseTreeHere = (prefix: string[], at: number): void => {
     if (is('*')) {
       pos += 1;
       file.uses.push({ path: prefix, line: at });
@@ -263,7 +267,8 @@ export function parseRust(code: string): RustFile {
     return e;
   };
 
-  const parseUnary = (): ConstExpr => {
+  const parseUnary = (): ConstExpr => nesting.in(() => parseUnaryHere(), line());
+  const parseUnaryHere = (): ConstExpr => {
     if (is('-')) {
       pos += 1;
       return { kind: 'unary', op: '-', arg: parseUnary() };
@@ -398,7 +403,8 @@ export function parseRust(code: string): RustFile {
 
   const parsePrimaryOrNeg = (): ConstExpr => (is('-') ? parseUnary() : parsePrimary());
 
-  const parseType = (): RustType => {
+  const parseType = (): RustType => nesting.in(() => parseTypeHere(), line());
+  const parseTypeHere = (): RustType => {
     const t = peek();
     if (!t) return fail('Expected a type but the input ended.');
     if (t.lifetime) fail(`Expected a type but found the lifetime '${t.value}'.`);
@@ -826,7 +832,7 @@ export function parseRust(code: string): RustFile {
           }
         } else if (is('mod') && peek(1)?.kind === 'id' && is('{', 2)) {
           pos += 3;
-          parseItems(true);
+          nesting.in(() => parseItems(true), line());
           expect('}', 'to close the module');
         } else if (peek()?.kind === 'id' && is('!', 1) && !is('[', 2)) {
           // Macro invocation or macro_rules! definition.
@@ -858,7 +864,13 @@ export function parseRust(code: string): RustFile {
     }
   };
 
-  parseItems(false);
+  try {
+    parseItems(false);
+  } catch (err) {
+    if (!(err instanceof NestingError)) throw err;
+    // Past the limit, what follows is not read: it is inside what could not be.
+    file.errors.push({ message: err.message, line: err.line ?? line(), type: 'syntax' });
+  }
   return file;
 }
 

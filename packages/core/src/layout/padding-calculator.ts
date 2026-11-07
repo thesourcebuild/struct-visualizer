@@ -1,4 +1,5 @@
 import type { AlignRequest, Architecture, ParsedStruct, StructMember, CalculationResult, ParsedEnum } from '../types';
+import { Nesting } from '../nesting';
 import { dataModels, getStandardTypeMap } from '../abi/data-models';
 import type { DataModel } from '../abi/data-models';
 import { CppLayout } from './cpp-layout';
@@ -85,8 +86,19 @@ export class PaddingCalculator {
    * layout of source with packing written into it (applyPacking), so it follows the same rules.
    */
   calculate(struct: ParsedStruct): CalculationResult {
-    return struct.isUnion === true ? this.calculateUnion(struct) : this.calculateStruct(struct);
+    // A C++ class takes its level where CppLayout lays it out (layoutOf), as a base does.
+    if (struct.isUnion !== true && struct.cpp && this.architecture.cppAbi) return this.cppLayout.layout(struct);
+    return this.nested(() => (struct.isUnion === true ? this.calculateUnion(struct) : this.calculateStruct(struct)), struct.line);
   }
+
+  /**
+   * @internal `f` one level deeper in the records being laid out inside each other (a member's
+   * record, a base class): past MAX_NESTING it throws NestingError, which analyzeStruct reports.
+   */
+  nested<T>(f: () => T, line?: number): T {
+    return this.nesting.in(f, line);
+  }
+  private readonly nesting = new Nesting();
 
   /**
    * Lay out a struct. Positions are tracked in bits so that bit-fields can be placed exactly; a
@@ -149,10 +161,10 @@ export class PaddingCalculator {
         const typeInfo = this.bitfieldTypeInfo(member);
         const typeAlign = Math.max(1, typeInfo.alignment);
         const packed = struct.packed === true || member.packed === true;
-        const pragma = struct.pragmaPack;
+        const pragma = this.packOf(member, struct);
         const requested = member.alignAttribute !== undefined ? this.resolveAlignRequest(member.alignAttribute) : undefined;
         // #pragma pack caps an alignment request too.
-        const explicit = requested !== undefined && struct.pragmaPack !== undefined ? Math.min(requested, struct.pragmaPack) : requested;
+        const explicit = requested !== undefined && pragma !== undefined ? Math.min(requested, pragma) : requested;
         /** The type's alignment under #pragma pack, which packed does not lower. */
         const pragmaAlign = pragma !== undefined ? Math.min(typeAlign, pragma) : typeAlign;
         let start: number;
@@ -271,10 +283,16 @@ export class PaddingCalculator {
     this.closeFields(state);
     const { pos, end, maxAlignment, maxExplicitAlignment, members } = state;
 
-    // Trailing padding rounds the size up to the struct's alignment.
-    const structAlignment = this.structAlignment(struct, maxAlignment, maxExplicitAlignment);
-    const used = Math.ceil(pos / 8);
-    const totalSize = used + this.calculatePadding(used, structAlignment);
+    // Trailing padding rounds the size up to the struct's alignment. MSVC caps each member by the
+    // #pragma pack at its declaration, so its struct is aligned as its strictest member, and only the
+    // rounding takes the pack in effect at the end (measured with a pack changed mid-struct).
+    const ms = this.architecture.bitfieldLayout === 'ms';
+    const rounding = this.structAlignment(struct, maxAlignment, maxExplicitAlignment);
+    const structAlignment = ms ? this.structAlignment({ ...struct, pragmaPack: undefined }, maxAlignment, maxExplicitAlignment) : rounding;
+    let used = Math.ceil(pos / 8);
+    // MSVC gives a C struct of no bytes (only zero-length or flexible arrays) 4 (measured).
+    if (ms && used === 0 && !struct.cpp && struct.members.length > 0) used = 4;
+    const totalSize = used + this.calculatePadding(used, rounding);
     const trailingPadding = totalSize - Math.ceil(end / 8);
 
     const totalPadding = members.reduce((sum, m) => sum + m.padding, 0) + trailingPadding;
@@ -351,17 +369,20 @@ export class PaddingCalculator {
       });
     }
 
-    // As for a struct (structAlignment): members are capped already.
-    let unionAlignment = maxAlignment;
-    if (struct.pragmaPack !== undefined) unionAlignment = Math.min(unionAlignment, struct.pragmaPack);
-    unionAlignment = Math.max(unionAlignment, maxExplicitAlignment);
-    if (struct.alignAttribute !== undefined) {
-      unionAlignment = Math.max(unionAlignment, this.resolveAlignRequest(struct.alignAttribute));
-    }
+    // As for a struct (structAlignment, finishStruct): members are capped already.
+    const aligned = (pack: number | undefined) => {
+      let alignment = maxAlignment;
+      if (pack !== undefined) alignment = Math.min(alignment, pack);
+      alignment = Math.max(alignment, maxExplicitAlignment);
+      if (struct.alignAttribute !== undefined) alignment = Math.max(alignment, this.resolveAlignRequest(struct.alignAttribute));
+      return alignment;
+    };
+    const rounding = aligned(struct.pragmaPack);
+    const unionAlignment = ms ? aligned(undefined) : rounding;
 
-    // A C++ object is at least one byte.
-    if (struct.cpp && this.architecture.cppAbi && maxSize === 0) maxSize = 1;
-    const trailingPadding = this.calculatePadding(maxSize, unionAlignment);
+    // A C++ object is at least one byte; so is an MSVC C union of zero-length arrays (measured).
+    if (maxSize === 0 && ((struct.cpp && this.architecture.cppAbi) || (ms && struct.members.length > 0))) maxSize = 1;
+    const trailingPadding = this.calculatePadding(maxSize, rounding);
     const totalSize = maxSize + trailingPadding;
 
     return {
@@ -438,8 +459,10 @@ export class PaddingCalculator {
    */
   private effectiveAlignment(member: StructMember, natural: number, struct: ParsedStruct, nested?: CalculationResult): number {
     if (this.architecture.bitfieldLayout === 'ms') {
-      let alignment = member.typeAlignment === undefined ? this.measureNatural(member) : 1;
-      if (struct.pragmaPack !== undefined) alignment = Math.min(alignment, struct.pragmaPack);
+      // `natural` is the type's own alignment when no typedef sets one (both callers measure it).
+      let alignment = member.typeAlignment === undefined ? natural : 1;
+      const pack = this.packOf(member, struct);
+      if (pack !== undefined) alignment = Math.min(alignment, pack);
       return Math.max(1, alignment, this.msRequired(member, nested));
     }
     let alignment = struct.packed === true || member.packed === true ? 1 : natural;
@@ -450,9 +473,13 @@ export class PaddingCalculator {
     return Math.max(1, alignment);
   }
 
-  /** The alignment of a member's type before any request: what an aligned typedef replaces. */
-  private measureNatural(member: StructMember): number {
-    return this.getMemberSizeAndAlignment(member).alignment;
+  /**
+   * The #pragma pack that caps `member`: under MSVC the one in effect at its declaration, under
+   * GCC its record's, the one in effect where the record ends (StructMember.pragmaPack).
+   */
+  private packOf(member: StructMember, struct: ParsedStruct): number | undefined {
+    if (this.architecture.bitfieldLayout === 'ms' && member.pragmaPack !== undefined) return member.pragmaPack ?? undefined;
+    return struct.pragmaPack;
   }
 
   /**
@@ -476,7 +503,8 @@ export class PaddingCalculator {
   /** @internal */
   resolveAlignRequest(request: AlignRequest): number {
     if (typeof request === 'number') return request;
-    if (request === 'max') return this.architecture.maxAlignment ?? this.architecture.defaultAlignment;
+    // `aligned` without an argument: GCC's __BIGGEST_ALIGNMENT__.
+    if (request === 'max') return this.architecture.biggestAlignment ?? this.architecture.maxAlignment ?? this.architecture.defaultAlignment;
     return request.alignment;
   }
 
@@ -486,7 +514,10 @@ export class PaddingCalculator {
    */
   measure(member: StructMember): { size: number; alignment: number } {
     const { size, alignment } = this.getMemberSizeAndAlignment(member);
-    return { size, alignment: member.typeAlignment !== undefined ? this.resolveAlignRequest(member.typeAlignment) : alignment };
+    if (member.typeAlignment !== undefined) return { size, alignment: this.resolveAlignRequest(member.typeAlignment) };
+    // A C++ pointer to member's alignof differs under MSVC from the alignment it gets in a record.
+    if (member.memberPointer) return { size, alignment: this.cppLayout.memberPointer(member.memberPointer, true).alignment };
+    return { size, alignment };
   }
 
   /** GCC's `__alignof__`: the type's own alignment, which for some scalars exceeds `_Alignof`. */
@@ -502,7 +533,8 @@ export class PaddingCalculator {
    * union (or an array of one), also the layout of one element.
    */
   private getMemberSizeAndAlignment(member: StructMember): MemberInfo {
-    // Arrays, including the flexible array member (arraySize 0: no size, element alignment).
+    // Arrays, including the flexible array member and GNU's zero-length array (arraySize 0: no
+    // size, the element's alignment).
     if (member.arraySize !== undefined) {
       if (member.enumType) {
         const enumInfo = this.getEnumTypeInfo(member.enumType);
@@ -544,6 +576,7 @@ export class PaddingCalculator {
 
   /** A member of a scalar or pointer type; function pointers take the model's code-pointer size. */
   private scalarTypeInfo(member: StructMember): { size: number; alignment: number } {
+    if (member.memberPointer) return this.cppLayout.memberPointer(member.memberPointer, false);
     const functionPointerSize = dataModels[this.dataModel]?.dataTypes.functionPointerSize;
     if (member.functionPointer && functionPointerSize !== undefined) {
       const maxAlign = this.architecture.maxAlignment ?? this.architecture.defaultAlignment;
@@ -569,6 +602,13 @@ export class PaddingCalculator {
 
     // Normalize type (remove const, volatile, etc.)
     const normalizedType = this.normalizeType(type);
+
+    // A complex type is two of its real type, aligned as that type (GCC; measured on each target).
+    const complex = /^(.+) _Complex$/.exec(normalizedType);
+    if (complex) {
+      const real = this.getTypeInfo(complex[1]!);
+      return { size: 2 * real.size, alignment: real.alignment };
+    }
 
     // First try to get from standard type mapping based on data model
     let typeInfo = this.getStandardTypeInfo(normalizedType);
@@ -679,7 +719,7 @@ export class PaddingCalculator {
       return { ...struct, members: optimizedMembers };
     }
 
-    const isFlexible = (m: StructMember) => m.arraySize === 0 && m.arrayDims?.[0] === 0;
+    const isFlexible = (m: StructMember) => m.flexible === true;
     const tail = optimizedMembers.filter(isFlexible);
     const units: Array<{ members: StructMember[]; size: number; alignment: number }> = [];
     for (const member of optimizedMembers) {

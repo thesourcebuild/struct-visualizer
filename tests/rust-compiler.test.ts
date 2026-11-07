@@ -55,6 +55,8 @@ function compilerFor(target: string): "stable" | "build-std" | undefined {
 const CASES: Record<string, string> = {
   ...Object.fromEntries(rustExamples.map((e) => [e.name, e.code])),
   "tuple struct": "struct S(u8, u32, u16);",
+  // A bare carriage return is white space: it ends no line, so a line comment runs on past it.
+  "carriage returns as white space": "// note\rstruct S { x: u64 }\nstruct S { a: u8,\rb: u32,\r\nc: u16 }",
   "unit and zero-size fields": "struct U;\nstruct S { a: u8, u: U, m: core::marker::PhantomData<u64>, z: [u64; 0], b: u32 }",
   "niche placement": "struct S { a: u32, b: bool, c: u16, d: u8 }",
   "char and NonZero": "struct S { c: char, n: core::num::NonZeroU16, b: bool, x: u8 }",
@@ -112,6 +114,18 @@ const CASES: Record<string, string> = {
   "u128 enum": "enum E { A(u128), B }",
   "enum in struct": "enum K { A, B, C }\nstruct S { k: K, n: u32, o: Option<K> }",
   "Ordering": "struct S { o: core::cmp::Ordering, x: Option<core::cmp::Ordering>, n: u16 }",
+  // A tag's valid range leaves out the widest gap between discriminants, wrapping if it must.
+  "tag range around a gap": "enum E { A = -128, B = 127 }",
+  "repr(u8) tag range wraps": "#[repr(u8)]\nenum B { X = 0, Y = 255 }\nstruct S { o: Option<B> }",
+  "wrapping tag niches nest": "#[repr(u8)]\nenum B { X = 0, Y = 255 }\nenum E { A = -128, C = 127 }\n#[repr(i8)]\nenum G { A = -128, Z = 0, C = 127 }\nstruct S { a: Option<Option<B>>, b: Option<Option<Option<E>>>, c: Option<G>, d: u8 }",
+  "data enums with wrapping tags": "#[repr(u8)]\nenum D { A(bool) = 0, B = 255 }\n#[repr(i32)]\nenum K { A(char) = i32::MIN, B = i32::MAX }\nstruct S { d: Option<D>, k: Option<K>, o: Option<Option<D>> }",
+  "repr(C) enum tag ranges": "#[repr(C)]\nenum R { A = 0, B = 255 }\n#[repr(C)]\nenum N { A = -128, B = 127 }\nstruct S { r: Option<R>, n: Option<N>, b: u8 }",
+  "uninhabited variant left out of the tag range": "#[repr(u8)]\nenum E { A = 0, B(core::convert::Infallible) = 128, C = 255 }\nstruct S { e: Option<E>, f: Option<Option<E>> }",
+  "repr(u8) enum of absent variants": "#[repr(u8)]\nenum E { A(core::convert::Infallible) }\nstruct S { e: E, b: u8 }",
+  // A pointer's metadata is that of its struct tail: through structs' last fields and tuples' last elements.
+  "pointers to unsized tuples": "struct S<'a> { a: &'a (u8, [u32]), b: u8 }",
+  "boxed and raw unsized tuples": "struct S { a: Box<(u8, [u32])>, b: *const (u16, str), c: Option<&'static (u8, dyn core::fmt::Debug)> }",
+  "struct tails through tuples": "struct T<X: ?Sized> { n: u16, x: X }\nstruct W<X: ?Sized> { p: *const (u8, X) }\nstruct S { a: &'static T<(u8, T<[u16]>)>, b: *const (u8, (u16, dyn core::fmt::Debug)), c: &'static (u8,), d: Option<Box<(u32, T<str>)>>, e: W<[u8]>, f: W<u64> }",
 };
 
 const NO_STD_PRELUDE = [

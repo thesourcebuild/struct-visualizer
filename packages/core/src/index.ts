@@ -8,6 +8,7 @@ export { validateSupportedTypes } from './parser/validate-types';
 export { PaddingCalculator } from './layout/padding-calculator';
 export { CCodeGenerator } from './codegen/c-code-generator';
 export { analyzeStruct } from './analyze';
+export { MAX_NESTING, NESTING_MESSAGE } from './nesting';
 export { applyPacking, packingSyntaxes, packingSyntaxesFor, resolvePackingSyntax } from './packing';
 export type { PackingSyntax, PackingSyntaxInfo } from './packing';
 export { memberDeclarator, memberLabel, memberTypeLabel } from './display';

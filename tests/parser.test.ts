@@ -276,7 +276,38 @@ describe("constant expressions with types", () => {
     expect(layout("#if sizeof(int) == 4\n#endif\nstruct S { int a; };").errors[0]).toMatch(/'sizeof' needs types, which #if does not know/);
   });
 
-  it("does not guess how a value converts to a type whose signedness the target decides", () => {
-    expect(layout("struct S { char a[(char)200 > 0 ? 1 : 2]; };").errors[0]).toMatch(/depends on whether that type is signed/);
+  it("converts to plain char as the target's char is signed, and does not guess where that is not known", () => {
+    const code = "struct S { char a[(char)200 > 0 ? 1 : 2]; };";
+    expect(layout(code).size).toBe(2);
+    expect(layout(code, { target: "arm64", dataModel: "LP64", os: "linux" }).size).toBe(1);
+    expect(layout(code, { target: "microchip-16bit", dataModel: "XC16", os: "none" }).errors[0]).toMatch(/depends on whether char is signed/);
+  });
+});
+
+describe("line ends", () => {
+  // Measured: gcc 13 and sdcc 4.2 end a line at a carriage return on its own, as at LF and CRLF;
+  // MSVC 19.44 reads one as a space (warning C4335, "Mac file format detected"), so a `//` comment
+  // or a #define runs on to the next LF, and a string literal keeps it.
+  const MSVC: PlatformSelection = { target: "intel-x64-amd", dataModel: "LLP64", os: "windows" };
+  const SDCC: PlatformSelection = { target: "8051-8bit", dataModel: "SDCC", os: "none" };
+  const cr = (...lines: string[]) => lines.join("\r");
+
+  it("GCC and SDCC: a carriage return on its own ends a line", () => {
+    const code = cr("// leading comment", "#define N 3", "struct S { char a[N]; int b; };");
+    expect(layout(code)).toMatchObject({ errors: [], size: 8 });
+    expect(layout(code, SDCC)).toMatchObject({ errors: [], size: 5 });
+    expect(layout(cr("// one", "", "struct S { char a[-1]; };")).analysis.errors[0]?.line).toBe(3);
+    expect(layout(cr("struct S { char a[sizeof \"x", "y\"]; };")).errors).not.toEqual([]);
+  });
+
+  it("MSVC: a carriage return on its own is a space, with warning C4335", () => {
+    const c4335 = expect.arrayContaining([expect.stringMatching(/C4335/)]);
+    expect(layout(cr("// leading comment", "struct S { char a; int b; };"), MSVC)).toMatchObject({ errors: [expect.stringMatching(/No valid struct/)], warnings: c4335 });
+    expect(layout(cr("struct S { char a;", "int b; };"), MSVC)).toMatchObject({ errors: [], size: 8, warnings: c4335 });
+    expect(layout(cr("struct S { char a[sizeof \"x", "y\"]; };"), MSVC)).toMatchObject({ errors: [], size: 4 });
+    // The first line ends in LF: no warning, and the #define takes the rest of its line.
+    const define = layout("struct T { char t; };\n#define N 2\rstruct S { char a[N]; };", MSVC);
+    expect(define).toMatchObject({ errors: [], size: 1, warnings: [] });
+    expect(layout("struct S { char a;\r\nint b; };", MSVC)).toMatchObject({ errors: [], size: 8, warnings: [] });
   });
 });

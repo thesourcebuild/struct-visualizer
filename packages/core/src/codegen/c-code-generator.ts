@@ -95,7 +95,7 @@ ${prints}
             : `    printf("    %-16s ${note}\\n", "${label}");`;
         }
         const offset = `offsetof(${typeRef}, ${member.name})`;
-        const isFlexible = member.arraySize === 0 && member.arrayDims?.[0] === 0;
+        const isFlexible = member.flexible === true;
         if (language === 'cpp') {
           const size = isFlexible ? '"flexible array"' : `sizeof(((${typeRef}*)0)->${member.name})`;
           return `    std::cout << "  " << std::setw(20) << std::left << "${label}" << " offset: " << std::setw(3) << std::right << ${offset} << ", size: " << ${size} << std::endl;`;

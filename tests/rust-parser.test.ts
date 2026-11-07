@@ -83,3 +83,22 @@ describe("Rust parser", () => {
     expect(enc("enum E {}")).toBe("empty");
   });
 });
+
+describe("Rust line ends", () => {
+  // rustc 1.99 (measured): a carriage return without a line feed is white space, so a line comment
+  // runs on past it; in a doc comment or a literal it is an error.
+  it("reads a bare carriage return as a space, and rejects one in a doc comment or a literal", () => {
+    expect(parseRust("// note\rstruct X { a: u8 }\nstruct S { a: u8,\rb: u32 }").items.has("X")).toBe(false);
+    expect(analyzeRust("#[repr(C)] struct S { a: u8,\rb: u32 }", "x86_64-unknown-linux-gnu").result?.totalSize).toBe(8);
+    expect(parseRust("/// doc\r\nstruct S { a: u8 }").errors).toEqual([]);
+    const error = (code: string) => parseRust(code).errors[0]?.message;
+    expect(error("/// doc\rstruct S { a: u8 }")).toBe("Bare CR not allowed in doc-comment.");
+    expect(error("//! doc\rx\nstruct S { a: u8 }")).toBe("Bare CR not allowed in doc-comment.");
+    expect(error("//// not a doc comment\rx\nstruct S { a: u8 }")).toBeUndefined();
+    expect(error("/** doc\r */\nstruct S { a: u8 }")).toBe("Bare CR not allowed in block doc-comment.");
+    expect(error("/* plain\r */\nstruct S { a: u8 }")).toBeUndefined();
+    expect(error("const X: &str = \"a\rb\";\nstruct S { a: u8 }")).toBe("Bare CR not allowed in string, use `\\r` instead.");
+    expect(error("const X: &str = r\"a\rb\";\nstruct S { a: u8 }")).toBe("Bare CR not allowed in raw string.");
+    expect(error("const X: u8 = b'\r';\nstruct S { a: u8 }")).toBe("Character constant must be escaped: `\\r`.");
+  });
+});

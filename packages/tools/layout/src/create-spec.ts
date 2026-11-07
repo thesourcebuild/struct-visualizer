@@ -2,13 +2,16 @@ import type { OptionValues } from "@sp/contracts";
 import {
   clampDataModel,
   clampOSType,
+  dataModelList,
   getDefaultDataModelForArchitecture,
+  osTypeList,
   resolvePackingSyntax,
-  targetArchitectures,
+  targetArchitectureList,
 } from "@sp/core";
 import type { DataModel, OSType, TargetArchitecture } from "@sp/core";
 import {
   DEFAULT_OS,
+  DEFAULT_REFERENCE_MODEL,
   DEFAULT_TARGET,
   OPTION_BINDING_LANGUAGE,
   OPTION_COMPARE,
@@ -39,14 +42,27 @@ export function defaultOptions(): OptionValues {
     [OPTION_ENUM_SIZE]: "default",
     [OPTION_ENUM_ALIGN]: "default",
     [OPTION_LANGUAGE]: "c",
-    [OPTION_REFERENCE_MODEL]: "LP64",
+    [OPTION_REFERENCE_MODEL]: DEFAULT_REFERENCE_MODEL,
     [OPTION_BINDING_LANGUAGE]: "rust",
   };
 }
 
+/** The selected target, falling back to the default for unknown ids (stale links). */
 export function readTarget(options: OptionValues): TargetArchitecture {
-  const v = readString(options, OPTION_TARGET, DEFAULT_TARGET);
-  return v in targetArchitectures ? (v as TargetArchitecture) : DEFAULT_TARGET;
+  const id = readString(options, OPTION_TARGET, DEFAULT_TARGET);
+  return targetArchitectureList.find((t) => t.id === id)?.id ?? DEFAULT_TARGET;
+}
+
+/** The selected OS, falling back to the default for unknown ids; clamp it to the target after. */
+export function readOS(options: OptionValues): OSType {
+  const id = readString(options, OPTION_OS, DEFAULT_OS);
+  return osTypeList.find((o) => o.id === id)?.id ?? DEFAULT_OS;
+}
+
+/** Data-models reference tool: the model whose types are listed, LP64 for unknown ids. */
+export function readReferenceModel(options: OptionValues): DataModel {
+  const id = readString(options, OPTION_REFERENCE_MODEL, DEFAULT_REFERENCE_MODEL);
+  return dataModelList.find((m) => m.id === id)?.id ?? DEFAULT_REFERENCE_MODEL;
 }
 
 /**
@@ -56,9 +72,16 @@ export function readTarget(options: OptionValues): TargetArchitecture {
 export function normalizeOptions(options: OptionValues): OptionValues {
   const target = readTarget(options);
   const dataModel = clampDataModel(target, readString(options, OPTION_DATA_MODEL, "") as DataModel);
-  const os = clampOSType(target, readString(options, OPTION_OS, DEFAULT_OS) as OSType);
+  const os = clampOSType(target, readOS(options));
   const packing = resolvePackingSyntax(os, dataModel, readString(options, OPTION_PACKING, "attribute"));
-  return { ...options, [OPTION_TARGET]: target, [OPTION_DATA_MODEL]: dataModel, [OPTION_OS]: os, [OPTION_PACKING]: packing };
+  return {
+    ...options,
+    [OPTION_TARGET]: target,
+    [OPTION_DATA_MODEL]: dataModel,
+    [OPTION_OS]: os,
+    [OPTION_PACKING]: packing,
+    [OPTION_REFERENCE_MODEL]: readReferenceModel(options),
+  };
 }
 
 export function createSpec(options: Partial<OptionValues> = {}): LayoutSpec {

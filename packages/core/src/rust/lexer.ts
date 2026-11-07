@@ -37,6 +37,16 @@ export interface RustToken extends Token {
   lifetime?: boolean;
 }
 
+/**
+ * A carriage return not followed by a line feed (a CRLF is a line end). rustc reads one as
+ * whitespace, so it does not end a line comment, and rejects one inside a doc comment or a
+ * literal: "bare CR not allowed in doc-comment", "... in string, use `\r` instead" (measured).
+ */
+const bareCr = (text: string, from: number, to: number): boolean => {
+  for (let k = text.indexOf('\r', from); k !== -1 && k < to; k = text.indexOf('\r', k + 1)) if (text[k + 1] !== '\n') return true;
+  return false;
+};
+
 export function lexRust(text: string): RustToken[] {
   const tokens: RustToken[] = [];
   let i = 0;
@@ -62,7 +72,11 @@ export function lexRust(text: string): RustToken[] {
 
     // Comments: line, and nested block comments.
     if (c === '/' && text[i + 1] === '/') {
+      const start = i;
       while (i < text.length && text[i] !== '\n') i += 1;
+      // A doc comment: `///` (not `////`) or `//!`.
+      const doc = (text[start + 2] === '/' && text[start + 3] !== '/') || text[start + 2] === '!';
+      if (doc && bareCr(text, start, i)) throw new RustLexError('Bare CR not allowed in doc-comment.', line);
       continue;
     }
     if (c === '/' && text[i + 1] === '*') {
@@ -82,6 +96,9 @@ export function lexRust(text: string): RustToken[] {
         }
       }
       if (depth !== 0) throw new RustLexError('Unterminated block comment.', startLine);
+      // A doc comment: `/**` (not `/***` or `/**/`) or `/*!`.
+      const doc = (text[i + 2] === '*' && text[i + 3] !== '*' && text[i + 3] !== '/') || text[i + 2] === '!';
+      if (doc && bareCr(text, i, j)) throw new RustLexError('Bare CR not allowed in block doc-comment.', startLine);
       advance(j);
       continue;
     }
@@ -93,6 +110,7 @@ export function lexRust(text: string): RustToken[] {
       const close = `"${hashes}`;
       const end = text.indexOf(close, i + raw[0].length);
       if (end === -1) throw new RustLexError('Unterminated raw string.', line);
+      if (bareCr(text, i, end)) throw new RustLexError('Bare CR not allowed in raw string.', line);
       const start = line;
       const value = text.slice(i, end + close.length);
       advance(end + close.length);
@@ -112,6 +130,7 @@ export function lexRust(text: string): RustToken[] {
       let j = c === 'b' ? i + 2 : i + 1;
       while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
       if (j >= text.length) throw new RustLexError('Unterminated string literal.', line);
+      if (bareCr(text, i, j)) throw new RustLexError('Bare CR not allowed in string, use `\\r` instead.', line);
       const start = line;
       const value = text.slice(i, j + 1);
       advance(j + 1);
@@ -134,6 +153,7 @@ export function lexRust(text: string): RustToken[] {
       const cp = text.codePointAt(q + 1);
       const width = cp !== undefined && cp > 0xffff ? 2 : 1;
       if (text[q + 1 + width] === '\'') {
+        if (text[q + 1] === '\r') throw new RustLexError('Character constant must be escaped: `\\r`.', line);
         tokens.push({ kind: 'char', value: text.slice(q, q + 2 + width), line });
         i = q + 2 + width;
         continue;

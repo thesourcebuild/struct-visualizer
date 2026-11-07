@@ -30,44 +30,56 @@ const typeErrors: Rule = {
 };
 
 /**
- * GO001 — the fieldalignment analyzer would report this struct: another order is smaller, or
- * the same size with fewer pointer bytes for the garbage collector to scan.
+ * GO001 — the fieldalignment analyzer reports this struct. Its message is quoted; the sizes shown
+ * are the compiler's, which differ from the analyzer's own size model in a few cases (complex64
+ * on 64-bit targets, sync/atomic's 64-bit types on 32-bit ones).
  */
 const reorder: Rule = {
   code: "GO001",
   check: ({ result }) => {
     const data = result.data;
     const a = data?.analysis;
-    if (!data || !a?.result || !a.optimized || !a.pointerBytes || data.mode !== "natural") return [];
+    if (!data || !a?.result || !a.optimized || !a.pointerBytes || !a.fieldalignment || data.mode !== "natural") return [];
     const saved = a.result.totalSize - a.optimized.totalSize;
-    const fix = { label: "Show optimized order", apply: (s: GoLayoutSpec) => withOption(s, OPTION_MODE, "optimized") };
+    const quote = `fieldalignment: "${a.fieldalignment}".`;
+    const diag = (level: "warning" | "info", message: string, detail: string): Diag => ({
+      code: "GO001",
+      level,
+      message,
+      detail: `${quote} ${detail}`,
+      line: a.definition?.line,
+      optionIds: [OPTION_MODE],
+      fix: { label: "Show optimized order", apply: (s: GoLayoutSpec) => withOption(s, OPTION_MODE, "optimized") },
+    });
     if (saved > 0) {
       return [
-        {
-          code: "GO001",
-          level: "warning",
-          message: `Reordering fields saves ${plural(saved, "byte")}: ${a.result.totalSize} → ${a.optimized.totalSize}.`,
-          detail: `fieldalignment: "struct of size ${a.result.totalSize} could be ${a.optimized.totalSize}". Every value, slice element and map entry of this type carries the padding.`,
-          line: a.definition?.line,
-          optionIds: [OPTION_MODE],
-          fix,
-        },
+        diag(
+          "warning",
+          `Reordering fields saves ${plural(saved, "byte")}: ${a.result.totalSize} → ${a.optimized.totalSize}.`,
+          "Every value, slice element and map entry of this type carries the padding.",
+        ),
       ];
     }
-    if (a.pointerBytes.optimized < a.pointerBytes.current) {
+    if (saved === 0 && a.pointerBytes.optimized < a.pointerBytes.current) {
       return [
-        {
-          code: "GO001",
-          level: "info",
-          message: `Same size, but reordering cuts the bytes the GC scans from ${a.pointerBytes.current} to ${a.pointerBytes.optimized}.`,
-          detail: `fieldalignment: "struct with ${a.pointerBytes.current} pointer bytes could be ${a.pointerBytes.optimized}". Pointer fields first lets the collector stop scanning earlier.`,
-          line: a.definition?.line,
-          optionIds: [OPTION_MODE],
-          fix,
-        },
+        diag(
+          "info",
+          `Same size, but reordering cuts the bytes the GC scans from ${a.pointerBytes.current} to ${a.pointerBytes.optimized}.`,
+          "Pointer fields first lets the collector stop scanning earlier.",
+        ),
       ];
     }
-    return [];
+    const model =
+      "The analyzer sizes types with its own model, which aligns complex64 to 8 bytes on 64-bit targets and does not know that sync/atomic's 64-bit types are 8-byte aligned on 32-bit ones.";
+    return [
+      diag(
+        "info",
+        saved < 0
+          ? `fieldalignment suggests another order, but the compiler lays it out larger: ${a.result.totalSize} → ${a.optimized.totalSize}.`
+          : `fieldalignment suggests another order, but the compiler lays it out in the same ${plural(a.result.totalSize, "byte")}, with no fewer pointer bytes.`,
+        model,
+      ),
+    ];
   },
 };
 

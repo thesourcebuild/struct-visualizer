@@ -44,8 +44,22 @@ export function encodeShareState(state: ShareState): { hash: string; inputOmitte
   return { hash: `#s=${toBase64Url(JSON.stringify(payload))}`, inputOmitted };
 }
 
+/** A value a spec option can hold: a string, a boolean or a finite number (JSON parses 1e400 as Infinity). */
 function isOptionValue(v: unknown): v is string | number | boolean {
-  return typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+  return typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v));
+}
+
+/**
+ * The options in an untrusted JSON object (a share link, saved state), each checked on its own:
+ * a value no option can hold is left out and the rest are kept.
+ */
+export function readOptionValues(raw: unknown): Record<string, string | number | boolean> {
+  const options: Record<string, string | number | boolean> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return options;
+  for (const [k, v] of Object.entries(raw)) {
+    if (isOptionValue(v)) options[k] = v;
+  }
+  return options;
 }
 
 /** Parse a `#s=...` fragment. Returns undefined for anything malformed. */
@@ -59,13 +73,9 @@ export function parseShareHash(hash: string): ShareState | undefined {
     if (p.v !== SHARE_VERSION || typeof p.t !== "string" || !p.o || typeof p.o !== "object") {
       return undefined;
     }
-    const options: ShareState["options"] = {};
-    for (const [k, v] of Object.entries(p.o)) {
-      if (isOptionValue(v)) options[k] = v;
-    }
     return {
       toolId: p.t,
-      options,
+      options: readOptionValues(p.o),
       input: typeof p.i === "string" ? p.i : undefined,
     };
   } catch {

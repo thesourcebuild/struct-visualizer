@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { PaddingCalculator, analyzeStruct, bindingTargetName, examples, generateBindings, goExportedName } from "@sp/core";
+import { PaddingCalculator, analyzeStruct, bindingTargetName, examples, generateBindings } from "@sp/core";
 import type { BindingLanguage, BindingOutput, CalculationResult, PlatformSelection } from "@sp/core";
 import { References, digest, useReferences } from "./support/references";
 import type { Answer } from "./support/references";
@@ -115,6 +115,23 @@ const CASES: Record<string, string> = {
   // (whose values go past 255).
   "wide bit-field run": "struct S { unsigned long long a : 60; unsigned long long b : 60; unsigned long long c : 60; char t; };",
   "large union": "union U { char buf[300]; int i; };\nstruct S { char a; union U u; };",
+  // An anonymous member's type is named after its record and member, which a struct has here.
+  "anonymous type named like a struct": "struct S_v { int z; };\nstruct S { struct S_v w; union { int i; float f; } v; };",
+  // Names the languages cannot give a type, or that would hide what the binding names: keywords
+  // (fn, error, test, None), primitives (u8, i32), and the names the code uses (Option, core,
+  // System, Console, bytes, print).
+  "types named like keywords and primitives": "struct u8 { char c; };\nstruct i32 { short s; };\nstruct error { char e; };\nstruct test { char t; };\nstruct Option { struct u8 b; void (*f)(void); _Bool z; };\nstruct fn { struct Option o; struct i32 i; struct error e; struct test t; char c; };",
+  "types named like what the bindings use": "struct Console { char c; };\nstruct System { short s; };\nstruct core { int i; };\nstruct bytes { char b[3]; };\nstruct print { char p; };\nstruct None { struct Console c; struct System s; struct core k; struct bytes b; struct print p; char print; };",
+  "members named like keywords": "struct S { int self; int Self; int super; int crate; int _; int fn; int None; int type; int from_buffer_copy; int __init__; int FromBytes; int fromBytes; int self_; int S; };",
+  // The binding's own names (a union's size, padding, a run of bit-fields, the fields of an array
+  // of structs in C#) give way to the members'.
+  "members named like the binding's own": "union U { int _size; char c; };\nstruct T { short t; };\nstruct S { char _pad0; int a; char bits_x; unsigned x : 3; union U u; struct T arr[2]; int arr_0; };",
+  // Rust allows no type with an alignment of its own in a packed struct.
+  "packed struct holding an aligned one": "struct __attribute__((aligned(8))) A { char c; };\nstruct __attribute__((packed)) S { char x; struct A a; _Bool b; };",
+  // Larger than a thread's stack (1 MB on Windows, 8 MB on Linux), which the examples must not use for it.
+  "larger than the stack": "struct S { char a; char big[9000000]; _Bool b; };",
+  // Signed or not as each target has them (unsigned on ARM; wchar_t a 2-byte unsigned on Windows).
+  "plain char and wchar_t": "struct S { char c; signed char s; unsigned char u; wchar_t w; char a[2]; };",
 };
 
 const LANGUAGES: BindingLanguage[] = ["zig", "rust", "go", "csharp", "python-struct", "python-ctypes"];
@@ -137,6 +154,8 @@ TARGETS.forEach((target) => {
     const analysis = analyzeStruct(code, target.selection);
     if (analysis.errors.length > 0 || !analysis.result) throw new Error(`${label}: ${analysis.errors.map((e) => e.message).join("; ")}`);
     const result = analysis.result;
+    // No object is larger than the target's addresses allow (PTRDIFF_MAX): 32 KB on AVR.
+    if (result.totalSize > 2 ** (8 * analysis.platform.architecture.pointerSize! - 1) - 1) return;
     const calculator = new PaddingCalculator(analysis.platform.architecture, analysis.platform.dataModel);
     const bindings = new Map(LANGUAGES.map((l) => [l, generateBindings(result, analysis.platform, calculator, l)] as const));
     const named = result.members.filter((m) => m.member.name && m.member.bitField === undefined && !m.member.role);
@@ -153,6 +172,9 @@ TARGETS.forEach((target) => {
 });
 
 const rootName = (p: Prepared) => p.result.struct.name;
+/** What a language's binding calls the root and a member: C's name where the language allows it. */
+const named = (p: Prepared, language: BindingLanguage) => p.bindings.get(language)!.names!;
+const member = (p: Prepared, language: BindingLanguage, name: string) => named(p, language).members[name]!;
 /** Members the binding keeps: Go, C# and Python leave a flexible array member out. */
 const kept = (p: Prepared, language: BindingLanguage) =>
   Object.entries(p.expected.offsets).filter(([name]) => name !== p.expected.flexible || language === "zig" || language === "rust" || language === "python-ctypes");
@@ -176,12 +198,13 @@ async function checkZig() {
     // No std of its own: a binding's test declares std, which may not shadow another.
     const lines: string[] = [];
     for (const p of cases) {
-      const root = rootName(p);
+      const root = named(p, "zig").root.written;
       lines.push(`const case_${p.index} = struct {`, p.bindings.get("zig")!.code, "};");
       lines.push("comptime {", `    if (@sizeOf(case_${p.index}.${root}) != ${p.expected.size}) @compileError(@import("std").fmt.comptimePrint("case ${p.index}: size {d}", .{@sizeOf(case_${p.index}.${root})}));`);
       if (!p.expected.union) {
         for (const [name, offset] of kept(p, "zig")) {
-          lines.push(`    if (@offsetOf(case_${p.index}.${root}, "${name}") != ${offset}) @compileError(@import("std").fmt.comptimePrint("case ${p.index}: ${name} at {d}", .{@offsetOf(case_${p.index}.${root}, "${name}")}));`);
+          const field = member(p, "zig", name).id;
+          lines.push(`    if (@offsetOf(case_${p.index}.${root}, "${field}") != ${offset}) @compileError(@import("std").fmt.comptimePrint("case ${p.index}: ${name} at {d}", .{@offsetOf(case_${p.index}.${root}, "${field}")}));`);
         }
       }
       lines.push("}");
@@ -246,12 +269,12 @@ async function checkRust() {
     const hosted = cases[0]!.target.selection.os !== "none";
     const lines = [...(hosted ? [] : ["#![no_std]"]), "#![allow(non_camel_case_types, non_snake_case, dead_code)]"];
     for (const p of cases) {
-      const root = rootName(p);
+      const root = named(p, "rust").root.written;
       lines.push(`pub mod case_${p.index} {`, p.bindings.get("rust")!.code, "}", "const _: () = {");
       lines.push(`    assert!(core::mem::size_of::<case_${p.index}::${root}>() == ${p.expected.size}, "case ${p.index}: size");`);
       if (!p.expected.union) {
         for (const [name, offset] of kept(p, "rust")) {
-          const field = ["type", "in", "match", "ref", "move", "fn", "loop", "use", "mod", "box", "self"].includes(name) ? `r#${name}` : name;
+          const field = member(p, "rust", name).written;
           lines.push(`    assert!(core::mem::offset_of!(case_${p.index}::${root}, ${field}) == ${offset}, "case ${p.index}: ${name}");`);
         }
       }
@@ -346,9 +369,10 @@ async function checkGo() {
       mkdirSync(join(root, pkg), { recursive: true });
       writeFileSync(join(root, pkg, "binding.go"), binding.code.replace("package bindings", `package ${pkg}`));
       writeFileSync(join(root, pkg, binding.example!.filename), binding.example!.code.replace("package bindings", `package ${pkg}`));
-      const struct = goExportedName(rootName(p));
+      // Go exports every name (an upper-case first letter), each unique.
+      const struct = named(p, "go").root.id;
       const asserts = [`package ${pkg}`, "", 'import "unsafe"', "", `var x ${struct}`, `var _ = [1]int{}[unsafe.Sizeof(x)-${p.expected.size}]`];
-      if (!p.expected.union) for (const [name, offset] of kept(p, "go")) asserts.push(`var _ = [1]int{}[unsafe.Offsetof(x.${goExportedName(name)})-${offset}]`);
+      if (!p.expected.union) for (const [name, offset] of kept(p, "go")) asserts.push(`var _ = [1]int{}[unsafe.Offsetof(x.${member(p, "go", name).id})-${offset}]`);
       writeFileSync(join(root, pkg, "check.go"), `${asserts.join("\n")}\n`);
     }
     const go = (args: string[], env: NodeJS.ProcessEnv) =>
@@ -443,7 +467,7 @@ async function checkPython() {
       `    ns2 = {'__name__': '__main__'}`,
       `    with contextlib.redirect_stdout(io.StringIO()):`,
       `        exec(${JSON.stringify(p.bindings.get("python-ctypes")!.code)}, ns2)`,
-      `    c = ns2['${root}']`,
+      `    c = ns2['${named(p, "python-ctypes").root.id}']`,
       `    results[${p.index}]['ctypes'] = {'size': ctypes.sizeof(c), 'offsets': {f[0]: getattr(c, f[0]).offset for f in c._fields_}}`,
       "except Exception:",
       `    results[${p.index}]['ctypes'] = {'error': traceback.format_exc(limit=-1)}`,
@@ -465,7 +489,8 @@ async function checkPython() {
       const offsets: Record<string, number> = {};
       for (const [name] of kept(p, language)) {
         // struct flattens: an array or record member starts where its first value does.
-        const keys = Object.keys(got.offsets).filter((k) => k === name || k.startsWith(`${name}[`) || k.startsWith(`${name}.`));
+        const id = member(p, language, name).id;
+        const keys = Object.keys(got.offsets).filter((k) => k === id || k.startsWith(`${id}[`) || k.startsWith(`${id}.`));
         if (keys.length > 0) offsets[name] = Math.min(...keys.map((k) => got.offsets[k]!));
       }
       const want = { size: p.expected.size, offsets: p.expected.union ? {} : Object.fromEntries(kept(p, language)) };
@@ -499,11 +524,11 @@ async function checkCSharp() {
     const ns = `Case${p.index}`;
     const binding = p.bindings.get("csharp")!;
     lines.push(`namespace ${ns}`, "{", binding.code, "}", `namespace ${ns}`, "{", binding.example!.code, "}");
-    const t = `${ns}.${rootName(p)}`;
+    const t = `${ns}.${named(p, "csharp").root.written}`;
     const fields = p.expected.union ? [] : kept(p, "csharp");
     main.push(
       `        System.Console.WriteLine("${p.index} " + System.Runtime.CompilerServices.Unsafe.SizeOf<${t}>()${fields
-        .map(([name]) => ` + " ${name}=" + System.Runtime.InteropServices.Marshal.OffsetOf<${t}>(${JSON.stringify(csharpField(p, name))})`)
+        .map(([name]) => ` + " ${name}=" + System.Runtime.InteropServices.Marshal.OffsetOf<${t}>(${JSON.stringify(member(p, "csharp", name).id)})`)
         .join("")});`,
       // The round-trip example, its own output set aside.
       "        try",
@@ -556,14 +581,6 @@ async function checkCSharp() {
     });
     if (failed) failures.get("csharp")!.set(first.index, `${failures.get("csharp")!.get(first.index) ?? ""}${failed}\n`);
   }
-}
-
-/** The C# field a member becomes: an array of records is one field per element. */
-function csharpField(p: Prepared, name: string): string {
-  const entry = p.result.members.find((m) => m.member.name === name)!;
-  const arrayOfRecords = entry.member.arraySize !== undefined && entry.member.isNested && !entry.member.type.includes("*");
-  // A member may not have its struct's name, nor that of the root's FromBytes and ToBytes.
-  return arrayOfRecords ? `${name}_0` : name === rootName(p) || name === "FromBytes" || name === "ToBytes" ? `${name}_` : name;
 }
 
 const sortKeys = (v: { size: number; offsets: Record<string, number> }) => ({ size: v.size, offsets: Object.fromEntries(Object.entries(v.offsets).sort(([a], [b]) => a.localeCompare(b))) });
@@ -683,5 +700,37 @@ describe("binding notes", () => {
     // Single bytes have no byte order, and a little-endian target's data reads as it is.
     expect(notes("struct S { char a; unsigned char b[3]; };", be).some((n) => byteOrder.test(n))).toBe(false);
     expect(notes("struct S { char a; int b; };", le).some((n) => byteOrder.test(n))).toBe(false);
+  });
+});
+
+describe("binding types and names", () => {
+  const binding = (code: string, target: string, language: BindingLanguage) => {
+    const analysis = analyzeStruct(code, TARGETS.find((t) => t.name === target)!.selection);
+    return generateBindings(analysis.result!, analysis.platform, new PaddingCalculator(analysis.platform.architecture, analysis.platform.dataModel), language);
+  };
+  const field = (code: string, name: string) => new RegExp(`pub ${name}: (\\w+),`).exec(code)?.[1];
+
+  // Plain char and wchar_t as each target's compiler has them: gcc's -funsigned-char default on
+  // ARM, AArch64, RISC-V and PowerPC; MSVC's wchar_t, an unsigned short.
+  it.each([
+    ["x86-64 Linux", "i8", "i32"],
+    ["x86-64 Windows", "i8", "u16"],
+    ["ARM32 Linux", "u8", "u32"],
+    ["AArch64 Linux", "u8", "u32"],
+    ["RISC-V 64 Linux", "u8", "i32"],
+    ["PowerPC 32 Linux", "u8", "i32"],
+    ["MIPS32 big-endian Linux", "i8", "i32"],
+  ])("plain char and wchar_t on %s are %s and %s", (target, char, wchar) => {
+    const { code } = binding("struct S { char c; wchar_t w; signed char s; unsigned char u; };", target, "rust");
+    expect([field(code, "c"), field(code, "w"), field(code, "s"), field(code, "u")]).toEqual([char, wchar, "i8", "u8"]);
+  });
+
+  it("says where a language cannot give a member or a type C's name", () => {
+    const rust = binding("struct S { int self; int self_; int type; };", "x86-64 Linux", "rust");
+    expect(rust.names!.members).toEqual({ self: { id: "self__", written: "self__" }, self_: { id: "self_", written: "self_" }, type: { id: "type", written: "r#type" } });
+    expect(rust.notes).toContain("'self' in struct S is named self__: the Rust binding cannot name it self.");
+    const ctypes = binding("struct None { int a; };", "x86-64 Linux", "python-ctypes");
+    expect(ctypes.names!.root).toEqual({ id: "None_", written: "None_" });
+    expect(ctypes.notes).toContain("struct None is named None_: the Python ctypes binding cannot name it None.");
   });
 });

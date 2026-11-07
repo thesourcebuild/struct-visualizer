@@ -12,6 +12,7 @@
  *
  * Standard types are written in their real form in ./std.ts and laid out by these same rules.
  */
+import { Nesting, NestingError } from '../nesting';
 import type { CalculationResult, ParseError, ParsedStruct, StructMember } from '../types';
 import { INTEGER_TYPES, formatRustType, parseRust } from './parser';
 import type { ConstExpr, GenericArg, GenericParam, RustEnum, RustField, RustFile, RustItem, RustRepr, RustStruct, RustType } from './parser';
@@ -55,6 +56,25 @@ const maxOf = (bytes: number) => (1n << BigInt(bytes * 8)) - 1n;
 export function nicheAvailable(s: Scalar | undefined): bigint {
   if (!s) return 0n;
   return (s.start - s.end - 1n) & maxOf(s.bytes);
+}
+
+/**
+ * WrappingRange::smallest_range_containing, on unsigned bit patterns: the narrowest of `min..=max`
+ * and the ranges that wrap around, leaving out the gap between two neighbouring values. On a tie
+ * `min..=max` wins, then the lowest gap.
+ */
+function smallestRangeContaining(values: readonly bigint[], bytes: number): { start: bigint; end: bigint } | undefined {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+  const obvious = { start: sorted[0]!, end: sorted[sorted.length - 1]! };
+  if (obvious.end - obvious.start <= 1n << BigInt(bytes * 8 - 1)) return obvious;
+  const width = (r: { start: bigint; end: bigint }) => (r.end - r.start) & maxOf(bytes);
+  let best = obvious;
+  for (let i = 1; i < sorted.length; i++) {
+    const r = { start: sorted[i]!, end: sorted[i - 1]! };
+    if (r.start !== r.end && width(r) < width(best)) best = r;
+  }
+  return best;
 }
 
 function asNiche(s: Scalar): Scalar | undefined {
@@ -293,6 +313,8 @@ export class RustLayoutEngine {
   private cache = new Map<string, Layout>();
   private visiting = new Set<string>();
   readonly enumInfo = new Map<string, EnumInfo>();
+  /** Every type and constant worked out inside another is one level deeper, an item's definition included (nesting.ts). */
+  private readonly nesting = new Nesting();
 
   constructor(
     readonly target: RustTarget,
@@ -355,7 +377,10 @@ export class RustLayoutEngine {
     }
   }
 
-  /** What a pointer to `type` carries besides the address. */
+  /**
+   * What a pointer to `type` carries besides the address: the metadata of its struct tail
+   * (struct_tail: the last field of a struct, or the last element of a tuple, followed down).
+   */
   private metadataOf(type: RustType, subst: Subst, depth = 0): 'none' | 'len' | 'vtable' {
     if (depth > 64) return 'none';
     switch (type.kind) {
@@ -363,6 +388,8 @@ export class RustLayoutEngine {
         return 'len';
       case 'dyn':
         return 'vtable';
+      case 'tuple':
+        return type.elems.length > 0 ? this.metadataOf(type.elems[type.elems.length - 1]!, subst, depth + 1) : 'none';
       case 'path': {
         const name = type.segments[type.segments.length - 1]!;
         if (type.segments.length === 1) {
@@ -375,6 +402,7 @@ export class RustLayoutEngine {
         if (!item) return 'none';
         const inner = this.bindGenerics(item, type.args, subst);
         if (item.kind === 'alias') return this.metadataOf(item.type, inner, depth + 1);
+        // Enums and unions are sized: the tail stops there.
         if (item.kind === 'struct' && item.fields.length > 0) {
           return this.metadataOf(item.fields[item.fields.length - 1]!.type, inner, depth + 1);
         }
@@ -435,6 +463,10 @@ export class RustLayoutEngine {
   // ---------------------------------------------------------------- constants
 
   evalConst(e: ConstExpr, subst: Subst, line?: number): bigint {
+    return this.nesting.in(() => this.evalConstHere(e, subst, line), line);
+  }
+
+  private evalConstHere(e: ConstExpr, subst: Subst, line?: number): bigint {
     switch (e.kind) {
       case 'lit':
         return e.suffix ? this.wrap(e.value, e.suffix) : e.value;
@@ -514,6 +546,10 @@ export class RustLayoutEngine {
   // ---------------------------------------------------------------- types
 
   layoutOf(type: RustType, subst: Subst, line?: number): Layout {
+    return this.nesting.in(() => this.layoutOfHere(type, subst, line), line);
+  }
+
+  private layoutOfHere(type: RustType, subst: Subst, line?: number): Layout {
     switch (type.kind) {
       case 'never':
         return { size: 0, align: 1, uninhabited: true };
@@ -730,20 +766,25 @@ export class RustLayoutEngine {
 
   // ---------------------------------------------------------------- enums
 
-  /** Integer::repr_discr: the discriminant's size and signedness. */
-  private reprDiscr(repr: RustRepr, min: bigint, max: bigint): { bytes: number; signed: boolean } {
+  /**
+   * Integer::discr_range_of_repr: the discriminant's size and signedness, from the most negative
+   * and the most positive value as written (each 0 when there is none).
+   */
+  private reprDiscr(repr: RustRepr, minNegative: bigint, maxPositive: bigint): { bytes: number; signed: boolean } {
     const fitUnsigned = (v: bigint) => [1, 2, 4, 8, 16].find((b) => v <= maxOf(b)) ?? 16;
     const fitSigned = (v: bigint) => [1, 2, 4, 8, 16].find((b) => v >= -(1n << BigInt(b * 8 - 1)) && v < 1n << BigInt(b * 8 - 1)) ?? 16;
+    const unsignedFit = fitUnsigned(BigInt.asUintN(128, minNegative) > maxPositive ? BigInt.asUintN(128, minNegative) : maxPositive);
+    const signedFit = Math.max(fitSigned(minNegative), fitSigned(BigInt.asIntN(128, maxPositive)));
     if (repr.int) {
       const bytes = this.intBytes(repr.int);
       const signed = repr.int.startsWith('i');
-      const fit = signed ? Math.max(fitSigned(min), fitSigned(max)) : fitUnsigned(max);
-      if (bytes < fit || (!signed && min < 0n)) throw new RustLayoutError(`A discriminant does not fit in repr(${repr.int}).`);
+      if (bytes < (signed ? signedFit : unsignedFit) || (!signed && minNegative < 0n)) throw new RustLayoutError(`A discriminant does not fit in repr(${repr.int}).`);
       return { bytes, signed };
     }
     const atLeast = repr.c ? this.target.cEnumMinBytes : 1;
-    if (min >= 0n) return { bytes: Math.max(fitUnsigned(max), atLeast), signed: false };
-    return { bytes: Math.max(fitSigned(min), fitSigned(max), atLeast), signed: true };
+    // The smallest fit, unsigned when that is as small.
+    if (unsignedFit <= signedFit) return { bytes: Math.max(unsignedFit, atLeast), signed: false };
+    return { bytes: Math.max(signedFit, atLeast), signed: true };
   }
 
   /** Niche::reserve: claim `count` invalid values, preferring the path to zero. */
@@ -761,6 +802,15 @@ export class RustLayoutEngine {
       return { start, scalar: { ...niche, end } };
     };
     const distanceEndZero = max - niche.end;
+    // One value: the invalid value nearest zero, read as signed. Not for bool (0..=1), which
+    // rustc leaves to the rules below.
+    if (count === 1n && !(niche.start === 0n && niche.end === 1n)) {
+      const bits = niche.bytes * 8;
+      const abs = (v: bigint) => (v < 0n ? -v : v);
+      const nextUp = abs(BigInt.asIntN(bits, niche.end + 1n));
+      const nextDown = abs(BigInt.asIntN(bits, niche.start - 1n));
+      return nextDown <= nextUp ? moveStart() : moveEnd();
+    }
     if (niche.start > niche.end) return moveEnd();
     if (niche.start <= distanceEndZero) return count <= niche.start ? moveStart() : moveEnd();
     const end = (niche.end + count) & max;
@@ -778,7 +828,8 @@ export class RustLayoutEngine {
       this.enumInfo.set(display, { encoding: 'empty', variants: [] });
       return { size: 0, align: 1, uninhabited: true, record: emptyRecord(display, this.target.id) };
     }
-    const present = variants.map((v, i) => i).filter((i) => repr.c || !absent(variants[i]!));
+    // With repr(C) or repr(int), every variant counts.
+    const present = variants.map((v, i) => i).filter((i) => inhibit || !absent(variants[i]!));
     if (present.length === 0) {
       this.enumInfo.set(display, { encoding: 'empty', variants: [] });
       return { size: 0, align: 1, uninhabited: true, record: emptyRecord(display, this.target.id) };
@@ -800,7 +851,7 @@ export class RustLayoutEngine {
       };
     }
 
-    // Discriminant values and range (uninhabited variants do not count, except for repr(C)).
+    // Discriminant values (uninhabited variants do not count, except for repr(C)).
     const discrs: bigint[] = [];
     let next = 0n;
     for (const v of item.variants) {
@@ -808,20 +859,15 @@ export class RustLayoutEngine {
       discrs.push(value);
       next = value + 1n;
     }
-    let min: bigint | undefined;
-    let max: bigint | undefined;
-    variants.forEach((fields, i) => {
-      if (!repr.c && fields.some((f) => f.layout.uninhabited)) return;
-      const d = discrs[i]!;
-      if (min === undefined || d < min) min = d;
-      if (max === undefined || d > max) max = d;
-    });
-    min ??= 0n;
-    max ??= 0n;
-    const minIty = this.reprDiscr(repr, min, max);
+    const necessary = discrs.filter((_, i) => repr.c || !variants[i]!.some((f) => f.layout.uninhabited));
+    const minNegative = necessary.reduce((m, d) => (d < m ? d : m), 0n);
+    const maxPositive = necessary.reduce((m, d) => (d > m ? d : m), 0n);
+    const minIty = this.reprDiscr(repr, minNegative, maxPositive);
+    // Their bit patterns in the discriminant type (repr(int), else isize).
+    const discrMask = maxOf(repr.int ? this.intBytes(repr.int) : this.target.pointerBytes);
 
     const niche = inhibit ? undefined : this.nicheFilling(item, variants, absent, repr, display);
-    const tagged = this.tagged(item, variants, repr, minIty, min, max, display);
+    const tagged = this.tagged(item, variants, repr, minIty, necessary.map((d) => d & discrMask), display);
 
     let best = tagged;
     if (niche) {
@@ -898,8 +944,7 @@ export class RustLayoutEngine {
     variants: FieldInput[][],
     repr: RustRepr,
     minIty: { bytes: number; signed: boolean },
-    min: bigint,
-    max: bigint,
+    discrs: readonly bigint[],
     display: string,
   ): { layout: Layout; info: EnumInfo } {
     let prefixAlign = this.intAlign(minIty.bytes);
@@ -925,8 +970,10 @@ export class RustLayoutEngine {
       const forAlign = [1, 2, 4, 8, 16].find((b) => b === startAlign && this.intAlign(b) === startAlign);
       if (forAlign !== undefined && forAlign > tagBytes) tagBytes = forAlign;
     }
+    // The tag's valid range: the smallest one holding every tag, with no inhabited variant 0..=0.
     const mask = maxOf(tagBytes);
-    const tag: Scalar = { offset: 0, bytes: tagBytes, start: min & mask, end: max & mask };
+    const range = smallestRangeContaining(discrs.map((d) => d & mask), tagBytes) ?? { start: 0n, end: 0n };
+    const tag: Scalar = { offset: 0, bytes: tagBytes, ...range };
     const tagField: FieldInput = {
       name: '(discriminant)',
       type: `${minIty.signed ? 'i' : 'u'}${tagBytes * 8}`,
@@ -1148,7 +1195,7 @@ export function analyzeRust(code: string, targetId: string): RustAnalysis {
     }
     analysis.unusedTypes = findUnused(file, rootName);
   } catch (err) {
-    if (!(err instanceof RustLayoutError)) throw err;
+    if (!(err instanceof RustLayoutError) && !(err instanceof NestingError)) throw err;
     analysis.errors.push({ message: err.message, line: err.line, type: 'semantic' });
     analysis.result = null;
   }
@@ -1158,6 +1205,8 @@ export function analyzeRust(code: string, targetId: string): RustAnalysis {
 /** Items the root does not reach through its field types. */
 function findUnused(file: RustFile, root: string): string[] {
   const used = new Set<string>([root]);
+  // Items go on a worklist: a chain of them (through pointers too) can be any length.
+  const pending: RustItem[] = [];
   const visitType = (t: RustType) => {
     switch (t.kind) {
       case 'path': {
@@ -1165,7 +1214,7 @@ function findUnused(file: RustFile, root: string): string[] {
         const item = file.items.get(name);
         if (item && !used.has(name)) {
           used.add(name);
-          visitItem(item);
+          pending.push(item);
         }
         t.args.forEach((a) => {
           if (a.kind === 'type') visitType(a.type);
@@ -1191,5 +1240,6 @@ function findUnused(file: RustFile, root: string): string[] {
     else item.fields.forEach((f) => visitType(f.type));
   };
   visitItem(file.items.get(root)!);
+  while (pending.length > 0) visitItem(pending.pop()!);
   return file.order.filter((n) => !used.has(n) && file.items.get(n)!.kind !== 'alias');
 }

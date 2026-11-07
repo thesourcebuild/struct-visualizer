@@ -8,6 +8,7 @@ import { platform } from "@sp/platform";
 import { BASE_PATH } from "@/lib/constants";
 import { parseShareHash } from "../share-link";
 import { DEFAULT_INPUTS } from "./default-input";
+import { readCollapsedFamilies, readSavedInput, readSavedLanguage, readSavedToolId } from "./saved-state";
 import { openGuide } from "@/components/guides/guide-overlay";
 import { Sidebar } from "./sidebar";
 import { ToolErrorBoundary } from "./tool-boundary";
@@ -73,16 +74,16 @@ export function AppShell({ initialToolId, preloadedFamily = "layout" }: AppShell
     const shared = parseShareHash(window.location.hash);
     const saved = { ...DEFAULT_INPUTS };
     for (const language of LANGUAGES) {
-      const value = p.readSavedState<string>(inputKey(language));
-      if (value) saved[language] = value;
+      const value = readSavedInput(p.readSavedState<unknown>(inputKey(language)));
+      if (value !== undefined) saved[language] = value;
     }
-    const savedTool = p.readSavedState<string>(KEY_LAST_TOOL);
+    const savedTool = readSavedToolId(p.readSavedState<unknown>(KEY_LAST_TOOL));
     // One-time restore from external state (localStorage, URL fragment). It cannot run during
     // render: the page is statically exported, so the server render must match the first client render.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setCollapsedFamilies(p.readSavedState<string[]>(KEY_COLLAPSED) ?? []);
-    const savedLanguage = p.readSavedState<ToolFamily>(KEY_LANGUAGE);
-    if (savedLanguage && isLanguageFamily(savedLanguage)) setLanguage(savedLanguage);
+    setCollapsedFamilies(readCollapsedFamilies(p.readSavedState<unknown>(KEY_COLLAPSED)));
+    const savedLanguage = readSavedLanguage(p.readSavedState<unknown>(KEY_LANGUAGE));
+    if (savedLanguage) setLanguage(savedLanguage);
 
     if (shared && getManifest(shared.toolId)) {
       openTool(shared.toolId);
@@ -92,7 +93,7 @@ export function AppShell({ initialToolId, preloadedFamily = "layout" }: AppShell
       window.history.replaceState(null, "", `${BASE_PATH}/tools/${shared.toolId}/`);
     } else {
       setInputs(saved);
-      if (!initialToolId && savedTool && getManifest(savedTool)) openTool(savedTool);
+      if (!initialToolId && savedTool) openTool(savedTool);
       else if (initialToolId) openTool(initialToolId);
     }
     setHydrated(true);

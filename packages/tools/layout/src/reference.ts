@@ -6,9 +6,8 @@ import {
   osTypes,
   targetArchitectureList,
 } from "@sp/core";
-import type { DataModel } from "@sp/core";
 import type { ToolResult, ToolTable } from "@sp/engine";
-import { OPTION_REFERENCE_MODEL, readString } from "./pure";
+import { readReferenceModel } from "./create-spec";
 import type { LayoutSpec } from "./spec";
 
 const TYPE_CATEGORIES: Record<string, readonly string[]> = {
@@ -30,13 +29,8 @@ const TYPE_CATEGORIES: Record<string, readonly string[]> = {
   "Boolean/enum": ["bool", "_Bool", "enum"],
 };
 
-function readReferenceModel(spec: LayoutSpec): DataModel {
-  const v = readString(spec.options, OPTION_REFERENCE_MODEL, "LP64");
-  return v in dataModels ? (v as DataModel) : "LP64";
-}
-
 export function computeDataModels(spec: LayoutSpec): ToolResult {
-  const modelId = readReferenceModel(spec);
+  const modelId = readReferenceModel(spec.options);
   const model = dataModels[modelId];
   const typeMap = getStandardTypeMap(modelId);
 

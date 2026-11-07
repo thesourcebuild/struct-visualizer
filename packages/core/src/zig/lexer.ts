@@ -77,6 +77,14 @@ function escape(text: string, i: number, line: number): { code: number; length: 
   }
 }
 
+/**
+ * Zig 0.17 reads a carriage return as whitespace between tokens, and as part of the line end
+ * before a line feed; anywhere else, in a comment or a literal, it is an invalid byte (measured
+ * with zig ast-check and build-obj: "comment contains invalid byte: '\\r'", and the same
+ * for string and character literals).
+ */
+const invalidCr = (what: string, line: number) => new ZigLexError(`${what} contains invalid byte: '\\r'.`, line);
+
 export function lexZig(text: string): ZigToken[] {
   const tokens: ZigToken[] = [];
   let i = 0;
@@ -97,7 +105,10 @@ export function lexZig(text: string): ZigToken[] {
       continue;
     }
     if (c === '/' && text[i + 1] === '/') {
-      while (i < text.length && text[i] !== '\n') i += 1;
+      while (i < text.length && text[i] !== '\n') {
+        if (text[i] === '\r' && text[i + 1] !== '\n') throw invalidCr('Comment', line);
+        i += 1;
+      }
       continue;
     }
     const start = i;
@@ -108,8 +119,12 @@ export function lexZig(text: string): ZigToken[] {
       const startLine = line;
       for (;;) {
         let j = i + 2;
-        while (j < text.length && text[j] !== '\n') j += 1;
-        lines.push(text.slice(i + 2, j));
+        while (j < text.length && text[j] !== '\n') {
+          if (text[j] === '\r' && text[j + 1] !== '\n') throw invalidCr('String literal', line);
+          j += 1;
+        }
+        // A line that ends in CRLF ends before the CR.
+        lines.push(text.slice(i + 2, text[j - 1] === '\r' ? j - 1 : j));
         i = j;
         // Another line of the same literal?
         let k = i + 1;
@@ -217,6 +232,7 @@ export function lexZig(text: string): ZigToken[] {
       } else {
         const cp = text.codePointAt(j);
         if (cp === undefined || text[j] === '\n') throw new ZigLexError('Unterminated character literal.', line);
+        if (text[j] === '\r') throw invalidCr('Character literal', line);
         code = cp;
         j += cp > 0xffff ? 2 : 1;
       }
@@ -231,6 +247,7 @@ export function lexZig(text: string): ZigToken[] {
       let value = '';
       while (j < text.length && text[j] !== '"') {
         if (text[j] === '\n') throw new ZigLexError('Unterminated string literal.', line);
+        if (text[j] === '\r') throw invalidCr('String literal', line);
         if (text[j] === '\\') {
           const e = escape(text, j + 1, line);
           value += String.fromCodePoint(e.code);

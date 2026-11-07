@@ -5,7 +5,8 @@
 //
 // Output: one JSON line per file, in argument order:
 // {"name": ..., "archs": {"amd64": {"size", "align", "fields": [{"name", "offset", "size"}]}, ...}}
-// or {"error": "..."} when the file does not type-check. Files share one importer, so standard
+// with {"error": "..."} for an architecture the file does not type-check on, or {"error": "..."}
+// alone when it type-checks on none. Files share one importer, so standard
 // library packages are loaded once.
 // types.SizesFor("gc", arch) implements the gc compiler's rules, including the padding added
 // after a trailing zero-size field.
@@ -83,12 +84,23 @@ func layoutFile(fset *token.FileSet, imp types.Importer, path string) (map[strin
 	}
 
 	out := map[string]any{"name": last}
-	results := map[string]layout{}
+	results := map[string]any{}
+	var firstErr error
 	for _, arch := range archs {
 		conf := types.Config{Importer: imp, Sizes: types.SizesFor("gc", arch)}
 		pkg, err := conf.Check(file.Name.Name, fset, []*ast.File{file}, nil)
 		if err != nil {
-			return nil, err
+			// Some code type-checks on some architectures only (a constant that overflows a
+			// 32-bit int). The message alone: the position names a temporary file.
+			msg := err.Error()
+			if te, ok := err.(types.Error); ok {
+				msg = te.Msg
+			}
+			results[arch] = map[string]any{"error": msg}
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		t := pkg.Scope().Lookup(last).Type()
 		st := t.Underlying().(*types.Struct)
@@ -103,6 +115,17 @@ func layoutFile(fset *token.FileSet, imp types.Importer, path string) (map[strin
 			l.Fields = append(l.Fields, field{Name: v.Name(), Offset: offsets[i], Size: sizes.Sizeof(v.Type())})
 		}
 		results[arch] = l
+	}
+	if firstErr != nil {
+		allFailed := true
+		for _, r := range results {
+			if _, ok := r.(layout); ok {
+				allFailed = false
+			}
+		}
+		if allFailed {
+			return nil, firstErr
+		}
 	}
 	out["archs"] = results
 	return out, nil

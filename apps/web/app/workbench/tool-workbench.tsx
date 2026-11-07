@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { AnyToolDefinition, ToolManifest, ToolSample, ToolSpecBase } from "@sp/engine";
+import type { ToolManifest, ToolSample, ToolSpecBase } from "@sp/engine";
 import type { OptionValue, OptionValues } from "@sp/contracts";
 import { platform } from "@sp/platform";
 import { Button, Panel } from "@sp/ui";
@@ -10,6 +10,7 @@ import { DiagnosticsPanel } from "./diagnostics-panel";
 import { FieldTable } from "./field-table";
 import { InputPanel } from "./input-panel";
 import { OptionsForm } from "./options-form";
+import { restoreSpec } from "./restore-spec";
 import { ResultPanel } from "./result-panel";
 import { useTool } from "./tool-definitions";
 import { useCompute } from "./use-compute";
@@ -24,13 +25,6 @@ interface ToolWorkbenchProps {
   /** Options from a share link, applied once on top of the saved spec. */
   sharedOptions?: OptionValues;
   onOpenSidebar: () => void;
-}
-
-/** Restore a spec: saved options for this tool, then share-link options on top. */
-function restoreSpec(t: AnyToolDefinition, sharedOptions: OptionValues | undefined): ToolSpecBase {
-  const saved = platform().readSavedState<OptionValues>(specKey(t.id)) ?? {};
-  const restored = t.createSpec({ ...saved, ...sharedOptions });
-  return t.specSchema.safeParse(restored).success ? restored : t.createSpec();
 }
 
 export function ToolWorkbench({
@@ -53,7 +47,7 @@ export function ToolWorkbench({
   useEffect(() => {
     // One-time restore from browser state, which the static HTML cannot know.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setSpec(restoreSpec(tool, sharedOptions));
+    setSpec(restoreSpec(tool, platform().readSavedState<unknown>(specKey(tool.id)), sharedOptions));
     setRestored(true);
   }, [tool, sharedOptions]);
 
@@ -157,6 +151,15 @@ export function ToolWorkbench({
               pending={compute.status === "pending"}
               language={manifest.inputLanguage ?? "c"}
             />
+          )}
+
+          {compute.failure !== undefined && (
+            <p
+              role="alert"
+              className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300"
+            >
+              {manifest.label} failed on this input: {compute.failure}
+            </p>
           )}
 
           <DiagnosticsPanel diagnostics={compute.diagnostics} onFix={applyFix} />

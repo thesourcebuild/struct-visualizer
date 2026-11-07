@@ -7,19 +7,22 @@ type CookieConsentGlobal = typeof globalThis & {
     showCookieConsent?: () => void;
 };
 
+/** A stored answer counts only when it is one the dialog writes; anything else asks again. */
+const isConsent = (value: string | null | undefined): boolean => value === "accepted" || value === "rejected";
+
 const hasStoredConsent = (): boolean => {
     if (typeof window === "undefined") return true;
 
     try {
         const consent = localStorage.getItem("cookie_consent");
-        if (consent) return true;
+        if (isConsent(consent)) return true;
     } catch (e) {
         console.debug("CookieConsent: localStorage unavailable", e);
     }
 
     try {
         const match = document.cookie.split("; ").find((c) => c.startsWith("cookie_consent="));
-        if (match?.split("=")[1]) return true;
+        if (isConsent(match?.slice("cookie_consent=".length))) return true;
     } catch (e) {
         console.debug("CookieConsent: unable to read cookies", e);
     }

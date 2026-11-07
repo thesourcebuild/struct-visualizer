@@ -33,6 +33,7 @@ export const TAG_PACKED = "packed";
 
 export const DEFAULT_TARGET = "intel-x64-amd";
 export const DEFAULT_OS = "linux";
+export const DEFAULT_REFERENCE_MODEL = "LP64";
 
 export const TOOL_STRUCT_LAYOUT = "struct-layout";
 export const TOOL_VERIFICATION_CODE = "verification-code";

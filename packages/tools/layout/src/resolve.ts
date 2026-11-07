@@ -1,11 +1,10 @@
 import { resolvePlatform } from "@sp/core";
-import type { DataModel, OSType, PlatformSelection, ResolvedPlatform } from "@sp/core";
-import { readTarget } from "./create-spec";
+import type { DataModel, PlatformSelection, ResolvedPlatform } from "@sp/core";
+import { readOS, readTarget } from "./create-spec";
 import {
   OPTION_DATA_MODEL,
   OPTION_ENUM_ALIGN,
   OPTION_ENUM_SIZE,
-  OPTION_OS,
   readEnumOverride,
   readString,
 } from "./pure";
@@ -23,7 +22,7 @@ export function selectionFromSpec(spec: LayoutSpec): PlatformSelection {
   return {
     target: readTarget(options),
     dataModel: readString(options, OPTION_DATA_MODEL, "") as DataModel,
-    os: readString(options, OPTION_OS, "linux") as OSType,
+    os: readOS(options),
     enumSize: readEnumOverride(options, OPTION_ENUM_SIZE),
     enumAlign: readEnumOverride(options, OPTION_ENUM_ALIGN),
   };

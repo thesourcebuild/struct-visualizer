@@ -1,5 +1,7 @@
-export { parseGo, formatGoType } from './parser';
-export type { GoFile, GoField, GoType, GoTypeDecl } from './parser';
+export { parseGo, formatGoType, formatGoExpr } from './parser';
+export type { GoConstDecl, GoExpr, GoFile, GoField, GoType, GoTypeDecl, GoVarDecl } from './parser';
+export { lexGo } from './lexer';
+export { classSize, fieldAlignmentMessage, goSortSlice } from './fieldalignment';
 export { GO_TARGETS, getGoTarget } from './targets';
 export type { GoCompiler, GoTarget } from './targets';
 export { GoLayoutEngine, analyzeGo } from './layout';

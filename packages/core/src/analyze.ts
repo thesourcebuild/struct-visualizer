@@ -3,6 +3,7 @@ import { StructParser } from './parser/struct-parser';
 import type { ParserTarget } from './parser/struct-parser';
 import { validateSupportedTypes } from './parser/validate-types';
 import { PaddingCalculator } from './layout/padding-calculator';
+import { NestingError } from './nesting';
 import { resolvePlatform } from './abi/resolve-selection';
 import type { PlatformSelection, ResolvedPlatform } from './abi/resolve-selection';
 import { applyPacking, resolvePackingSyntax } from './packing';
@@ -82,15 +83,23 @@ export function analyzeStruct(code: string, selection: PlatformSelection, option
   if (!definition) return analysis;
 
   const calculator = new PaddingCalculator(platform.architecture, platform.dataModel);
+  try {
+    analysis.result = calculator.calculate(definition);
+    analysis.packed = packedLayout(applyPacking(code, syntax), target);
+    analysis.optimized = calculator.compareLayouts(definition).optimized;
+  } catch (err) {
+    // Records laid out inside each other deeper than the engines go.
+    if (!(err instanceof NestingError)) throw err;
+    errors.push({ message: err.message, line: err.line, type: 'semantic' });
+    analysis.result = analysis.packed = analysis.optimized = null;
+    return analysis;
+  }
   analysis.definition = definition;
   analysis.unusedDefinitions = findUnusedDefinitions(
     definition,
     [...parser.getAllStructs(), ...parser.getAllUnions()],
     (name) => parser.resolveRecord(name),
   );
-  analysis.result = calculator.calculate(definition);
-  analysis.packed = packedLayout(applyPacking(code, syntax), target);
-  analysis.optimized = calculator.compareLayouts(definition).optimized;
   analysis.unknownTypes = calculator.getUnknownTypes();
   return analysis;
 }
@@ -121,12 +130,20 @@ function findUnusedDefinitions(
   resolve: (name: string) => ParsedStruct | undefined,
 ): string[] {
   const reachable = new Set<string>();
+  // A worklist, not recursion: a chain of definitions that point to each other can be any length.
+  const pending: ParsedStruct[] = [];
   const visit = (def: ParsedStruct) => {
     const key = definitionKey(def);
     if (reachable.has(key)) return;
     reachable.add(key);
+    pending.push(def);
+  };
+  const scan = (def: ParsedStruct) => {
     for (const member of def.members) {
       if (member.nestedStruct) visit(member.nestedStruct);
+      // A pointer to member's class sizes it under MSVC.
+      const memberOf = member.memberPointer ? resolve(member.memberPointer.className) : undefined;
+      if (memberOf) visit(memberOf);
       for (const text of [member.type, member.declaredType ?? '']) {
         // `struct X*`, `union X*`, typedef names (`Node*`) and function-pointer parameters.
         for (const [, name] of text.matchAll(/\b(?:struct|union)\s+(\w+)/g)) {
@@ -140,6 +157,7 @@ function findUnusedDefinitions(
     }
   };
   visit(root);
+  while (pending.length > 0) scan(pending.pop()!);
   return all
     .filter((def) => !def.name.startsWith(ANONYMOUS_PREFIX) && !reachable.has(definitionKey(def)))
     .map(definitionKey);

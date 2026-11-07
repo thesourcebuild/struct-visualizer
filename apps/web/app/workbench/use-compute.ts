@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { runLint } from "@sp/engine";
 import type { AnyToolDefinition, ToolResult, ToolSpecBase } from "@sp/engine";
 import type { Diagnostic } from "@sp/contracts";
+import { runTool } from "./run-tool";
 
 export type ComputeStatus = "blank" | "pending" | "done" | "error";
 
@@ -13,6 +13,8 @@ export interface ComputeState {
   diagnostics: Diagnostic<ToolSpecBase>[];
   /** Tags for option visibility, derived from the (debounced) input. */
   tags: string | readonly string[] | undefined;
+  /** What the tool's code threw on this input, if it did. */
+  failure: string | undefined;
 }
 
 const DEBOUNCE_MS = 150;
@@ -38,24 +40,16 @@ export function useCompute(
     if (!tool || !spec) return undefined;
     const effectiveInput = tool.readsInput ? debounced : "";
     if (tool.readsInput && effectiveInput.trim() === "") return undefined;
-    let result: ToolResult;
-    try {
-      result = tool.compute(spec, effectiveInput);
-    } catch (err) {
-      result = { error: err instanceof Error ? err.message : String(err) };
-    }
-    const diagnostics = runLint(tool.lintRules, { spec, input: effectiveInput, result });
-    const tags = tool.variantTag?.(spec, effectiveInput);
-    return { result, diagnostics, tags };
+    return runTool(tool, spec, effectiveInput);
   }, [tool, spec, debounced]);
 
   const pending = tool?.readsInput === true && debounced !== input;
 
   if (!computed) {
-    return { status: pending ? "pending" : "blank", result: undefined, diagnostics: [], tags: undefined };
+    return { status: pending ? "pending" : "blank", result: undefined, diagnostics: [], tags: undefined, failure: undefined };
   }
   return {
-    status: pending ? "pending" : computed.result.error ? "error" : "done",
+    status: pending ? "pending" : computed.result.error || computed.failure ? "error" : "done",
     ...computed,
   };
 }

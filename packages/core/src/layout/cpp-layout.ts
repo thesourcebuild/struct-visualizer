@@ -1,4 +1,4 @@
-import type { CalculationResult, CppMethod, ParsedStruct, StructMember } from '../types';
+import type { CalculationResult, CppMethod, MsInheritanceModel, ParsedStruct, StructMember } from '../types';
 import type { FieldPlacement, PaddingCalculator } from './padding-calculator';
 
 /**
@@ -67,6 +67,35 @@ export class CppLayout {
     return this.layoutOf(def).result;
   }
 
+  /**
+   * A pointer to member; `alone` for its type on its own (alignof) rather than in a record.
+   * Itanium: a ptrdiff_t offset to data; to a function, a function pointer or vtable offset and a
+   * this adjustment, both ptrdiff_t-sized. MSVC: to a function, a code pointer; to data, an int
+   * offset; then ints by the class's inheritance model: a this adjustment (functions, all but
+   * single), the vbptr's offset (unspecified) and a vbtable index (virtual and unspecified).
+   * Aligned like a pointer if it has one and else like int, 64-bit rounds the size to that; 32-bit
+   * aligns one of more than one field to 8 in a record. MSVC's alignof is the pointer size.
+   * Measured in tests/cpp-compiler.test.ts.
+   */
+  memberPointer(mp: NonNullable<StructMember['memberPointer']>, alone: boolean): { size: number; alignment: number } {
+    if (this.abi === 'itanium') {
+      const ptrdiff = this.host.measure({ name: '', type: 'ptrdiff_t' });
+      return { size: ptrdiff.size * (mp.function ? 2 : 1), alignment: ptrdiff.alignment };
+    }
+    const int = this.host.measure({ name: '', type: 'int' });
+    const model = mp.inheritance;
+    const pointers = mp.function ? 1 : 0;
+    let ints = mp.function ? 0 : 1;
+    if (mp.function && model !== 'single') ints += 1;
+    if (model === 'unspecified') ints += 1;
+    if (model === 'virtual' || model === 'unspecified') ints += 1;
+    let alignment = pointers > 0 ? this.pointerAlign : int.alignment;
+    if (this.pointerSize === 4 && pointers + ints > 1) alignment = 8;
+    let size = pointers * this.pointerSize + ints * int.size;
+    if (this.pointerSize === 8) size = alignTo(size, alignment);
+    return { size, alignment: alone ? this.pointerSize : alignment };
+  }
+
   // ------------------------------------------------------------------ class facts
 
   private bases(def: ParsedStruct) {
@@ -105,14 +134,23 @@ export class CppLayout {
     return this.polymorphic(def) || this.hasVirtualBases(def);
   }
 
-  /** No data, no virtual functions or bases, only empty bases (C++'s is_empty). */
+  /**
+   * No data, no virtual functions or bases, only empty bases (C++'s is_empty). The Itanium ABI's
+   * empty class may also have empty data members: [[no_unique_address]] ones of empty class type.
+   */
   isEmpty(def: ParsedStruct): boolean {
     if (def.isUnion) return def.members.every((m) => m.bitField === 0);
     return (
-      def.members.every((m) => m.bitField === 0 && !m.name) &&
+      def.members.every((m) => (m.bitField === 0 && !m.name) || this.emptyDataMember(m)) &&
       !this.dynamic(def) &&
       this.bases(def).every((b) => this.isEmpty(b.def))
     );
+  }
+
+  /** Itanium: a [[no_unique_address]] member of empty class type, which takes no data. */
+  private emptyDataMember(m: StructMember): boolean {
+    const t = classType(m);
+    return this.abi === 'itanium' && m.noUniqueAddress === 'std' && m.arraySize === undefined && t !== undefined && this.isEmpty(t);
   }
 
   /**
@@ -153,7 +191,7 @@ export class CppLayout {
   layoutOf(def: ParsedStruct): ClassLayout {
     let layout = this.layouts.get(def);
     if (!layout) {
-      layout = this.abi === 'msvc' ? this.msvc(def) : this.itanium(def);
+      layout = this.host.nested(() => (this.abi === 'msvc' ? this.msvc(def) : this.itanium(def)), def.line);
       this.layouts.set(def, layout);
     }
     return layout;
@@ -265,9 +303,9 @@ export class CppLayout {
       }
       for (const [nb, at] of bl.baseOffsets) claimPrimaryVirtualBases(nb, offset + at);
     };
+    // Each base's own layout is filled in once every virtual base has its place (itaniumBaseSubobject).
     const pushBase = (b: ParsedStruct, offset: number, role: 'base' | 'virtual-base') => {
-      const bl = this.layoutOf(b);
-      entries.push(baseEntry(b, offset, role, bl, this.asBaseSubobject(bl)));
+      entries.push(baseEntry(b, offset, role, this.layoutOf(b)));
     };
 
     if (primary && !primary.virtual) {
@@ -302,6 +340,8 @@ export class CppLayout {
     // a [[no_unique_address]] one may overlap the rest, and an empty one takes no data.
     const state = this.host.startFields(dsize * 8);
     let paddedSize = 0;
+    /** Where the last empty data member ends: not data, but within the class as a base. */
+    let emptyEnd = 0;
     const place: FieldPlacement = (member, layout, at) => {
       const t = classType(member);
       if (!t) return { offset: at, dataEnd: at + layout.size };
@@ -319,6 +359,7 @@ export class CppLayout {
         offset = 0;
         while (!fits(offset)) offset = offset === 0 && current !== 0 ? alignTo(current, layout.alignment) : offset + layout.alignment;
         dataEnd = current;
+        emptyEnd = Math.max(emptyEnd, offset + layout.size);
       } else {
         while (!fits(offset)) offset += layout.alignment;
         dataEnd = offset + (overlapping ? Math.max(tl.nvSize, tl.dataSize) : layout.size);
@@ -331,10 +372,11 @@ export class CppLayout {
     this.host.closeFields(state);
 
     dsize = Math.ceil(state.pos / 8);
-    size = Math.max(size, dsize);
+    size = Math.max(size, dsize, emptyEnd);
     align = Math.max(align, state.maxAlignment);
     const nvAlign = this.host.structAlignment(def, align, state.maxExplicitAlignment);
-    // As a base, the class ends with its data; a [[no_unique_address]] member's tail padding
+    // As a base, the class ends with its data or its last empty data member (GCC's end_of_class,
+    // so a derived class's members follow it); a [[no_unique_address]] member's tail padding
     // still counts in its own size.
     let nvSize = size;
     size = Math.max(size, paddedSize);
@@ -357,6 +399,10 @@ export class CppLayout {
       }
     };
     layoutVirtualBases(def);
+    for (const e of entries) {
+      const t = e.member.nestedStruct;
+      if (t && (e.member.role === 'base' || e.member.role === 'virtual-base')) e.nested = this.itaniumBaseSubobject(t, e.offset, vbaseOffsets);
+    }
 
     size = Math.max(size, dsize);
     // C++ objects are at least one byte; a class with members of size 0 (zero-length arrays) is not.
@@ -552,7 +598,7 @@ export class CppLayout {
 
     if (hasOwnVfptr) entries.push(vptrEntry('vptr', 0, this.pointerSize, ptrAlign));
     if (hasOwnVbptr) entries.push(vptrEntry('vbptr', vbptrOffset, this.pointerSize, ptrAlign));
-    for (const [b, at] of baseOffsets) entries.push(baseEntry(b, at, 'base', this.layoutOf(b), this.asBaseSubobject(this.layoutOf(b))));
+    for (const [b, at] of baseOffsets) entries.push(baseEntry(b, at, 'base', this.layoutOf(b), this.msvcBaseSubobject(this.layoutOf(b))));
     entries.push(...fieldEntries);
     const fields = fieldEntries.map((m) => ({ member: m.member, offset: m.offset }));
 
@@ -574,7 +620,7 @@ export class CppLayout {
         // The vtordisp is the 4 bytes just before its virtual base.
         if (vtordisps.has(v)) entries.push(vptrEntry('vtordisp', offset - vtordispSize, vtordispSize, vtordispAlign, v));
         vbaseOffsets.set(v, offset);
-        entries.push(baseEntry(v, offset, 'virtual-base', vl, this.asBaseSubobject(vl)));
+        entries.push(baseEntry(v, offset, 'virtual-base', vl, this.msvcBaseSubobject(vl)));
         size = offset + vl.nvSize;
         previousVbase = vl;
       }
@@ -692,11 +738,54 @@ export class CppLayout {
     }
   }
 
-  /** A class's layout as a base subobject of another: without its virtual bases, nvSize long. */
-  private asBaseSubobject(l: ClassLayout): CalculationResult {
+  /** MSVC: a class's layout as a base subobject of another: without its virtual bases, nvSize long. */
+  private msvcBaseSubobject(l: ClassLayout): CalculationResult {
     const members = l.result.members.filter((m) => m.member.role !== 'virtual-base' && !(m.member.role === 'vtordisp'));
     return withPadding({ ...l.result, members }, l.nvSize);
   }
+
+  /**
+   * Itanium: a base subobject of `def` at `at` in a complete object whose virtual bases are at
+   * `vbases`, nvSize long. Without its virtual bases, but with its primary virtual base where that
+   * shares its address there (g++'s "primary-for"); where it does not, the vptr the two share is
+   * the base's own.
+   */
+  private itaniumBaseSubobject(def: ParsedStruct, at: number, vbases: ReadonlyMap<ParsedStruct, number>): CalculationResult {
+    const l = this.layoutOf(def);
+    const members = l.result.members.flatMap((m): Entry[] => {
+      const t = m.member.nestedStruct;
+      if (!t || (m.member.role !== 'base' && m.member.role !== 'virtual-base')) return [m];
+      if (m.member.role === 'base') return [{ ...m, nested: this.itaniumBaseSubobject(t, at + m.offset, vbases) }];
+      if (!l.primary?.virtual || l.primary.def !== t) return [];
+      if (vbases.get(t) === at + m.offset) return [{ ...m, nested: this.itaniumBaseSubobject(t, at + m.offset, vbases) }];
+      let ptrAlign = def.packed ? 1 : this.pointerAlign;
+      if (def.pragmaPack !== undefined) ptrAlign = Math.min(ptrAlign, def.pragmaPack);
+      return [{
+        ...vptrEntry('vptr', m.offset, this.pointerSize, ptrAlign),
+        note: `The pointer to the virtual function table (vptr), which ${def.name} shares with its primary virtual base ${t.name} where ${t.name} is placed with it; here ${t.name} is elsewhere.`,
+      }];
+    });
+    return withPadding({ ...l.result, members }, l.nvSize);
+  }
+}
+
+/**
+ * MSVC's inheritance model of a class (MsInheritanceModel): virtual with a virtual base at any
+ * depth; multiple with more than one base anywhere down its chain of single bases, or a class on
+ * it that is polymorphic over a base that is not; else single. While the class is being defined
+ * its own virtual functions do not count yet. Measured in tests/cpp-compiler.test.ts.
+ */
+export function msInheritanceModel(def: ParsedStruct, beingDefined: boolean): MsInheritanceModel {
+  const bases = (d: ParsedStruct) => d.cpp?.bases ?? [];
+  const virtualBases = (d: ParsedStruct): boolean => bases(d).some((b) => b.virtual || virtualBases(b.def));
+  const polymorphic = (d: ParsedStruct): boolean => (d.cpp?.methods ?? []).some((m) => m.declaredVirtual) || bases(d).some((b) => polymorphic(b.def));
+  if (virtualBases(def)) return 'virtual';
+  for (let rd = def; bases(rd).length > 0; rd = bases(rd)[0]!.def) {
+    if (bases(rd).length > 1) return 'multiple';
+    const base = bases(rd)[0]!.def;
+    if (!(rd === def && beingDefined) && polymorphic(rd) && !polymorphic(base)) return 'multiple';
+  }
+  return 'single';
 }
 
 /** The class a member is an object of (or an array of), for C++ classes. */
@@ -704,7 +793,7 @@ function classType(m: StructMember): ParsedStruct | undefined {
   return m.isNested && m.nestedStruct?.cpp && !m.type.includes('*') && !m.reference ? m.nestedStruct : undefined;
 }
 
-function baseEntry(def: ParsedStruct, offset: number, role: 'base' | 'virtual-base', l: ClassLayout, nested: CalculationResult): Entry {
+function baseEntry(def: ParsedStruct, offset: number, role: 'base' | 'virtual-base', l: ClassLayout, nested?: CalculationResult): Entry {
   const keyword = def.cpp?.key ?? 'struct';
   return {
     member: { name: def.name, type: `${keyword} ${def.name}`, role, isNested: true, nestedStruct: def },

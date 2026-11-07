@@ -2,8 +2,7 @@
  * Go source generation: a verification program that prints what the real compiler does, and
  * the struct rewritten in the suggested field order.
  */
-import { stripComments } from '../parser/preprocess';
-import { tokenize } from '../parser/tokens';
+import { lexGo } from './lexer';
 import { formatGoType } from './parser';
 import type { GoField } from './parser';
 
@@ -62,8 +61,9 @@ export function generateGoVerificationCode(
 ): string {
   const packageName = asPackage ?? 'main';
   const funcName = asPackage ? 'Report' : 'main';
-  const lines = source.replace(/\r\n?/g, '\n').split('\n');
-  const first = tokenize(stripComments(source))[0];
+  // Lines as the Go lexer counts them: a carriage return is whitespace to Go, kept as it is.
+  const lines = source.split('\n');
+  const first = lexGo(source).tokens[0];
   const imports = 'import (\n\tspfmt "fmt"\n\tspunsafe "unsafe"\n)';
 
   let head: string[];
@@ -104,6 +104,6 @@ export function generateGoVerificationCode(
 
 /** Whether the input already declares `func main`, which the verification program adds. */
 export function declaresGoMain(source: string): boolean {
-  const tokens = tokenize(stripComments(source));
+  const tokens = lexGo(source).tokens;
   return tokens.some((t, i) => t.value === 'func' && tokens[i + 1]?.value === 'main' && tokens[i + 2]?.value === '(');
 }

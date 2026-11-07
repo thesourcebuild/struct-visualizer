@@ -8,6 +8,8 @@ const normalizeTypeForLookup = (type: string) =>
     .replace(/\*/g, '')
     .replace(/\bconst\b/g, '')
     .replace(/\bvolatile\b/g, '')
+    // A complex type is supported where its real type is.
+    .replace(/\s_Complex$/, '')
     .replace(/\s+/g, ' ')
     .trim();
 

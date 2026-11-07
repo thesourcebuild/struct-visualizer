@@ -1,12 +1,12 @@
 /**
- * Zig memory layout, as Zig 0.16 computes it (src/Type.zig abiSize/abiAlignment/classify and
+ * Zig memory layout, as Zig 0.17 computes it (src/Type.zig abiSize/abiAlignment/classify and
  * src/Sema/type_resolution.zig), with the comptime evaluation a type needs on the way: constants,
  * builtins (@sizeOf, @alignOf, @bitSizeOf, @offsetOf, @This, @Vector, @Int, @typeInfo), calls of
  * functions that return types, and `if`.
  *
  * - struct: the compiler sorts the fields by descending alignment (`mem.sortUnstable`, a pdq
  *   sort, so equal alignments keep whatever order pdq leaves) and places them in that order.
- *   Tuples, extern structs keep declaration order; extern ones raise 128-bit integers to 16.
+ *   Tuples and extern structs keep declaration order.
  * - packed struct and packed union: an integer of the fields' total bit width.
  * - union: the largest field, plus a tag when the union is tagged, or, in Debug and ReleaseSafe,
  *   a hidden safety tag for a bare union. The tag goes first unless the payload is more aligned.
@@ -14,6 +14,7 @@
  * - ?T: the payload alone for pointers (also slices) and error sets, else T and a flag that adds
  *   T's alignment. E!T: an error code (u16) and the payload, the more aligned one first.
  */
+import { Nesting, NestingError } from '../nesting';
 import type { CalculationResult, ParseError, ParsedStruct, StructMember } from '../types';
 import { parseZig } from './parser';
 import type { ContainerDecl, Decl, Expr, FieldDecl, FnDecl, Stmt, SwitchProng, ZigFile } from './parser';
@@ -23,14 +24,18 @@ import {
   cTypeAlignment,
   cTypeBitSize,
   cTypeByteSize,
+  compilerRtFloatAbi,
   floatLayout,
   getZigCpu,
   getZigTarget,
   intAlignment,
   intByteSize,
   isBigEndian,
+  minFunctionAlignment,
+  OPTIMIZE_FIELD,
   ptrBits,
   runtimeSafety,
+  stackAlignment,
   zigBackend,
 } from './targets';
 import type { CType, ZigBuildMode, ZigCpu, ZigTarget } from './targets';
@@ -44,7 +49,7 @@ export type ZType =
   | { k: 'float'; bits: 16 | 32 | 64 | 80 | 128 }
   | { k: 'c_longdouble' }
   | { k: 'bool' | 'void' | 'noreturn' | 'anyopaque' }
-  | { k: 'comptime'; name: 'type' | 'comptime_int' | 'comptime_float' | '@TypeOf(.enum_literal)' | '@TypeOf(null)' | '@TypeOf(undefined)' }
+  | { k: 'comptime'; name: 'type' | 'comptime_int' | 'comptime_float' | '@EnumLiteral()' | '@TypeOf(null)' | '@TypeOf(undefined)' }
   | { k: 'ptr'; size: 'one' | 'many' | 'slice' | 'c'; child: ZType; isConst: boolean; isVolatile: boolean; allowzero: boolean; align?: number; sentinel?: string }
   | { k: 'array'; len: number; sentinel?: string; child: ZType }
   | { k: 'vector'; len: number; child: ZType }
@@ -59,19 +64,20 @@ type Value =
   | { k: 'type'; t: ZType }
   /** An integer: comptime_int, or of a fixed-width type (`const n: u16 = 3`), which @clz needs. */
   | { k: 'int'; v: bigint; type?: ZType }
-  | { k: 'float'; text: string }
+  /** A float: comptime_float, or of a float type it was coerced to. */
+  | { k: 'float'; text: string; type?: ZType }
   | { k: 'bool'; v: boolean }
   | { k: 'enumLit'; name: string }
   | { k: 'enumValue'; type: Container; name: string }
   | { k: 'string'; v: string }
   | { k: 'null' | 'undefined' | 'void' | 'init' }
   | { k: 'fn'; fn: FnDecl; scope: Scope; name: string; id: number }
-  /** A struct value: its fields by name. */
-  | { k: 'record'; fields: Map<string, Value> }
+  /** A struct value: its fields by name, and its type where it has a named one. */
+  | { k: 'record'; fields: Map<string, Value>; type?: ZType }
   /** A tagged union value (std.builtin.Type, as @typeInfo gives it): only its active field can be read. */
-  | { k: 'union'; tag: string; payload: Value }
-  /** A value of an optional type: the payload, or null. */
-  | { k: 'optional'; v: Value | null }
+  | { k: 'union'; tag: string; payload: Value; type?: ZType }
+  /** A value of an optional type: the payload, or null; and the optional type, where known. */
+  | { k: 'optional'; v: Value | null; type?: ZType }
   /** Something the engine does not represent (a container's declarations): an error to use. */
   | { k: 'unmodelled'; what: string };
 
@@ -152,6 +158,39 @@ const ceilPow2 = (n: number) => {
 };
 /** Type.smallestUnsignedBits */
 const smallestUnsignedBits = (max: number) => (max <= 0 ? 0 : Math.floor(Math.log2(max)) + 1);
+
+/** The bytes of a string in UTF-8, as Zig stores a string literal. */
+function utf8Length(s: string): number {
+  let n = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+  }
+  return n;
+}
+
+/** A decimal float literal's exact value, num / den; undefined for a hex float. */
+function rationalOf(text: string): { num: bigint; den: bigint } | undefined {
+  const m = /^(-?)(\d[\d_]*)(?:\.([\d_]*))?(?:[eE]([+-]?\d+))?$/.exec(text);
+  if (!m) return undefined;
+  const frac = (m[3] ?? '').replace(/_/g, '');
+  let num = BigInt(m[2]!.replace(/_/g, '') + frac);
+  let den = 10n ** BigInt(frac.length);
+  const exp = Number(m[4] ?? 0);
+  if (exp >= 0) num *= 10n ** BigInt(exp);
+  else den *= 10n ** BigInt(-exp);
+  return { num: m[1] ? -num : num, den };
+}
+
+/** Whether a float of `bits` bits (f16, f32, f64, f80, f128) holds the integer exactly. */
+function floatHoldsInt(bits: number, n: bigint): boolean {
+  const { significand, maxExponent } = { 16: { significand: 11, maxExponent: 15 }, 32: { significand: 24, maxExponent: 127 }, 64: { significand: 53, maxExponent: 1023 }, 80: { significand: 64, maxExponent: 16383 }, 128: { significand: 113, maxExponent: 16383 } }[bits as 16]!;
+  let a = n < 0n ? -n : n;
+  if (a === 0n) return true;
+  if (a.toString(2).length > maxExponent + 1) return false;
+  while ((a & 1n) === 0n) a >>= 1n;
+  return a.toString(2).length <= significand;
+}
 
 const C_TYPES: Record<string, { c: CType; signed: boolean }> = {
   c_char: { c: 'char', signed: true },
@@ -308,6 +347,8 @@ export class ZigEngine {
   private readonly memo = new Map<string, Value>();
   private readonly fnIdsByDecl = new WeakMap<FnDecl, number>();
   private callDepth = 0;
+  /** Every expression and type worked out inside another is one level deeper, a declaration's value included (nesting.ts). */
+  private readonly nesting = new Nesting();
   /** Containers whose layout was computed, in the order they were reached. */
   readonly reached = new Set<Container>();
   /** The error names the evaluated code declares: the program's global error set. */
@@ -392,8 +433,10 @@ export class ZigEngine {
       } else {
         if (!d.value) throw new ZigLayoutError(`'${d.name}' has no value.`, d.line);
         const owner = b.scope.container;
-        v = this.eval(d.value, b.scope, owner && owner.name !== 'root' ? `${owner.name}.${d.name}` : d.name);
-        if (d.type) v = this.coerce(v, this.evalType(d.type, b.scope), d.line);
+        // A declared type is the value's result type, and the value is coerced to it.
+        const type = d.type ? this.evalType(d.type, b.scope) : undefined;
+        v = this.eval(d.value, b.scope, owner && owner.name !== 'root' ? `${owner.name}.${d.name}` : d.name, type);
+        if (type) v = this.coerce(v, type, d.line);
       }
       b.v = v;
       b.state = 'done';
@@ -454,11 +497,13 @@ export class ZigEngine {
     return v.t;
   }
 
-  evalInt(e: Expr, scope: Scope): bigint {
-    const v = this.eval(e, scope);
-    if (v.k === 'int') return v.v;
+  /** An integer; with a result type, the value is coerced to it, as where the language gives one. */
+  evalInt(e: Expr, scope: Scope, rt?: ZType): bigint {
+    let v = this.eval(e, scope, undefined, rt);
     if (v.k === 'bool') throw new ZigLayoutError('Expected an integer, found a bool.', e.line);
-    throw new ZigLayoutError(`Expected an integer, found ${describeValue(v)}.`, e.line);
+    if (v.k !== 'int') throw new ZigLayoutError(`Expected an integer, found ${describeValue(v)}.`, e.line);
+    if (rt) v = this.coerce(v, rt, e.line);
+    return (v as Extract<Value, { k: 'int' }>).v;
   }
 
   private evalBool(e: Expr, scope: Scope): boolean {
@@ -467,8 +512,9 @@ export class ZigEngine {
     return v.v;
   }
 
-  private evalCount(e: Expr, scope: Scope, what: string): number {
-    const n = this.evalInt(e, scope);
+  /** A length or count, of the type the language gives it (an array length is a usize, a vector's a u32). */
+  private evalCount(e: Expr, scope: Scope, what: string, rt?: ZType): number {
+    const n = this.evalInt(e, scope, rt);
     if (n < 0n) throw new ZigLayoutError(`${what} cannot be negative (${n}).`, e.line);
     if (n > 0xffffffffn) throw new ZigLayoutError(`${what} ${n} is too large.`, e.line);
     return Number(n);
@@ -480,7 +526,17 @@ export class ZigEngine {
     return n;
   }
 
-  eval(e: Expr, scope: Scope, nameHint?: string): Value {
+  /**
+   * The value of an expression. `rt` is its result type where the language gives one (a declared
+   * type, a parameter's, a return type, @as, an array length's usize, ...): the casts that take
+   * their type from it (@intCast, @truncate, @enumFromInt, ...) need it, and it passes into the
+   * branches of `if`, `switch` and `orelse`.
+   */
+  eval(e: Expr, scope: Scope, nameHint?: string, rt?: ZType): Value {
+    return this.nesting.in(() => this.evalHere(e, scope, nameHint, rt), e.line);
+  }
+
+  private evalHere(e: Expr, scope: Scope, nameHint?: string, rt?: ZType): Value {
     switch (e.k) {
       case 'ident': {
         const p = this.primitive(e.name);
@@ -511,31 +567,31 @@ export class ZigEngine {
       case 'errorValue':
         throw new ZigLayoutError(`error.${e.name} is a value, not a type.`, e.line);
       case 'comptime':
-        return this.eval(e.e, scope, nameHint);
+        return this.eval(e.e, scope, nameHint, rt);
       case 'unreachable':
         throw new ZigLayoutError('Reached unreachable code at compile time.', e.line);
       case 'switch': {
         const subject = this.eval(e.subject, scope);
         this.checkSwitch(e, subject, scope);
         const matches = (item: SwitchProng['items'][number]): boolean => {
-          if ('value' in item) return this.equal(subject, this.eval(item.value, scope));
+          if ('value' in item) return this.equal(subject, this.switchItem(subject, item.value, scope), e.line);
           if (subject.k !== 'int') throw new ZigLayoutError('A range prong needs an integer to switch on.', e.line);
           return this.evalInt(item.from, scope) <= subject.v && subject.v <= this.evalInt(item.to, scope);
         };
         const prong = e.prongs.find((p) => !p.isElse && p.items.some(matches)) ?? e.prongs.find((p) => p.isElse);
         if (!prong) throw new ZigLayoutError(`No prong of the switch matches ${describeValue(subject)}, and there is no else.`, e.line);
-        return this.eval(prong.body, scope, nameHint);
+        return this.eval(prong.body, scope, nameHint, rt);
       }
       case 'field':
         return this.fieldAccess(this.eval(e.obj, scope), e.name, e.line, scope);
       case 'call':
         return this.call(e, scope);
       case 'builtin':
-        return this.builtin(e, scope);
+        return this.builtin(e, scope, rt);
       case 'unary':
         return this.unary(e.op, this.eval(e.e, scope), e.line);
       case 'binary':
-        return this.binary(e, scope);
+        return this.binary(e, scope, rt);
       case 'index':
         throw new ZigLayoutError('Indexing is not supported in a type expression.', e.line);
       case 'deref':
@@ -549,9 +605,9 @@ export class ZigEngine {
       }
       case 'if': {
         const taken = this.condition(e.cond, e.capture, scope);
-        if (taken) return this.eval(e.then, taken, nameHint);
+        if (taken) return this.eval(e.then, taken, nameHint, rt);
         if (!e.else) return { k: 'void' };
-        return this.eval(e.else, scope, nameHint);
+        return this.eval(e.else, scope, nameHint, rt);
       }
       case 'optional':
         return { k: 'type', t: { k: 'opt', child: this.evalType(e.child, scope) } };
@@ -570,15 +626,20 @@ export class ZigEngine {
           isVolatile: e.isVolatile,
           allowzero: e.allowzero,
           align: e.align ? this.evalAlign(e.align, scope) : undefined,
-          sentinel: e.sentinel ? this.sentinelText(e.sentinel, scope) : undefined,
+          sentinel: e.sentinel ? this.sentinelText(e.sentinel, child, scope) : undefined,
         };
         return { k: 'type', t };
       }
       case 'array': {
         if (e.len === 'infer') throw new ZigLayoutError("An array type's length must be given: [_]T is only for array literals.", e.line);
-        const len = this.evalCount(e.len, scope, 'An array length');
+        const len = this.evalCount(e.len, scope, 'An array length', { k: 'usize' });
         const child = this.evalType(e.child, scope);
-        return { k: 'type', t: { k: 'array', len, child, sentinel: e.sentinel ? this.sentinelText(e.sentinel, scope) : undefined } };
+        // Sema.validateArrayElemType
+        if (child.k === 'anyopaque' || (child.k === 'container' && child.c.decl.kind === 'opaque')) {
+          throw new ZigLayoutError(`Array of opaque type '${formatType(child)}' not allowed.`, e.line);
+        }
+        if (child.k === 'noreturn') throw new ZigLayoutError("Array of 'noreturn' not allowed.", e.line);
+        return { k: 'type', t: { k: 'array', len, child, sentinel: e.sentinel ? this.sentinelText(e.sentinel, child, scope) : undefined } };
       }
       case 'container': {
         const parentName = scope.nearestContainer();
@@ -609,12 +670,80 @@ export class ZigEngine {
     throw new ZigLayoutError('Unsupported calling convention.', e.line);
   }
 
-  private sentinelText(e: Expr, scope: Scope): string {
-    const v = this.eval(e, scope);
-    if (v.k === 'int') return String(v.v);
-    if (v.k === 'null') return 'null';
-    if (v.k === 'bool') return String(v.v);
-    throw new ZigLayoutError('Unsupported sentinel.', e.line);
+  /**
+   * A sentinel, as Sema.zirArrayTypeSentinel takes it: the value coerced to the element type, which
+   * must be one whose values compare with `==` (Type.isSelfComparable): no plain structs, unions or
+   * arrays ("non-scalar sentinel type"). Its text is how the type's name shows it.
+   */
+  private sentinelText(e: Expr, child: ZType, scope: Scope): string {
+    const raw = this.eval(e, scope, undefined, child);
+    // An anonymous literal `.{ ... }` coerces to an aggregate of its fields; the engine does not
+    // hold them, so for it only the type is checked (and only a packed container could take it).
+    const v = raw.k === 'init' ? raw : this.coerce(raw, child, e.line);
+    if (!this.isSelfComparable(child)) throw new ZigLayoutError(`Non-scalar sentinel type '${formatType(child)}'.`, e.line);
+    const text = (x: Value): string | undefined =>
+      x.k === 'int'
+        ? String(x.v)
+        : x.k === 'bool'
+          ? String(x.v)
+          : x.k === 'float'
+            ? this.floatText(x)
+            : x.k === 'enumValue'
+              ? `.${x.name}`
+              : x.k === 'optional'
+                ? x.v === null
+                  ? 'null'
+                  : text(x.v)
+                : x.k === 'void'
+                  ? '{}'
+                  : undefined;
+    const s = text(v);
+    if (s === undefined) throw new ZigLayoutError(`A sentinel of ${describeValue(v)} is not modelled here.`, e.line);
+    return s;
+  }
+
+  /**
+   * A float value as zig prints it (the shortest text that reads back as the value): a value of
+   * f32 or f64, or one any float type holds exactly. Others are not modelled.
+   */
+  private floatText(x: Extract<Value, { k: 'float' }>): string | undefined {
+    const r = rationalOf(x.text);
+    if (!r) return undefined;
+    const d = Number(x.text.replace(/_/g, ''));
+    const bits = x.type?.k === 'float' ? x.type.bits : x.type?.k === 'c_longdouble' ? cTypeBitSize(this.target, 'longdouble') : 128;
+    const exact = Number.isFinite(d) && Number.isInteger(d) ? BigInt(d) * r.den === r.num : false;
+    const value = bits === 32 ? Math.fround(d) : bits === 64 || exact ? d : undefined;
+    return value === undefined ? undefined : String(value).replace('e+', 'e');
+  }
+
+  /** Type.isSelfComparable for `==`. */
+  private isSelfComparable(t: ZType): boolean {
+    switch (t.k) {
+      case 'int':
+      case 'usize':
+      case 'isize':
+      case 'c':
+      case 'float':
+      case 'c_longdouble':
+      case 'bool':
+      case 'void':
+      case 'errset':
+      case 'fn':
+      case 'anyopaque':
+        return true;
+      case 'comptime':
+        return t.name !== '@TypeOf(null)' && t.name !== '@TypeOf(undefined)';
+      case 'vector':
+        return this.isSelfComparable(t.child);
+      case 'ptr':
+        return t.size !== 'slice';
+      case 'opt':
+        return this.isSelfComparable(t.child);
+      case 'container':
+        return t.c.decl.kind === 'enum' || t.c.decl.kind === 'opaque' || t.c.decl.layout === 'packed';
+      default:
+        return false;
+    }
   }
 
   /**
@@ -632,21 +761,28 @@ export class ZigEngine {
   }
 
   /**
-   * `==` of comptime values. An enum literal is compared as a value of the other side's enum, a
-   * tagged union with a tag by its active field, an optional with null or its payload's type.
+   * `==` of comptime values. An enum literal is compared as a value of the other side's enum (one
+   * of its fields: `==` gives it no result type, so no declaration counts), a tagged union with a
+   * tag by its active field, an optional with null or its payload's type.
    */
-  private equal(l: Value, r: Value): boolean {
+  private equal(l: Value, r: Value, line: number): boolean {
     if (l.k === 'union' && r.k === 'enumLit') return l.tag === r.name;
     if (r.k === 'union' && l.k === 'enumLit') return r.tag === l.name;
     if (l.k === 'optional' || r.k === 'optional') {
       const unwrap = (v: Value) => (v.k === 'optional' ? v.v : v.k === 'null' ? null : v);
       const a = unwrap(l);
       const b = unwrap(r);
-      return a === null || b === null ? a === b : this.equal(a, b);
+      return a === null || b === null ? a === b : this.equal(a, b, line);
     }
-    const name = (v: Value) => (v.k === 'enumLit' || v.k === 'enumValue' ? v.name : undefined);
-    if ((l.k === 'enumLit') !== (r.k === 'enumLit') && name(l) !== undefined && name(r) !== undefined) return name(l) === name(r);
+    if (l.k === 'enumValue' && r.k === 'enumLit') return valueKey(l) === valueKey(this.enumField(l.type, r.name, line));
+    if (r.k === 'enumValue' && l.k === 'enumLit') return valueKey(r) === valueKey(this.enumField(r.type, l.name, line));
     return valueKey(l) === valueKey(r);
+  }
+
+  /** A switch prong's item, which takes the subject's type as its result type (so `.name` may be a decl literal). */
+  private switchItem(subject: Value, item: Expr, scope: Scope): Value {
+    const v = this.eval(item, scope);
+    return subject.k === 'enumValue' && v.k === 'enumLit' ? this.coerce(v, { k: 'container', c: subject.type }, item.line) : v;
   }
 
   /**
@@ -662,8 +798,8 @@ export class ZigEngine {
     for (const p of e.prongs) {
       for (const item of p.items) {
         if ('value' in item) {
-          const v = this.eval(item.value, scope);
-          if (values.some((x) => this.equal(x, v))) throw new ZigLayoutError(`Duplicate switch value: ${describeValue(v)}.`, e.line);
+          const v = this.switchItem(subject, item.value, scope);
+          if (values.some((x) => this.equal(x, v, e.line))) throw new ZigLayoutError(`Duplicate switch value: ${describeValue(v)}.`, e.line);
           values.push(v);
           if (v.k === 'int') ranges.push([v.v, v.v]);
         } else {
@@ -726,52 +862,238 @@ export class ZigEngine {
     return this.fnType(params, this.evalType(f.fn.ret, scope), callconv);
   }
 
-  /**
-   * The peer type of integers in arithmetic (Sema's peer type resolution, `fixed_int`): the widest
-   * unsigned and the widest signed operand, the first on a tie; the signed one if it is wider, else,
-   * for comptime-known values as these are, the unsigned one if wider, the earlier on a tie.
-   * comptime_int operands take the result's type. Every operand's value must then fit it.
-   */
-  private peerIntType(l: Extract<Value, { k: 'int' }>, r: Extract<Value, { k: 'int' }>, line: number): ZType | undefined {
-    const operands = [l, r];
-    let unsigned: number | undefined;
-    let signed: number | undefined;
-    operands.forEach((v, i) => {
-      if (!v.type) return;
-      const isSigned = this.intRange(v.type).min < 0n;
-      const current = isSigned ? signed : unsigned;
-      if (current === undefined || this.bitSize(v.type) > this.bitSize(operands[current]!.type!)) {
-        if (isSigned) signed = i;
-        else unsigned = i;
-      }
-    });
-    let pick: number | undefined;
-    if (signed === undefined) pick = unsigned;
-    else if (unsigned === undefined) pick = signed;
-    else {
-      const sBits = this.bitSize(operands[signed]!.type!);
-      const uBits = this.bitSize(operands[unsigned]!.type!);
-      pick = sBits > uBits ? signed : uBits > sBits ? unsigned : Math.min(signed, unsigned);
+  /** The type of a comptime value, as @TypeOf gives it. */
+  private typeOfValue(v: Value, line: number): ZType {
+    const notModelled = (what: string) => new ZigLayoutError(`The type of ${what} is not modelled here.`, line);
+    switch (v.k) {
+      case 'type':
+        return { k: 'comptime', name: 'type' };
+      case 'int':
+        return v.type ?? { k: 'comptime', name: 'comptime_int' };
+      case 'float':
+        return v.type ?? { k: 'comptime', name: 'comptime_float' };
+      case 'bool':
+        return { k: 'bool' };
+      case 'void':
+        return { k: 'void' };
+      case 'enumLit':
+        return { k: 'comptime', name: '@EnumLiteral()' };
+      case 'enumValue':
+        return { k: 'container', c: v.type };
+      case 'null':
+        return { k: 'comptime', name: '@TypeOf(null)' };
+      case 'undefined':
+        return { k: 'comptime', name: '@TypeOf(undefined)' };
+      case 'string':
+        // A string literal is a pointer to a constant, zero-terminated array of its bytes.
+        return {
+          k: 'ptr',
+          size: 'one',
+          isConst: true,
+          isVolatile: false,
+          allowzero: false,
+          child: { k: 'array', len: utf8Length(v.v), sentinel: '0', child: { k: 'int', signed: false, bits: 8 } },
+        };
+      case 'fn':
+        return this.fnTypeOf(v, line);
+      case 'record':
+      case 'union':
+      case 'optional':
+        if (v.type) return v.type;
+        throw notModelled(describeValue(v));
+      case 'init':
+        throw notModelled('an anonymous literal .{ ... }');
+      case 'unmodelled':
+        throw notModelled(v.what);
     }
-    if (pick === undefined) return undefined;
-    const t = operands[pick]!.type!;
-    const { min, max } = this.intRange(t);
-    for (const v of operands) {
-      if (v.v < min || v.v > max) throw new ZigLayoutError(`Type '${formatType(t)}' cannot represent integer value '${v.v}'.`, line);
-    }
-    return t;
   }
 
   /**
-   * A shift of a fixed-width integer: the amount coerces to std.math.Log2Int of its type, which a
-   * comptime-known amount does when its value fits.
+   * Sema.resolvePeerTypes: the type values of these types meet in (@TypeOf of several arguments,
+   * arithmetic's operands). Each peer picks a strategy (PeerResolveStrategy.select) and they merge
+   * into one; ported for the types comptime values here have. Peers of a strategy the engine does
+   * not resolve (pointers, arrays, error sets, ...) must be of one type.
    */
-  private checkShiftAmount(t: ZType, amount: Extract<Value, { k: 'int' }>, line: number): void {
-    const bits = this.bitSize(t, line);
-    const log2Bits = bits <= 1 ? 0 : Math.ceil(Math.log2(bits));
-    if (amount.v < 0n || amount.v >= 1n << BigInt(log2Bits)) {
-      throw new ZigLayoutError(`Type 'u${log2Bits}' cannot represent integer value '${amount.v}'.`, line);
+  private peerType(peers: readonly { type: ZType; value?: Value }[], line: number): ZType {
+    type Strategy = 'unknown' | 'error_set' | 'error_union' | 'nullable' | 'optional' | 'array' | 'vector' | 'c_ptr' | 'ptr' | 'func' | 'enum_or_union' | 'comptime_int' | 'comptime_float' | 'fixed_int' | 'fixed_float' | 'tuple' | 'exact';
+    const ORDER: Strategy[] = ['unknown', 'error_set', 'error_union', 'nullable', 'optional', 'array', 'vector', 'c_ptr', 'ptr', 'func', 'enum_or_union', 'comptime_int', 'comptime_float', 'fixed_int', 'fixed_float', 'tuple', 'exact'];
+    const select = (t: ZType): Strategy => {
+      switch (t.k) {
+        case 'comptime':
+          return t.name === 'type' ? 'exact' : t.name === '@TypeOf(undefined)' ? 'unknown' : t.name === '@TypeOf(null)' ? 'nullable' : t.name === '@EnumLiteral()' ? 'enum_or_union' : t.name;
+        case 'void':
+        case 'bool':
+        case 'anyopaque':
+          return 'exact';
+        case 'noreturn':
+          return 'unknown';
+        case 'int':
+        case 'usize':
+        case 'isize':
+        case 'c':
+          return 'fixed_int';
+        case 'float':
+        case 'c_longdouble':
+          return 'fixed_float';
+        case 'ptr':
+          return t.size === 'c' ? 'c_ptr' : 'ptr';
+        case 'array':
+          return 'array';
+        case 'vector':
+          return 'vector';
+        case 'opt':
+          return 'optional';
+        case 'errset':
+          return 'error_set';
+        case 'errunion':
+          return 'error_union';
+        case 'fn':
+          return 'func';
+        case 'container':
+          return t.c.decl.kind === 'enum' || t.c.decl.kind === 'union' ? 'enum_or_union' : t.c.decl.kind === 'opaque' ? 'exact' : t.c.tuple ? 'tuple' : 'exact';
+      }
+    };
+    const merge = (a: Strategy, b: Strategy): Strategy => {
+      const [s0, s1] = ORDER.indexOf(a) <= ORDER.indexOf(b) ? [a, b] : [b, a];
+      switch (s0) {
+        case 'unknown':
+          return s1;
+        case 'error_set':
+          return s1 === 'error_set' ? 'error_set' : 'error_union';
+        case 'error_union':
+          return 'error_union';
+        case 'nullable':
+          return s1 === 'nullable' ? 'nullable' : s1 === 'c_ptr' ? 'c_ptr' : 'optional';
+        case 'optional':
+          return s1 === 'c_ptr' ? 'c_ptr' : 'optional';
+        case 'array':
+          return s1 === 'vector' ? 'vector' : 'array';
+        case 'vector':
+        case 'c_ptr':
+        case 'ptr':
+        case 'enum_or_union':
+        case 'exact':
+          return s0;
+        case 'tuple':
+          return s1 === 'exact' ? 'exact' : 'tuple';
+        default:
+          // func, comptime_int, comptime_float, fixed_int, fixed_float: the later strategy wins.
+          return s1;
+      }
+    };
+    const conflict = (a: ZType, b: ZType) => new ZigLayoutError(`Incompatible types: '${formatType(a)}' and '${formatType(b)}'.`, line);
+    let s: Strategy = 'unknown';
+    for (const p of peers) s = merge(s, select(p.type));
+    let live = peers;
+    if (s === 'unknown') s = 'exact';
+    else live = peers.filter((p) => !(p.type.k === 'noreturn' || (p.type.k === 'comptime' && p.type.name === '@TypeOf(undefined)')));
+    const first = live[0]!;
+    const isComptime = (t: ZType, name: string) => t.k === 'comptime' && t.name === name;
+    switch (s) {
+      case 'nullable':
+        for (const p of live) if (!isComptime(p.type, '@TypeOf(null)')) throw conflict(first.type, p.type);
+        return first.type;
+      case 'optional': {
+        const inner = live
+          .filter((p) => !isComptime(p.type, '@TypeOf(null)'))
+          .map((p) => (p.type.k === 'opt' ? { type: p.type.child, value: p.value?.k === 'optional' ? (p.value.v ?? undefined) : undefined } : p));
+        return { k: 'opt', child: this.peerType(inner, line) };
+      }
+      case 'enum_or_union': {
+        let cur: ZType | undefined;
+        for (const p of live) {
+          const t = p.type;
+          const kind = isComptime(t, '@EnumLiteral()') ? 'literal' : t.k === 'container' && t.c.decl.kind === 'enum' ? 'enum' : t.k === 'container' && t.c.decl.kind === 'union' ? 'union' : undefined;
+          if (!kind) throw conflict(first.type, t);
+          if (!cur || isComptime(cur, '@EnumLiteral()')) {
+            cur = t;
+            continue;
+          }
+          if (kind === 'literal') continue;
+          const curUnion = cur.k === 'container' && cur.c.decl.kind === 'union';
+          if (kind === 'enum') {
+            const want = curUnion && cur.k === 'container' ? this.unionTagType(cur.c) : cur;
+            if (typeKey(want) !== typeKey(t)) throw conflict(cur, t);
+          } else if (curUnion) {
+            if (typeKey(cur) !== typeKey(t)) throw conflict(cur, t);
+          } else {
+            if (t.k !== 'container' || typeKey(this.unionTagType(t.c)) !== typeKey(cur)) throw conflict(cur, t);
+            cur = t;
+          }
+        }
+        return cur!;
+      }
+      case 'comptime_int':
+        for (const p of live) if (!isComptime(p.type, 'comptime_int')) throw conflict(first.type, p.type);
+        return first.type;
+      case 'comptime_float':
+        for (const p of live) if (!isComptime(p.type, 'comptime_int') && !isComptime(p.type, 'comptime_float')) throw conflict(first.type, p.type);
+        return { k: 'comptime', name: 'comptime_float' };
+      case 'fixed_int': {
+        // The widest unsigned and the widest signed peer, the first on a tie; the signed one if it
+        // is wider, else (with comptime-known values, as these are) the unsigned one if wider, the
+        // earlier on a tie.
+        let unsigned: number | undefined;
+        let signed: number | undefined;
+        live.forEach((p, i) => {
+          if (isComptime(p.type, 'comptime_int')) return;
+          if (!this.isIntType(p.type)) throw conflict(first.type, p.type);
+          const isSigned = this.intRange(p.type).min < 0n;
+          const current = isSigned ? signed : unsigned;
+          if (current === undefined || this.bitSize(p.type) > this.bitSize(live[current]!.type)) {
+            if (isSigned) signed = i;
+            else unsigned = i;
+          }
+        });
+        if (signed === undefined) return live[unsigned!]!.type;
+        if (unsigned === undefined) return live[signed]!.type;
+        const sBits = this.bitSize(live[signed]!.type);
+        const uBits = this.bitSize(live[unsigned]!.type);
+        return live[sBits > uBits ? signed : uBits > sBits ? unsigned : Math.min(signed, unsigned)]!.type;
+      }
+      case 'fixed_float': {
+        let cur: ZType | undefined;
+        for (const p of live) {
+          const t = p.type;
+          if (isComptime(t, 'comptime_int') || isComptime(t, 'comptime_float') || this.isIntType(t)) continue;
+          if (t.k !== 'float' && t.k !== 'c_longdouble') throw conflict(first.type, t);
+          if (!cur || typeKey(cur) === typeKey(t)) cur = cur ?? t;
+          else cur = { k: 'float', bits: Math.max(this.bitSize(cur), this.bitSize(t)) as 16 | 32 | 64 | 80 | 128 };
+        }
+        return cur!;
+      }
+      default:
+        // exact, and the strategies not ported: one type for all.
+        for (const p of live) {
+          if (typeKey(p.type) === typeKey(first.type)) continue;
+          if (s === 'exact') throw conflict(first.type, p.type);
+          throw new ZigLayoutError(`Peer type resolution of '${formatType(first.type)}' and '${formatType(p.type)}' is not modelled here.`, line);
+        }
+        return first.type;
     }
+  }
+
+  /**
+   * The type integer operands of arithmetic meet in: their peer type, which each comptime-known
+   * operand must fit (the coercion that follows); undefined for comptime_int.
+   */
+  private peerIntType(operands: readonly Extract<Value, { k: 'int' }>[], line: number): ZType | undefined {
+    const t = this.peerType(operands.map((v) => ({ type: this.typeOfValue(v, line), value: v })), line);
+    if (t.k === 'comptime') return undefined;
+    for (const v of operands) this.coerce(v, t, line);
+    return t;
+  }
+
+  /** std.math.Log2Int of a fixed-width integer type: what a shift amount coerces to. */
+  private log2IntType(t: ZType, line: number): ZType {
+    const bits = this.bitSize(t, line);
+    return { k: 'int', signed: false, bits: smallestUnsignedBits(bits - 1) };
+  }
+
+  /** Type.intFittingRange of one value: the smallest integer type that holds it. */
+  private intFitting(v: bigint): ZType {
+    const bitLength = (n: bigint) => (n === 0n ? 0 : n.toString(2).length);
+    return v < 0n ? { k: 'int', signed: true, bits: bitLength(-v - 1n) + 1 } : { k: 'int', signed: false, bits: bitLength(v) };
   }
 
   private isIntType(t: ZType): boolean {
@@ -785,22 +1107,38 @@ export class ZigEngine {
   private coerce(v: Value, t: ZType, line: number): Value {
     const mismatch = () => new ZigLayoutError(`Expected a value of type '${formatType(t)}', found ${describeValue(v)}.`, line);
     if (this.isIntType(t)) {
-      // A comptime-known integer coerces to any integer type that holds it.
-      if (v.k !== 'int') throw mismatch();
+      // A comptime-known integer coerces to any integer type that holds it; a float, when it is whole.
+      let n: bigint;
+      if (v.k === 'int') n = v.v;
+      else if (v.k === 'float') {
+        const r = rationalOf(v.text);
+        if (!r) throw new ZigLayoutError(`The float ${v.text} is not modelled here.`, line);
+        if (r.num % r.den !== 0n) throw new ZigLayoutError(`Fractional component prevents float value '${v.text}' from coercion to type '${formatType(t)}'.`, line);
+        n = r.num / r.den;
+      } else throw mismatch();
       const { min, max } = this.intRange(t);
-      if (v.v < min || v.v > max) throw new ZigLayoutError(`Type '${formatType(t)}' cannot represent ${v.v}.`, line);
-      return { k: 'int', v: v.v, type: t };
+      if (n < min || n > max) throw new ZigLayoutError(`Type '${formatType(t)}' cannot represent integer value '${n}'.`, line);
+      return { k: 'int', v: n, type: t };
+    }
+    if (t.k === 'float' || t.k === 'c_longdouble') {
+      // A float coerces to any float type (rounding); a comptime-known integer only to one that
+      // holds it exactly.
+      if (v.k === 'float') return { k: 'float', text: v.text, type: t };
+      if (v.k !== 'int') throw mismatch();
+      const bits = t.k === 'float' ? t.bits : cTypeBitSize(this.target, 'longdouble');
+      if (!floatHoldsInt(bits, v.v)) throw new ZigLayoutError(`Type '${formatType(t)}' cannot represent integer value '${v.v}'.`, line);
+      return { k: 'float', text: String(v.v), type: t };
     }
     switch (t.k) {
       case 'opt':
-        if (v.k === 'null') return { k: 'optional', v: null };
-        if (v.k === 'optional') return v.v === null ? v : { k: 'optional', v: this.coerce(v.v, t.child, line) };
-        return { k: 'optional', v: this.coerce(v, t.child, line) };
+        if (v.k === 'null') return { k: 'optional', v: null, type: t };
+        if (v.k === 'optional') return { k: 'optional', v: v.v === null ? null : this.coerce(v.v, t.child, line), type: t };
+        return { k: 'optional', v: this.coerce(v, t.child, line), type: t };
       case 'comptime':
         if (t.name === 'type' && v.k === 'type') return v;
         if (t.name === 'comptime_int' && v.k === 'int') return { k: 'int', v: v.v };
         if (t.name === 'comptime_float' && (v.k === 'float' || v.k === 'int')) return v;
-        if (t.name === '@TypeOf(.enum_literal)' && v.k === 'enumLit') return v;
+        if (t.name === '@EnumLiteral()' && v.k === 'enumLit') return v;
         throw mismatch();
       case 'bool':
         if (v.k === 'bool') return v;
@@ -820,22 +1158,59 @@ export class ZigEngine {
         throw mismatch();
       case 'container': {
         const d = t.c.decl;
+        // A decl literal: `.name` with a result type that has no such field is its declaration.
+        if (v.k === 'enumLit' && !(d.kind === 'enum' && this.hasEnumField(t.c, v.name))) {
+          const b = t.c.scope.bindings.get(v.name);
+          if (b) return this.coerce(b.k === 'value' ? b.v : this.declValue(b, line), t, line);
+        }
         if (d.kind === 'enum') {
           if (v.k === 'enumValue' && v.type.id === t.c.id) return v;
-          if (v.k === 'enumLit') {
-            if (!d.fields.some((f) => f.name === v.name && f.name !== '_')) throw new ZigLayoutError(`'${t.c.name}' has no field named '${v.name}'.`, line);
-            return { k: 'enumValue', type: t.c, name: v.name };
-          }
+          if (v.k === 'enumLit') return this.enumField(t.c, v.name, line);
           throw mismatch();
         }
         // std.builtin.Type, which @typeInfo gives.
-        if (d.kind === 'union' && v.k === 'union') return v;
-        if (d.kind === 'struct' && v.k === 'record') return v;
+        if ((d.kind === 'union' && v.k === 'union') || (d.kind === 'struct' && v.k === 'record')) {
+          if (v.type && typeKey(v.type) !== typeKey(t)) throw new ZigLayoutError(`Expected type '${formatType(t)}', found '${formatType(v.type)}'.`, line);
+          return { ...v, type: t };
+        }
         throw mismatch();
       }
       default:
         throw mismatch();
     }
+  }
+
+  private hasEnumField(c: Container, name: string): boolean {
+    return c.decl.kind === 'enum' && name !== '_' && c.decl.fields.some((f) => f.name === name);
+  }
+
+  /** An enum literal as a value of the enum: one of its fields (declarations do not count). */
+  private enumField(c: Container, name: string, line: number): Value {
+    if (!this.hasEnumField(c, name)) throw new ZigLayoutError(`No field named '${name}' in enum '${c.name}'.`, line);
+    return { k: 'enumValue', type: c, name };
+  }
+
+  /**
+   * Sema.resolveDestType: a cast builtin's destination is its result type, without an error union
+   * or optional around it; without a result type it has none.
+   */
+  private castDest(name: string, rt: ZType | undefined, line: number): ZType {
+    if (!rt) throw new ZigLayoutError(`${name} must have a known result type: use @as to provide one.`, line);
+    let t = rt;
+    if (t.k === 'errunion') t = t.payload;
+    if (t.k === 'opt') t = t.child;
+    return t;
+  }
+
+  private isIntOrComptimeInt(t: ZType): boolean {
+    return this.isIntType(t) || (t.k === 'comptime' && t.name === 'comptime_int');
+  }
+
+  /** An enum value's integer, of the enum's tag type. */
+  private enumInt(v: Extract<Value, { k: 'enumValue' }>): Extract<Value, { k: 'int' }> {
+    const info = this.enumInfo(v.type);
+    const index = v.type.decl.fields.filter((f) => f.name !== '_').findIndex((f) => f.name === v.name);
+    return { k: 'int', v: info.values[index]!, type: info.tag };
   }
 
   /** @truncate: the low bits of `n` as type `t`. */
@@ -855,10 +1230,18 @@ export class ZigEngine {
     const { min, max } = this.intRange(t);
     if (op === '+%' || op === '-%' || op === '*%') return this.truncate(v, t, line);
     if (op === '+|' || op === '-|' || op === '*|' || op === '<<|') return { k: 'int', v: v < min ? min : v > max ? max : v, type: t };
-    if (v < min || v > max) throw new ZigLayoutError(`'${op}' overflows '${formatType(t)}': ${v}.`, line);
+    if (v < min || v > max) throw new ZigLayoutError(`Overflow of integer type '${formatType(t)}' with value '${v}' ('${op}').`, line);
     return { k: 'int', v, type: t };
   }
 
+  private isSignedInt(t: ZType): boolean {
+    return t.k === 'int' ? t.signed : t.k === 'isize' ? true : t.k === 'c' ? t.signed : false;
+  }
+
+  /**
+   * Sema.zirNegate (`-`: of a signed integer or comptime_int, never of an unsigned one), zirNegateWrap
+   * (`-%`: of any integer, wrapping), and `~` (of a fixed-width integer: comptime_int has no width).
+   */
   private unary(op: string, v: Value, line: number): Value {
     switch (op) {
       case '!':
@@ -866,29 +1249,63 @@ export class ZigEngine {
         return { k: 'bool', v: !v.v };
       case '-':
       case '-%':
-        if (v.k !== 'int') throw new ZigLayoutError(`'-' needs an integer, found ${describeValue(v)}.`, line);
+        if (v.k !== 'int') throw new ZigLayoutError(`Negation of ${describeValue(v)} is not supported here.`, line);
+        if (op === '-' && v.type && !this.isSignedInt(v.type)) throw new ZigLayoutError(`Negation of type '${formatType(v.type)}': it is unsigned (use -% to wrap).`, line);
         return this.intResult(-v.v, v.type, op, line);
       case '~':
         if (v.k !== 'int') throw new ZigLayoutError(`'~' needs an integer, found ${describeValue(v)}.`, line);
-        // Of a fixed width, the bits flip within it.
-        return v.type ? this.truncate(~v.v, v.type, line) : { k: 'int', v: ~v.v };
+        if (!v.type) throw new ZigLayoutError("Bitwise not operation on type 'comptime_int': give the integer a width, e.g. ~@as(u8, x).", line);
+        // The bits flip within the integer's width.
+        return this.truncate(~v.v, v.type, line);
       default:
         throw new ZigLayoutError(`'${op}' is not supported in a type expression.`, line);
     }
   }
 
-  private binary(e: Extract<Expr, { k: 'binary' }>, scope: Scope): Value {
+  /**
+   * A shift (Sema.zirShl, zirShr). For `<<` and `>>` the amount takes std.math.Log2Int of a
+   * fixed-width left operand as its type (comptime_int for a comptime_int one), and must be less
+   * than its width; `<<` drops the bits shifted out. `<<|` takes an amount of any integer type and
+   * saturates. A comptime_int is shifted exactly; no amount may be negative.
+   */
+  private shift(e: Extract<Expr, { k: 'binary' }>, l: Extract<Value, { k: 'int' }>, scope: Scope): Value {
+    const { op, line } = e;
+    const t = l.type;
+    let r = this.eval(e.r, scope, undefined, op === '<<|' ? undefined : t ? this.log2IntType(t, line) : { k: 'comptime', name: 'comptime_int' });
+    if (r.k !== 'int') throw new ZigLayoutError(`Expected integer type, found '${formatType(this.typeOfValue(r, line))}'.`, line);
+    if (op !== '<<|' && t) r = this.coerce(r, this.log2IntType(t, line), line) as Extract<Value, { k: 'int' }>;
+    const b = r.v;
+    if (b === 0n) return l;
+    if (b < 0n) throw new ZigLayoutError(`Shift by negative amount '${b}'.`, line);
+    if (!t) return { k: 'int', v: op === '>>' ? l.v >> b : l.v << b };
+    const bits = BigInt(this.bitSize(t, line));
+    if (op !== '<<|' && b >= bits) throw new ZigLayoutError(`Shift amount '${b}' is too large for operand type '${formatType(t)}'.`, line);
+    if (op === '>>') return { k: 'int', v: l.v >> b, type: t };
+    if (op === '<<') return this.truncate(l.v << b, t, line);
+    // Saturating: any non-zero value shifted by the width or more is out of range.
+    return this.intResult(l.v === 0n ? 0n : l.v << (b > bits ? bits : b), t, '<<|', line);
+  }
+
+  private binary(e: Extract<Expr, { k: 'binary' }>, scope: Scope, rt?: ZType): Value {
     const { op, line } = e;
     if (op === 'and' || op === 'or') {
       const l = this.evalBool(e.l, scope);
       if (op === 'and' ? !l : l) return { k: 'bool', v: l };
       return { k: 'bool', v: this.evalBool(e.r, scope) };
     }
-    if (op === 'orelse' || op === 'catch') throw new ZigLayoutError(`'${op}' is not supported in a type expression.`, line);
+    if (op === 'orelse') {
+      // The payload of an optional, or (for null) the right side, which has the result type.
+      const v = this.eval(e.l, scope);
+      if (v.k === 'null' || (v.k === 'optional' && v.v === null)) return this.eval(e.r, scope, undefined, rt);
+      if (v.k !== 'optional') throw new ZigLayoutError(`Expected optional type, found '${formatType(this.typeOfValue(v, line))}'.`, line);
+      return v.v!;
+    }
+    if (op === 'catch') throw new ZigLayoutError("'catch' is not supported in a type expression: error unions have no values here.", line);
     const l = this.eval(e.l, scope);
+    if ((op === '<<' || op === '<<|' || op === '>>') && l.k === 'int') return this.shift(e, l, scope);
     const r = this.eval(e.r, scope);
     if (op === '==' || op === '!=') {
-      const eq = this.equal(l, r);
+      const eq = this.equal(l, r, line);
       return { k: 'bool', v: op === '==' ? eq : !eq };
     }
     if (op === '++') {
@@ -907,11 +1324,9 @@ export class ZigEngine {
     }
     const a = l.v;
     const b = r.v;
-    const isShift = op === '<<' || op === '<<|' || op === '>>';
-    if (isShift && l.type) this.checkShiftAmount(l.type, r, line);
     const isComparison = op === '<' || op === '>' || op === '<=' || op === '>=';
-    // Arithmetic has the operands' peer type; a shift, its left operand's.
-    const peer = isShift || isComparison ? undefined : this.peerIntType(l, r, line);
+    // Arithmetic has the operands' peer type.
+    const peer = isComparison ? undefined : this.peerIntType([l, r], line);
     const result = (v: bigint) => this.intResult(v, peer, op, line);
     switch (op) {
       case '<':
@@ -942,13 +1357,6 @@ export class ZigEngine {
         if (b === 0n) throw new ZigLayoutError('Division by zero.', line);
         if (a < 0n || b < 0n) throw new ZigLayoutError('Remainder of signed integers must use @rem or @mod.', line);
         return result(a % b);
-      case '<<':
-      case '<<|':
-        if (b < 0n) throw new ZigLayoutError('Shift by a negative amount.', line);
-        return this.intResult(a << b, l.type, op === '<<|' ? '<<|' : '<<', line);
-      case '>>':
-        if (b < 0n) throw new ZigLayoutError('Shift by a negative amount.', line);
-        return this.intResult(a >> b, l.type, op, line);
       case '&':
         return result(a & b);
       case '|':
@@ -996,42 +1404,49 @@ export class ZigEngine {
   private call(e: Extract<Expr, { k: 'call' }>, scope: Scope): Value {
     // `value.method(...)`: a function of the value's type, with the value first.
     let callee: Value;
-    let args: Value[];
     const receiver = e.fn.k === 'field' ? this.eval(e.fn.obj, scope) : undefined;
-    if (e.fn.k === 'field' && receiver?.k === 'enumValue') {
+    const method = e.fn.k === 'field' && receiver?.k === 'enumValue';
+    if (method && e.fn.k === 'field' && receiver?.k === 'enumValue') {
       const b = receiver.type.scope.bindings.get(e.fn.name);
       if (!b) throw new ZigLayoutError(`'${receiver.type.name}' has no method named '${e.fn.name}'.`, e.line);
       callee = b.k === 'value' ? b.v : this.declValue(b, e.line);
-      args = [receiver, ...e.args.map((a) => this.eval(a, scope))];
     } else {
       callee = receiver && e.fn.k === 'field' ? this.fieldAccess(receiver, e.fn.name, e.line, scope) : this.eval(e.fn, scope);
-      args = e.args.map((a) => this.eval(a, scope));
     }
     if (callee.k !== 'fn') throw new ZigLayoutError(`Only a function can be called, not ${describeValue(callee)}.`, e.line);
     const fn = callee.fn;
     if (fn.body === null) throw new ZigLayoutError(`'${callee.name}' is an extern function: it cannot be called at compile time.`, e.line);
     if (fn.unsupported) throw new ZigLayoutError(`'${callee.name}' cannot be evaluated here: ${fn.unsupported}`, e.line);
-    if (args.length !== fn.params.length) {
-      throw new ZigLayoutError(`'${callee.name}' takes ${fn.params.length} argument${fn.params.length === 1 ? '' : 's'}, given ${args.length}.`, e.line);
+    const argExprs: (Expr | Value)[] = method ? [receiver!, ...e.args] : e.args;
+    if (argExprs.length !== fn.params.length) {
+      throw new ZigLayoutError(`'${callee.name}' takes ${fn.params.length} argument${fn.params.length === 1 ? '' : 's'}, given ${argExprs.length}.`, e.line);
     }
+
+    // Each argument has its parameter's type as its result type, and is coerced to it; the type
+    // may name the parameters before it.
+    const callScope = new Scope(callee.scope);
+    const args: Value[] = [];
+    fn.params.forEach((p, i) => {
+      const type = p.type ? this.evalType(p.type, callScope) : undefined;
+      const a = argExprs[i]!;
+      let v = i === 0 && method ? (a as Value) : this.eval(a as Expr, scope, undefined, type);
+      if (type) v = this.coerce(v, type, e.line);
+      args.push(v);
+      if (p.name && p.name !== '_') callScope.bindings.set(p.name, { k: 'value', v });
+    });
     const key = `${callee.id}(${args.map(valueKey).join(',')})`;
     const cached = this.memo.get(key);
     if (cached) return cached;
     if (this.callDepth > 64) throw new ZigLayoutError(`Evaluation of '${callee.name}' recurses too deeply.`, e.line);
 
-    const callScope = new Scope(callee.scope);
-    // Each argument takes its parameter's type, which may name the parameters before it.
-    fn.params.forEach((p, i) => {
-      if (p.type) args[i] = this.coerce(args[i]!, this.evalType(p.type, callScope), e.line);
-      if (p.name && p.name !== '_') callScope.bindings.set(p.name, { k: 'value', v: args[i]! });
-    });
     const name = `${callee.name}(${args.map((a) => this.argText(a)).join(', ')})`;
+    // The return type is resolved before the body runs: what `return` coerces its value to.
+    const ret = this.evalType(fn.ret, callScope);
     this.callDepth += 1;
     try {
-      let result = this.runBody(fn.body, callScope, name);
+      let result = this.runBody(fn.body, callScope, name, ret);
       if (!result) {
         // A function returning void ends without a return.
-        const ret = this.evalType(fn.ret, callScope);
         if (ret.k !== 'void') throw new ZigLayoutError(`'${callee.name}' returned no value.`, e.line);
         result = { k: 'void' };
       }
@@ -1059,31 +1474,32 @@ export class ZigEngine {
     }
   }
 
-  /** Run statements; the value of the first `return` reached. */
-  private runBody(body: Stmt[], scope: Scope, nameHint: string): Value | undefined {
+  /** Run statements; the value of the first `return` reached, coerced to the return type. */
+  private runBody(body: Stmt[], scope: Scope, nameHint: string, ret: ZType): Value | undefined {
     for (const s of body) {
       switch (s.k) {
         case 'decl': {
           const d = s.decl;
           if (d.kind !== 'const') throw new ZigLayoutError(`'var' is not supported in a function that returns a type.`, d.line);
           if (scope.lookup(d.name) && scope.bindings.has(d.name)) throw new ZigLayoutError(`Redeclaration of '${d.name}'.`, d.line);
-          const value = this.eval(d.value!, scope, d.name === 'Self' ? nameHint : `${nameHint}.${d.name}`);
-          scope.bindings.set(d.name, { k: 'value', v: d.type ? this.coerce(value, this.evalType(d.type, scope), d.line) : value });
+          const type = d.type ? this.evalType(d.type, scope) : undefined;
+          const value = this.eval(d.value!, scope, d.name === 'Self' ? nameHint : `${nameHint}.${d.name}`, type);
+          scope.bindings.set(d.name, { k: 'value', v: type ? this.coerce(value, type, d.line) : value });
           break;
         }
         case 'return':
-          return s.e ? this.eval(s.e, scope, nameHint) : { k: 'void' };
+          return s.e ? this.coerce(this.eval(s.e, scope, nameHint, ret), ret, s.e.line) : { k: 'void' };
         case 'if': {
           const taken = this.condition(s.cond, s.capture, scope);
           const branch = taken ? s.then : s.else;
           if (branch) {
-            const r = this.runBody([branch], taken ?? new Scope(scope), nameHint);
+            const r = this.runBody([branch], taken ?? new Scope(scope), nameHint, ret);
             if (r) return r;
           }
           break;
         }
         case 'block': {
-          const r = this.runBody(s.body, new Scope(scope), nameHint);
+          const r = this.runBody(s.body, new Scope(scope), nameHint, ret);
           if (r) return r;
           break;
         }
@@ -1098,12 +1514,16 @@ export class ZigEngine {
     return undefined;
   }
 
-  private builtin(e: Extract<Expr, { k: 'builtin' }>, scope: Scope): Value {
+  private builtin(e: Extract<Expr, { k: 'builtin' }>, scope: Scope, rt?: ZType): Value {
     const args = e.args;
     const want = (n: number) => {
       if (args.length !== n) throw new ZigLayoutError(`${e.name} takes ${n} argument${n === 1 ? '' : 's'}.`, e.line);
     };
-    const intOf = (i: number) => this.evalInt(args[i]!, scope);
+    const intArg = (i: number): Extract<Value, { k: 'int' }> => {
+      const v = this.eval(args[i]!, scope);
+      if (v.k !== 'int') throw new ZigLayoutError(`${e.name} needs integers, found ${describeValue(v)}.`, e.line);
+      return v;
+    };
     switch (e.name) {
       case '@import': {
         want(1);
@@ -1124,6 +1544,11 @@ export class ZigEngine {
         want(1);
         const t = this.evalType(args[0]!, scope);
         if (e.name === '@bitSizeOf') return { k: 'int', v: BigInt(this.bitSize(t, e.line)) };
+        // Sema.zirSizeOf and zirAlignOf: no size for a type without values or a comptime-only
+        // one; no alignment for a type without values.
+        const cls = this.classify(t, e.line);
+        if (cls === 'npv') throw new ZigLayoutError(`No ${e.name === '@sizeOf' ? 'size' : 'align'} available for uninstantiable type '${formatType(t)}'.`, e.line);
+        if (e.name === '@sizeOf' && (cls === 'comptime' || cls === 'partial')) throw new ZigLayoutError(`No size available for comptime-only type '${formatType(t)}'.`, e.line);
         const l = this.layoutOf(t, e.line);
         return { k: 'int', v: BigInt(e.name === '@sizeOf' ? l.size : l.align) };
       }
@@ -1137,7 +1562,7 @@ export class ZigEngine {
       }
       case '@Vector': {
         want(2);
-        const len = this.evalCount(args[0]!, scope, 'A vector length');
+        const len = this.evalCount(args[0]!, scope, 'A vector length', { k: 'int', signed: false, bits: 32 });
         const child = this.evalType(args[1]!, scope);
         if (!(child.k === 'int' || child.k === 'usize' || child.k === 'isize' || child.k === 'c' || child.k === 'float' || child.k === 'c_longdouble' || child.k === 'bool' || (child.k === 'ptr' && child.size !== 'slice'))) {
           throw new ZigLayoutError(`Vector element type must be an integer, float, bool or pointer, not '${formatType(child)}'.`, e.line);
@@ -1149,8 +1574,7 @@ export class ZigEngine {
         const s = this.eval(args[0]!, scope);
         // std.builtin.Signedness, as a value or a literal.
         if ((s.k !== 'enumLit' && s.k !== 'enumValue') || (s.name !== 'signed' && s.name !== 'unsigned')) throw new ZigLayoutError('@Int takes .signed or .unsigned.', e.line);
-        const bits = this.evalCount(args[1]!, scope, 'A bit count');
-        if (bits > 65535) throw new ZigLayoutError(`Integers have at most 65535 bits, not ${bits}.`, e.line);
+        const bits = this.evalCount(args[1]!, scope, 'A bit count', { k: 'int', signed: false, bits: 16 });
         return { k: 'type', t: { k: 'int', signed: s.name === 'signed', bits } };
       }
       case '@typeInfo': {
@@ -1177,28 +1601,83 @@ export class ZigEngine {
         return { k: 'type', t: f.type };
       }
       case '@TypeOf': {
-        want(1);
-        const v = this.eval(args[0]!, scope);
-        if (v.k === 'type') return { k: 'type', t: { k: 'comptime', name: 'type' } };
-        if (v.k === 'int') return { k: 'type', t: { k: 'comptime', name: 'comptime_int' } };
-        if (v.k === 'bool') return { k: 'type', t: { k: 'bool' } };
-        throw new ZigLayoutError('@TypeOf is supported for types, integers and bools here.', e.line);
+        // The value's type; of several, their peer type.
+        if (args.length === 0) throw new ZigLayoutError('@TypeOf takes at least 1 argument.', e.line);
+        const vs = args.map((a) => this.eval(a, scope));
+        if (vs.length === 1) return { k: 'type', t: this.typeOfValue(vs[0]!, e.line) };
+        return { k: 'type', t: this.peerType(vs.map((v) => ({ type: this.typeOfValue(v, e.line), value: v })), e.line) };
       }
+      case '@EnumLiteral':
+        want(0);
+        return { k: 'type', t: { k: 'comptime', name: '@EnumLiteral()' } };
       case '@as': {
         want(2);
         const t = this.evalType(args[0]!, scope);
-        const inner = args[1]!;
-        // The casts that take their type from where the result goes: @as gives them one.
-        if (inner.k === 'builtin' && (inner.name === '@intCast' || inner.name === '@truncate') && inner.args.length === 1) {
-          const v = this.eval(inner.args[0]!, scope);
-          if (v.k !== 'int') throw new ZigLayoutError(`${inner.name} takes an integer.`, e.line);
-          return inner.name === '@truncate' ? this.truncate(v.v, t, e.line) : this.coerce({ k: 'int', v: v.v }, t, e.line);
-        }
-        return this.coerce(this.eval(inner, scope), t, e.line);
+        return this.coerce(this.eval(args[1]!, scope, undefined, t), t, e.line);
       }
-      case '@intCast':
-      case '@truncate':
-        throw new ZigLayoutError(`${e.name} takes its type from where its result goes: write @as(T, ${e.name}(...)).`, e.line);
+      case '@intCast': {
+        // Sema.intCast: a comptime-known integer coerces to the destination integer type.
+        want(1);
+        const dest = this.castDest(e.name, rt, e.line);
+        const v = this.eval(args[0]!, scope);
+        if (!this.isIntOrComptimeInt(dest)) throw new ZigLayoutError(`Expected integer or vector, found '${formatType(dest)}'.`, e.line);
+        if (v.k !== 'int') throw new ZigLayoutError(`Expected integer or vector, found '${formatType(this.typeOfValue(v, e.line))}'.`, e.line);
+        return dest.k === 'comptime' ? { k: 'int', v: v.v } : this.coerce(v, dest, e.line);
+      }
+      case '@truncate': {
+        // Sema.zirTruncate: the low bits, of the same signedness; a wider destination is a coercion.
+        want(1);
+        const dest = this.castDest(e.name, rt, e.line);
+        const v = this.eval(args[0]!, scope);
+        if (!this.isIntOrComptimeInt(dest)) throw new ZigLayoutError(`Expected integer or vector, found '${formatType(dest)}'.`, e.line);
+        if (v.k !== 'int') throw new ZigLayoutError(`Expected integer or vector, found '${formatType(this.typeOfValue(v, e.line))}'.`, e.line);
+        if (dest.k === 'comptime') return { k: 'int', v: v.v };
+        if (this.bitSize(dest, e.line) === 0) return { k: 'int', v: 0n, type: dest };
+        if (v.type) {
+          if (this.isSignedInt(v.type) !== this.isSignedInt(dest)) {
+            throw new ZigLayoutError(`Expected ${this.isSignedInt(dest) ? 'signed' : 'unsigned'} integer type, found '${formatType(v.type)}'.`, e.line);
+          }
+          if (this.bitSize(dest, e.line) >= this.bitSize(v.type, e.line)) return this.coerce(v, dest, e.line);
+        }
+        return this.truncate(v.v, dest, e.line);
+      }
+      case '@enumFromInt':
+      case '@fromBackingInt': {
+        // An enum value from its integer (packed containers are not modelled as values).
+        want(1);
+        const dest = this.castDest(e.name, rt, e.line);
+        if (dest.k !== 'container' || dest.c.decl.kind !== 'enum') {
+          throw new ZigLayoutError(`${e.name} gives an enum${e.name === '@fromBackingInt' ? ' (or a packed container, not modelled here)' : ''}, not '${formatType(dest)}'.`, e.line);
+        }
+        const info = this.enumInfo(dest.c);
+        let v = intArg(0);
+        if (e.name === '@fromBackingInt') v = this.coerce(v, info.tag, e.line) as Extract<Value, { k: 'int' }>;
+        const index = info.values.indexOf(v.v);
+        if (index < 0) {
+          if (dest.c.decl.nonexhaustive) throw new ZigLayoutError(`An unnamed value of the non-exhaustive enum '${dest.c.name}' is not modelled here.`, e.line);
+          throw new ZigLayoutError(`Enum '${dest.c.name}' has no tag with value '${v.v}'.`, e.line);
+        }
+        return { k: 'enumValue', type: dest.c, name: dest.c.decl.fields.filter((f) => f.name !== '_')[index]!.name! };
+      }
+      case '@backingInt': {
+        want(1);
+        const v = this.eval(args[0]!, scope);
+        if (v.k !== 'enumValue') throw new ZigLayoutError(`Expected enum, tagged union, packed union or packed struct, found '${formatType(this.typeOfValue(v, e.line))}'.`, e.line);
+        return this.enumInt(v);
+      }
+      case '@bitCast': {
+        // Between integers (and from an enum) of one bit size: the same bits.
+        want(1);
+        const dest = this.castDest(e.name, rt, e.line);
+        let v = this.eval(args[0]!, scope);
+        if (v.k === 'enumValue') v = this.enumInt(v);
+        if (v.k === 'int' && !v.type) throw new ZigLayoutError("Cannot @bitCast from 'comptime_int'.", e.line);
+        if (v.k !== 'int' || !this.isIntType(dest)) throw new ZigLayoutError(`@bitCast to '${formatType(dest)}' from ${describeValue(v)} is not modelled here.`, e.line);
+        const from = this.bitSize(v.type!, e.line);
+        const to = this.bitSize(dest, e.line);
+        if (from !== to) throw new ZigLayoutError(`@bitCast size mismatch: destination type '${formatType(dest)}' has ${to} bits but source type '${formatType(v.type!)}' has ${from} bits.`, e.line);
+        return this.truncate(v.v, dest, e.line);
+      }
       case '@clz':
       case '@ctz':
       case '@popCount': {
@@ -1216,9 +1695,7 @@ export class ZigEngine {
         want(1);
         const v = this.eval(args[0]!, scope);
         if (v.k !== 'enumValue') throw new ZigLayoutError(`@intFromEnum takes an enum value, not ${describeValue(v)}.`, e.line);
-        const info = this.enumInfo(v.type);
-        const index = v.type.decl.fields.filter((f) => f.name !== '_').findIndex((f) => f.name === v.name);
-        return { k: 'int', v: info.values[index]!, type: info.tag };
+        return this.enumInt(v);
       }
       case '@intFromBool':
         want(1);
@@ -1229,35 +1706,59 @@ export class ZigEngine {
         return { k: 'void' };
       case '@min':
       case '@max': {
-        if (args.length < 2) throw new ZigLayoutError(`${e.name} takes at least two arguments.`, e.line);
-        const vs = args.map((_, i) => intOf(i));
-        return { k: 'int', v: vs.reduce((m, v) => (e.name === '@min' ? (v < m ? v : m) : v > m ? v : m)) };
+        // Sema.analyzeMinMax: of comptime-known integers, the least or greatest value, as
+        // comptime_int when every operand is one, else as the smallest integer type that holds it
+        // (Type.intFittingRange of the result's bounds), whatever the operands' types.
+        if (args.length < 2) throw new ZigLayoutError(`${e.name} expects at least 2 arguments, found ${args.length}.`, e.line);
+        const vs = args.map((a) => this.eval(a, scope));
+        for (const v of vs) {
+          if (v.k === 'float') throw new ZigLayoutError(`${e.name} of floats is not modelled here.`, e.line);
+          if (v.k !== 'int') throw new ZigLayoutError(`Expected number, found '${formatType(this.typeOfValue(v, e.line))}'.`, e.line);
+        }
+        const ints = vs as Extract<Value, { k: 'int' }>[];
+        const pick = ints.map((v) => v.v).reduce((m, v) => (e.name === '@min' ? (v < m ? v : m) : v > m ? v : m));
+        return ints.every((v) => !v.type) ? { k: 'int', v: pick } : { k: 'int', v: pick, type: this.intFitting(pick) };
       }
       case '@divExact':
       case '@divTrunc':
       case '@divFloor':
+      case '@divCeil':
       case '@mod':
       case '@rem': {
+        // The operands' peer type, which each must fit; the result must fit it too.
         want(2);
-        const a = intOf(0);
-        const b = intOf(1);
-        if (b === 0n) throw new ZigLayoutError('Division by zero.', e.line);
+        const l = intArg(0);
+        const r = intArg(1);
+        const peer = this.peerIntType([l, r], e.line);
+        const a = l.v;
+        const b = r.v;
+        if (b === 0n) throw new ZigLayoutError('Division by zero here causes illegal behavior.', e.line);
         const trunc = a / b;
+        const inexact = a % b !== 0n;
+        let v: bigint;
         switch (e.name) {
           case '@divExact':
-            if (a % b !== 0n) throw new ZigLayoutError(`@divExact(${a}, ${b}) has a remainder.`, e.line);
-            return { k: 'int', v: trunc };
+            if (inexact) throw new ZigLayoutError(`Exact division produced remainder: @divExact(${a}, ${b}).`, e.line);
+            v = trunc;
+            break;
           case '@divTrunc':
-            return { k: 'int', v: trunc };
+            v = trunc;
+            break;
           case '@divFloor':
-            return { k: 'int', v: a % b !== 0n && a < 0n !== b < 0n ? trunc - 1n : trunc };
+            v = inexact && a < 0n !== b < 0n ? trunc - 1n : trunc;
+            break;
+          case '@divCeil':
+            v = inexact && a < 0n === b < 0n ? trunc + 1n : trunc;
+            break;
           case '@rem':
-            return { k: 'int', v: a % b };
+            v = a % b;
+            break;
           default: {
-            const r = a % b;
-            return { k: 'int', v: r !== 0n && r < 0n !== b < 0n ? r + b : r };
+            const rem = a % b;
+            v = rem !== 0n && rem < 0n !== b < 0n ? rem + b : rem;
           }
         }
+        return this.intResult(v, peer, e.name, e.line);
       }
       case '@compileError': {
         want(1);
@@ -1277,15 +1778,21 @@ export class ZigEngine {
     return this.coerce({ k: 'enumLit', name }, v.t, 0);
   }
 
-  /** @import("builtin"): the build mode and the target, as the values of std's enums they are. */
+  /**
+   * @import("builtin"): the build mode and the target, as the values of std's enums they are. The
+   * mode is a std.lang.Optimize (`optimize`, and `mode`, its deprecated name), whose fields are the
+   * -O names debug, safe, fast and small.
+   */
   private builtinModule(): Value {
     const rec = (entries: [string, Value][]): Value => ({ k: 'record', fields: new Map(entries) });
     const t = this.target;
     const cpu = rec([['arch', this.stdEnum(['Target', 'Cpu', 'Arch'], t.arch)]]);
     const os = rec([['tag', this.stdEnum(['Target', 'Os', 'Tag'], t.os)]]);
     const abi = this.stdEnum(['Target', 'Abi'], t.abi);
+    const optimize = this.stdEnum(['lang', 'Optimize'], OPTIMIZE_FIELD[this.options.mode]);
     return rec([
-      ['mode', this.stdEnum(['builtin', 'OptimizeMode'], this.options.mode)],
+      ['optimize', optimize],
+      ['mode', optimize],
       ['target', rec([['cpu', cpu], ['os', os], ['abi', abi]])],
       ['cpu', cpu],
       ['os', os],
@@ -1294,22 +1801,35 @@ export class ZigEngine {
     ]);
   }
 
+  /** A type std declares (std.lang.Type.Int, std.Target, ...), by its path from std. */
+  private stdType(path: readonly string[]): ZType {
+    let v = this.stdValue();
+    for (const segment of path) v = this.fieldAccess(v, segment, 0, this.rootScope);
+    if (v.k !== 'type') throw new Error(`std prelude: ${path.join('.')} is not a type`);
+    return v.t;
+  }
+
   /**
-   * @typeInfo: a std.builtin.Type, the tagged union of what a type is. What the engine does not
-   * give (a container's declarations, the names of an error set) is an error to read.
+   * @typeInfo: a std.lang.Type (std.builtin.Type), the tagged union of what a type is, with
+   * 0.17's fields. What the engine does not give (declaration names, the names of an error set,
+   * the elements of the field slices) is an error to read.
    */
   private typeInfo(t: ZType): Value {
-    const rec = (entries: [string, Value][]): Value => ({ k: 'record', fields: new Map(entries) });
-    const info = (tag: string, payload: Value = { k: 'void' }): Value => ({ k: 'union', tag, payload });
+    const T = (...path: string[]) => this.stdType(['lang', 'Type', ...path]);
+    const rec = (type: ZType, entries: [string, Value][]): Value => ({ k: 'record', fields: new Map(entries), type });
+    const info = (tag: string, payload: Value = { k: 'void' }): Value => ({ k: 'union', tag, payload, type: T() });
     const type = (x: ZType): Value => ({ k: 'type', t: x });
+    const typeT: ZType = { k: 'comptime', name: 'type' };
+    const optType = (x: ZType | null): Value => ({ k: 'optional', v: x ? type(x) : null, type: { k: 'opt', child: typeT } });
     const bool = (v: boolean): Value => ({ k: 'bool', v });
     const u16 = (n: number): Value => ({ k: 'int', v: BigInt(n), type: { k: 'int', signed: false, bits: 16 } });
-    const layout = (l: string) => this.stdEnum(['builtin', 'Type', 'ContainerLayout'], l);
-    // A slice of fields: its len (a usize); its elements are not given.
-    const fields = (n: number): Value => rec([['len', { k: 'int', v: BigInt(n), type: { k: 'usize' } }]]);
+    const comptimeInt = (n: number): Value => ({ k: 'int', v: BigInt(n) });
+    const layout = (l: string) => this.stdEnum(['lang', 'Type', 'ContainerLayout'], l);
+    // A slice: its len (a usize); its elements are not given.
+    const slice = (n: number): Value => ({ k: 'record', fields: new Map([['len', { k: 'int', v: BigInt(n), type: { k: 'usize' } }]]) });
     const unmodelled = (what: string): Value => ({ k: 'unmodelled', what });
     const int = (signed: boolean, bits: number) =>
-      info('int', rec([['signedness', this.stdEnum(['builtin', 'Signedness'], signed ? 'signed' : 'unsigned')], ['bits', u16(bits)]]));
+      info('int', rec(T('Int'), [['signedness', this.stdEnum(['lang', 'Signedness'], signed ? 'signed' : 'unsigned')], ['bits', u16(bits)]]));
     switch (t.k) {
       case 'int':
         return int(t.signed, t.bits);
@@ -1319,61 +1839,73 @@ export class ZigEngine {
       case 'c':
         return int(t.signed, cTypeBitSize(this.target, t.c));
       case 'float':
-        return info('float', rec([['bits', u16(t.bits)]]));
+        return info('float', rec(T('Float'), [['bits', u16(t.bits)]]));
       case 'c_longdouble':
-        return info('float', rec([['bits', u16(cTypeBitSize(this.target, 'longdouble'))]]));
+        return info('float', rec(T('Float'), [['bits', u16(cTypeBitSize(this.target, 'longdouble'))]]));
       case 'bool':
       case 'void':
       case 'noreturn':
         return info(t.k);
       case 'anyopaque':
-        return info('opaque', rec([['decls', unmodelled("anyopaque's declarations")]]));
+        return info('opaque', rec(T('Opaque'), [['decl_names', unmodelled("anyopaque's declarations")]]));
       case 'comptime':
         return info(
-          t.name === '@TypeOf(.enum_literal)' ? 'enum_literal' : t.name === '@TypeOf(null)' ? 'null' : t.name === '@TypeOf(undefined)' ? 'undefined' : t.name,
+          t.name === '@EnumLiteral()' ? 'enum_literal' : t.name === '@TypeOf(null)' ? 'null' : t.name === '@TypeOf(undefined)' ? 'undefined' : t.name,
         );
-      case 'ptr':
+      case 'ptr': {
+        const usize: ZType = { k: 'usize' };
+        const attrs = rec(T('Pointer', 'Attributes'), [
+          ['const', bool(t.isConst)],
+          ['volatile', bool(t.isVolatile)],
+          ['allowzero', bool(t.allowzero)],
+          ['addrspace', unmodelled("a pointer type's address space")],
+          ['align', { k: 'optional', v: t.align !== undefined ? { k: 'int', v: BigInt(t.align), type: usize } : null, type: { k: 'opt', child: usize } }],
+        ]);
         return info(
           'pointer',
-          rec([
-            ['size', this.stdEnum(['builtin', 'Type', 'Pointer', 'Size'], t.size)],
-            ['is_const', bool(t.isConst)],
-            ['is_volatile', bool(t.isVolatile)],
-            ['alignment', { k: 'optional', v: t.align !== undefined ? { k: 'int', v: BigInt(t.align), type: { k: 'usize' } } : null }],
+          rec(T('Pointer'), [
+            ['size', this.stdEnum(['lang', 'Type', 'Pointer', 'Size'], t.size)],
+            ['attrs', attrs],
             ['child', type(t.child)],
-            ['is_allowzero', bool(t.allowzero)],
             ['sentinel_ptr', unmodelled("a pointer type's sentinel")],
           ]),
         );
+      }
       case 'array':
-        return info('array', rec([['len', { k: 'int', v: BigInt(t.len) }], ['child', type(t.child)], ['sentinel_ptr', unmodelled("an array type's sentinel")]]));
+        return info('array', rec(T('Array'), [['len', comptimeInt(t.len)], ['child', type(t.child)], ['sentinel_ptr', unmodelled("an array type's sentinel")]]));
       case 'vector':
-        return info('vector', rec([['len', { k: 'int', v: BigInt(t.len) }], ['child', type(t.child)]]));
+        return info('vector', rec(T('Vector'), [['len', comptimeInt(t.len)], ['child', type(t.child)]]));
       case 'opt':
-        return info('optional', rec([['child', type(t.child)]]));
+        return info('optional', rec(T('Optional'), [['child', type(t.child)]]));
       case 'errunion':
-        return info('error_union', rec([['error_set', type(t.set)], ['payload', type(t.payload)]]));
+        return info('error_union', rec(T('ErrorUnion'), [['error_set', type(t.set)], ['payload', type(t.payload)]]));
       case 'errset':
-        return info('error_set', unmodelled("an error set's names"));
+        return info('error_set', rec(T('ErrorSet'), [['error_names', unmodelled("an error set's names")]]));
       case 'fn':
         return info('fn', unmodelled("a function type's parameters"));
       case 'container': {
         const c = t.c;
         const d = c.decl;
-        const decls = unmodelled(`the declarations of '${c.name}'`);
+        const decls = unmodelled(`the declaration names of '${c.name}'`);
         if (d.kind === 'enum') {
           const e = this.enumInfo(c);
-          return info('enum', rec([['tag_type', type(e.tag)], ['fields', fields(d.fields.filter((f) => f.name !== '_').length)], ['decls', decls], ['is_exhaustive', bool(!d.nonexhaustive)]]));
+          const n = d.fields.filter((f) => f.name !== '_').length;
+          const mode = this.stdEnum(['lang', 'Type', 'Enum', 'Mode'], d.nonexhaustive ? 'nonexhaustive' : 'exhaustive');
+          return info('enum', rec(T('Enum'), [['tag_type', type(e.tag)], ['mode', mode], ['field_names', slice(n)], ['field_values', slice(n)], ['decl_names', decls]]));
         }
-        if (d.kind === 'opaque') return info('opaque', rec([['decls', decls]]));
+        if (d.kind === 'opaque') return info('opaque', rec(T('Opaque'), [['decl_names', decls]]));
+        const n = d.fields.length;
+        const backing = optType(d.layout === 'packed' ? this.packedInfo(c).backing : null);
         if (d.kind === 'union') {
-          const tag = d.layout === 'auto' && (d.unionEnum || d.arg) ? { k: 'type' as const, t: this.unionTagType(c) } : null;
-          return info('union', rec([['layout', layout(d.layout)], ['tag_type', { k: 'optional', v: tag }], ['fields', fields(d.fields.length)], ['decls', decls]]));
+          const tag = optType(d.layout === 'auto' && (d.unionEnum || d.arg) ? this.unionTagType(c) : null);
+          return info(
+            'union',
+            rec(T('Union'), [['layout', layout(d.layout)], ['tag_type', tag], ['backing_integer', backing], ['field_names', slice(n)], ['field_types', slice(n)], ['field_attrs', slice(n)], ['decl_names', decls]]),
+          );
         }
-        const backing = d.layout === 'packed' ? type(this.packedInfo(c).backing) : null;
         return info(
           'struct',
-          rec([['layout', layout(d.layout)], ['backing_integer', { k: 'optional', v: backing }], ['fields', fields(d.fields.length)], ['decls', decls], ['is_tuple', bool(c.tuple)]]),
+          rec(T('Struct'), [['is_tuple', bool(c.tuple)], ['layout', layout(d.layout)], ['backing_integer', backing], ['field_names', slice(n)], ['field_types', slice(n)], ['field_attrs', slice(n)], ['decl_names', decls]]),
         );
       }
     }
@@ -1498,8 +2030,15 @@ export class ZigEngine {
     return c === 'runtime' || c === 'partial';
   }
 
-  /** Type.bitSize, for the types a packed container may hold. */
+  /**
+   * Type.bitSize, of the types with a bit representation (Type.hasBitRepresentation, which
+   * @bitSizeOf requires, and which also lets in error sets and every enum): integers, floats, bool,
+   * void, pointers and pointer-like optionals, packed containers, enums, and arrays and vectors of
+   * these, `len` times their element's bits. Other types (plain structs and unions, slices, error
+   * unions, other optionals) have none.
+   */
   bitSize(t: ZType, line?: number): number {
+    const none = () => new ZigLayoutError(`No bit size available for type '${formatType(t)}'.`, line);
     switch (t.k) {
       case 'int':
         return t.bits;
@@ -1517,31 +2056,40 @@ export class ZigEngine {
       case 'void':
         return 0;
       case 'ptr':
-        return t.size === 'slice' ? 2 * ptrBits(this.target) : ptrBits(this.target);
+        if (t.size === 'slice') throw none();
+        return ptrBits(this.target);
+      case 'opt':
+        if (!this.isPtrAtRuntime(t)) throw none();
+        return ptrBits(this.target);
       case 'errset':
         return this.errorBits();
       case 'vector':
         return t.len * this.bitSize(t.child, line);
-      case 'array': {
-        if (t.len + (t.sentinel ? 1 : 0) === 0) return 0;
-        const n = t.len + (t.sentinel ? 1 : 0);
-        return (n - 1) * 8 * this.layoutOf(t.child, line).size + this.bitSize(t.child, line);
-      }
+      case 'array':
+        return (t.len + (t.sentinel !== undefined ? 1 : 0)) * this.bitSize(t.child, line);
       case 'container': {
         const d = t.c.decl;
         if (d.kind === 'enum') return this.bitSize(this.enumInfo(t.c).tag, line);
         if (d.layout === 'packed') return this.packedBits(t.c, line);
-        return this.layoutOf(t, line).size * 8;
+        throw none();
       }
-      case 'opt':
-      case 'errunion':
-        return this.layoutOf(t, line).size * 8;
       default:
-        throw new ZigLayoutError(`'${formatType(t)}' has no bit size.`, line);
+        throw none();
     }
   }
 
+  /** Type.isPtrAtRuntime: a pointer other than a slice, or an optional one that is only a pointer. */
+  private isPtrAtRuntime(t: ZType): boolean {
+    if (t.k === 'ptr') return t.size !== 'slice';
+    if (t.k === 'opt' && t.child.k === 'ptr') return (t.child.size === 'one' || t.child.size === 'many') && !t.child.allowzero;
+    return false;
+  }
+
   layoutOf(t: ZType, line?: number): ZLayout {
+    return this.nesting.in(() => this.layoutOfHere(t, line), line);
+  }
+
+  private layoutOfHere(t: ZType, line?: number): ZLayout {
     const target = this.target;
     switch (t.k) {
       case 'int':
@@ -1566,7 +2114,7 @@ export class ZigEngine {
       case 'comptime':
         return { size: 0, align: 1, cls: 'comptime' };
       case 'fn':
-        return { size: 0, align: 1, cls: 'comptime' };
+        return { size: 0, align: minFunctionAlignment(target), cls: 'comptime' };
       case 'ptr':
         return { size: this.ptrSize(t), align: this.ptrBytes, cls: 'runtime' };
       case 'array': {
@@ -1608,8 +2156,8 @@ export class ZigEngine {
   }
 
   /**
-   * Type.abiAlignment and abiSize of a vector: by LLVM's rule, or by the self-hosted x86-64
-   * backend's, which aligns to 16 bytes, or 32 and 64 with AVX and AVX-512F on the CPU.
+   * Type.abiAlignment and abiSize of a vector: by the LLVM backend's rule, or by the self-hosted
+   * x86-64 backend's, which aligns to 16 bytes, or 32 and 64 with AVX and AVX-512F on the CPU.
    */
   private vectorLayout(t: Extract<ZType, { k: 'vector' }>, line?: number): ZLayout {
     if (t.len === 0) return { size: 0, align: 1, cls: 'opv' };
@@ -1625,10 +2173,18 @@ export class ZigEngine {
       const align = bytes > 32 && cpu.avx512f ? 64 : bytes > 16 && cpu.avx ? 32 : 16;
       return { size: alignForward(bytes, align), align, cls: 'runtime' };
     }
+    // Floats the target emulates in software are laid out as an array of them.
+    const floatBits = t.child.k === 'float' ? t.child.bits : t.child.k === 'c_longdouble' ? cTypeBitSize(this.target, 'longdouble') : undefined;
+    if (floatBits !== undefined && compilerRtFloatAbi(this.target, floatBits) === 'soft') {
+      const elem = this.layoutOf(t.child, line);
+      return { size: alignForward(t.len * elem.size, elem.align), align: elem.align, cls: 'runtime' };
+    }
     const elemBits = this.bitSize(t.child, line);
     if (elemBits === 0) return { size: 0, align: 1, cls: 'opv' };
     const bytes = Math.ceil((elemBits * t.len) / 8);
-    const align = ceilPow2(bytes);
+    // ARM and AArch64 align a vector to at most the stack's alignment.
+    const arch = this.target.arch;
+    const align = ceilPow2(arch === 'arm' || arch === 'thumb' || arch === 'aarch64' ? Math.min(bytes, stackAlignment(this.target)) : bytes);
     return { size: alignForward(bytes, align), align, cls: 'runtime' };
   }
 
@@ -1656,7 +2212,7 @@ export class ZigEngine {
       let v: bigint;
       if (f.value) {
         if (inferred) throw new ZigLayoutError(`Field '${f.name}' has a value: give the enum an integer tag type, e.g. enum(u8).`, f.line);
-        v = this.evalInt(f.value, c.scope);
+        v = this.evalInt(f.value, c.scope, tag);
       } else {
         v = i === 0 ? 0n : values[i - 1]! + 1n;
       }
@@ -1680,7 +2236,7 @@ export class ZigEngine {
     return signed ? { min: -(1n << (bits - 1n)), max: (1n << (bits - 1n)) - 1n } : { min: 0n, max: (1n << bits) - 1n };
   }
 
-  /** Type.unpackable: what a packed struct or union may hold (0.16: no pointers). */
+  /** Type.unpackable: what a packed struct or union may hold (no pointers, since 0.15). */
   private packableError(t: ZType): string | undefined {
     switch (t.k) {
       case 'int':
@@ -1775,22 +2331,6 @@ export class ZigEngine {
     }
   }
 
-  /** Type.defaultStructFieldAlignment */
-  private defaultFieldAlign(t: ZType, layout: 'auto' | 'extern', line?: number): number {
-    const a = this.layoutOf(t, line).align;
-    if (layout === 'extern' && this.isAbiInt(t) && this.intBits(t, line) >= 128) return Math.max(a, 16);
-    return a;
-  }
-
-  private isAbiInt(t: ZType): boolean {
-    if (t.k === 'int' || t.k === 'usize' || t.k === 'isize' || t.k === 'c' || t.k === 'errset') return true;
-    if (t.k === 'container') return t.c.decl.kind === 'enum' || ((t.c.decl.kind === 'struct' || t.c.decl.kind === 'union') && t.c.decl.layout === 'packed');
-    return false;
-  }
-
-  private intBits(t: ZType, line?: number): number {
-    return this.bitSize(t, line);
-  }
 
   /** Type.validateExtern */
   private externError(t: ZType, position: 'struct_field' | 'union_field' | 'element'): string | undefined {
@@ -1902,7 +2442,8 @@ export class ZigEngine {
       this.checkFieldType(c, f);
       this.layoutOf(f.type, f.line);
     }
-    const aligns = fields.map((f) => f.align ?? this.defaultFieldAlign(f.type, layout, f.line));
+    // A field is aligned as written, else as its type: extern structs too.
+    const aligns = fields.map((f) => f.align ?? this.layoutOf(f.type, f.line).align);
     let structAlign = 1;
     let npv = false;
     let runtime = false;
@@ -1956,11 +2497,16 @@ export class ZigEngine {
     return { size, align: structAlign, cls, record };
   }
 
-  /** Type.structFieldOffset for tuples: declaration order, comptime and zero-bit fields at 0. */
+  /**
+   * Type.structFieldOffset for tuples: declaration order, comptime and zero-bit fields at 0. The
+   * tuple is aligned as its most aligned field (Type.abiAlignment), but its size is rounded up to
+   * the alignment of the fields with runtime bits only.
+   */
   private tupleLayout(c: Container): ZLayout {
     const fields = this.fieldsOf(c);
     let cur = 0;
     let align = 1;
+    let runtimeAlign = 1;
     let npv = false;
     let runtime = false;
     let comptime = false;
@@ -1978,12 +2524,13 @@ export class ZigEngine {
         placed.push({ f, offset: 0, align: l.align });
         continue;
       }
+      runtimeAlign = Math.max(runtimeAlign, l.align);
       cur = alignForward(cur, l.align);
       placed.push({ f, offset: cur, align: l.align });
       cur += l.size;
     }
     const cls: Class = npv ? 'npv' : comptime ? (runtime ? 'partial' : 'comptime') : runtime ? 'runtime' : 'opv';
-    const size = cls === 'npv' ? 0 : alignForward(cur, align);
+    const size = cls === 'npv' ? 0 : alignForward(cur, runtimeAlign);
     placed.sort((a, b) => a.offset - b.offset || (this.layoutOf(a.f.type).size === 0 ? -1 : 0));
     return { size, align, cls, record: this.structRecord(c, placed, size, align) };
   }
@@ -2338,7 +2885,7 @@ export function analyzeZig(code: string, targetId: string, build: ZigBuildOption
         break;
       }
     } catch (err) {
-      if (!(err instanceof ZigLayoutError)) throw err;
+      if (!(err instanceof ZigLayoutError) && !(err instanceof NestingError)) throw err;
       if (d.value!.k === 'container') {
         analysis.errors.push({ message: err.message, line: err.line ?? d.line, type: 'semantic' });
         return analysis;
@@ -2403,7 +2950,7 @@ export function analyzeZig(code: string, targetId: string, build: ZigBuildOption
     }
     analysis.unusedTypes = findUnused(file, root.decl);
   } catch (err) {
-    if (!(err instanceof ZigLayoutError)) throw err;
+    if (!(err instanceof ZigLayoutError) && !(err instanceof NestingError)) throw err;
     analysis.errors.push({ message: err.message, line: err.line, type: 'semantic' });
     analysis.result = null;
   }
@@ -2414,6 +2961,8 @@ export function analyzeZig(code: string, targetId: string, build: ZigBuildOption
 function findUnused(file: ZigFile, root: Decl): string[] {
   const decls = new Map(file.root.decls.map((d) => [d.name, d]));
   const used = new Set<string>([root.name]);
+  // Declarations go on a worklist: a chain of them can be any length.
+  const pending: Decl[] = [];
   const visitExpr = (e: Expr | undefined): void => {
     if (!e) return;
     switch (e.k) {
@@ -2421,7 +2970,7 @@ function findUnused(file: ZigFile, root: Decl): string[] {
         const d = decls.get(e.name);
         if (d && !used.has(e.name)) {
           used.add(e.name);
-          visitDecl(d);
+          pending.push(d);
         }
         return;
       }
@@ -2534,5 +3083,6 @@ function findUnused(file: ZigFile, root: Decl): string[] {
     // Declarations inside a container are used only if referenced; their names are not top-level.
   };
   visitDecl(root);
+  while (pending.length > 0) visitDecl(pending.pop()!);
   return file.root.decls.filter((d) => d.kind === 'const' && d.value?.k === 'container' && !used.has(d.name)).map((d) => d.name);
 }

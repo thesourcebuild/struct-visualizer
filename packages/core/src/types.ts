@@ -21,8 +21,10 @@ export interface StructMember {
   type: string;
   /** The type as written, when it differs from `type` (a typedef name, a function pointer). */
   declaredType?: string;
-  /** Total element count (product of all dimensions); 0 for a flexible array member. */
+  /** Total element count (product of all dimensions); 0 for a flexible array member or a GNU zero-length array. */
   arraySize?: number;
+  /** A C99 flexible array member (`int data[];`), as opposed to a GNU zero-length array (`int data[0];`). */
+  flexible?: boolean;
   /** Each dimension as written, e.g. [3, 4] for `m[3][4]`. */
   arrayDims?: number[];
   bitField?: number;
@@ -36,6 +38,12 @@ export interface StructMember {
   /** `__attribute__((packed))` on the member: alignment 1. */
   packed?: boolean;
   /**
+   * The #pragma pack in effect where the member is declared (null: none), set only where it differs
+   * from its record's (ParsedStruct.pragmaPack, the one in effect where the record ends). MSVC caps
+   * the member by it; GCC uses the record's for every member.
+   */
+  pragmaPack?: number | null;
+  /**
    * The alignment of the member's type, set by an aligned typedef (`typedef int a8
    * __attribute__((aligned(8)));`). It replaces the type's natural alignment, smaller or larger,
    * and packing lowers it like any natural alignment, unlike `alignAttribute` on the member.
@@ -48,6 +56,12 @@ export interface StructMember {
   functionPointer?: boolean;
   /** A C++ reference member: laid out as a pointer. */
   reference?: boolean;
+  /**
+   * A C++ pointer to member: `int A::*` (to a data member) or `void (A::*)()` (to a member
+   * function), with the class named and MSVC's inheritance model of that class where the member
+   * is declared, which MSVC sizes it by.
+   */
+  memberPointer?: { className: string; function: boolean; inheritance: MsInheritanceModel };
   /** A C++ member that is not public. */
   access?: 'private' | 'protected';
   /**
@@ -95,7 +109,19 @@ export interface CppClass {
   nonPublicData: boolean;
   defaultMemberInitializer: boolean;
   referenceMember: boolean;
+  /**
+   * MSVC's inheritance model, fixed where a pointer to one of its members is first declared as a
+   * member: 'unspecified' for good when the class had no definition there.
+   */
+  inheritanceModel?: MsInheritanceModel;
 }
+
+/**
+ * How MSVC represents pointers to members of a class: by whether it has a virtual base
+ * ('virtual'), more than one base or a vfptr its base lacks ('multiple'), neither ('single'), or
+ * no definition where the pointer is declared ('unspecified').
+ */
+export type MsInheritanceModel = 'single' | 'multiple' | 'virtual' | 'unspecified';
 
 /**
  * The language the source is compiled as. C++17 stands for C++11 to C++17 and C++20 for C++20
@@ -132,7 +158,7 @@ export interface ParsedStruct {
   totalSize?: number;
   alignment?: number;
   totalPadding?: number;
-  /** `#pragma pack(n)` in effect at the definition: n caps every member's alignment. */
+  /** `#pragma pack(n)` in effect where the definition ends: n caps every member's alignment (GCC; see StructMember.pragmaPack for MSVC). */
   pragmaPack?: number;
   /** `__attribute__((packed))` on the type: every member at alignment 1. */
   packed?: boolean;
@@ -184,6 +210,16 @@ export interface Architecture {
   defaultAlignment?: number;
   /** The largest alignment a type gets on its own; alignment requests may exceed it. */
   maxAlignment?: number;
+  /**
+   * GCC's __BIGGEST_ALIGNMENT__: what `__attribute__((aligned))` without an argument asks for.
+   * maxAlignment where unset.
+   */
+  biggestAlignment?: number;
+  /** Plain char is signed (it is unsigned on ARM, AArch64, RISC-V, PowerPC and SDCC). Unset where not measured. */
+  charSigned?: boolean;
+  /** wchar_t's size in bytes and whether it is signed, as measured (unset where not measured). */
+  wcharSize?: number;
+  wcharSigned?: boolean;
   /**
    * Byte order; little unless set. It does not move any member, but a bit-field's bits are
    * numbered from the most significant bit of each byte on a big-endian target.

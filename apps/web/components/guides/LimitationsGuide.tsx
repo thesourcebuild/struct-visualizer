@@ -93,6 +93,7 @@ export function LimitationsGuide() {
                 <ul className={UL}>
                     <li>Templates, which have no layout until instantiated, and template base classes.</li>
                     <li>MSVC&apos;s <code className={CODE}>#pragma vtordisp</code> and the <code className={CODE}>/vd</code> options: the default, <code className={CODE}>/vd1</code>, is used.</li>
+                    <li>MSVC&apos;s <code className={CODE}>__single_inheritance</code>, <code className={CODE}>__multiple_inheritance</code> and <code className={CODE}>__virtual_inheritance</code>, <code className={CODE}>#pragma pointers_to_members</code> and <code className={CODE}>/vmg</code>: a pointer to member is sized by its class&apos;s own inheritance model, as under the default <code className={CODE}>/vmb</code>.</li>
                     <li>The 8051 compilers and XC16 compile C only, so they have no C++ layout.</li>
                 </ul>
             </section>
@@ -100,7 +101,7 @@ export function LimitationsGuide() {
             <section className={`${CARD} border-amber-500`}>
                 <h2 className={H2}>Zig</h2>
                 <p className={P}>
-                    Zig types are laid out by Zig 0.16&apos;s rules, ported from the compiler and checked against it on every target in Debug,
+                    Zig types are laid out by Zig 0.17&apos;s rules, ported from the compiler and checked against it on every target in Debug,
                     ReleaseSafe and ReleaseFast. A plain struct&apos;s field order is the compiler&apos;s choice, which a later Zig may change; extern
                     and packed layouts are defined by the language.
                 </p>
@@ -108,14 +109,36 @@ export function LimitationsGuide() {
                     <li>Structs, tuples, extern and packed structs, enums, bare, tagged, extern and packed unions; optionals, error sets and error unions, slices, sentinels, vectors.</li>
                     <li>Error codes are as wide as <code className={CODE}>--error-limit</code> needs: <code className={CODE}>u16</code> for its default, 65535.</li>
                     <li>The build mode matters: Debug and ReleaseSafe give a bare union a hidden safety tag. In Debug on x86-64 Linux, Zig&apos;s own code generator lays out vectors by the CPU: 16-byte aligned, 32 with AVX and 64 with AVX-512F (the CPU option, as <code className={CODE}>-mcpu</code>).</li>
-                    <li>Comptime code that decides a type: constants and integer arithmetic (fixed-width where declared so), <code className={CODE}>@sizeOf</code>, <code className={CODE}>@alignOf</code>, <code className={CODE}>@bitSizeOf</code>, <code className={CODE}>@Int</code>, <code className={CODE}>@This</code>, <code className={CODE}>@typeInfo</code>, <code className={CODE}>@clz</code>, <code className={CODE}>@import(&quot;builtin&quot;)</code> (the mode and the target), and functions that return a type through <code className={CODE}>const</code>, <code className={CODE}>if</code> with captures, <code className={CODE}>switch</code>, <code className={CODE}>return</code> and method calls.</li>
-                    <li>The common <code className={CODE}>std</code> types (ArrayList, the hash maps, Allocator, MultiArrayList, atomics, the Io locks, Writer and Reader, bit sets, linked lists), transcribed from the std sources.</li>
+                    <li>Comptime code that decides a type: constants and integer arithmetic (fixed-width where declared so, as the compiler does it), <code className={CODE}>@sizeOf</code>, <code className={CODE}>@alignOf</code>, <code className={CODE}>@bitSizeOf</code>, <code className={CODE}>@Int</code>, <code className={CODE}>@This</code>, <code className={CODE}>@TypeOf</code>, <code className={CODE}>@typeInfo</code>, <code className={CODE}>@clz</code>, <code className={CODE}>@min</code>/<code className={CODE}>@max</code> and the division builtins, the casts that take their type from a declaration or <code className={CODE}>@as</code> (<code className={CODE}>@intCast</code>, <code className={CODE}>@truncate</code>, ...), <code className={CODE}>orelse</code>, <code className={CODE}>@import(&quot;builtin&quot;)</code> (the mode and the target), and functions that return a type through <code className={CODE}>const</code>, <code className={CODE}>if</code> with captures, <code className={CODE}>switch</code>, <code className={CODE}>return</code> and method calls.</li>
+                    <li>The common <code className={CODE}>std</code> types (ArrayList, the hash maps, Allocator, MultiArrayList, atomics, the Io locks, Writer and Reader, bit sets, linked lists, Deque), transcribed from the std sources.</li>
                 </ul>
                 <p className={`${P} mt-3`}>Not modelled:</p>
                 <ul className={UL}>
-                    <li>Comptime code with loops, assignments or <code className={CODE}>@Type</code>, and the parts of <code className={CODE}>@typeInfo</code> that are not layout (declarations, error set names, function details): an error says what is not supported. So are std types defined that way, such as <code className={CODE}>EnumSet</code> and <code className={CODE}>EnumArray</code>.</li>
+                    <li>Comptime code with loops or assignments, the builtins that build a type from parts (<code className={CODE}>@Struct</code>, <code className={CODE}>@Union</code>, <code className={CODE}>@Enum</code>, ...), and the parts of <code className={CODE}>@typeInfo</code> that are not layout (declarations, error set names, function details): an error says what is not supported. So are std types defined that way, such as <code className={CODE}>EnumSet</code> and <code className={CODE}>EnumArray</code>.</li>
                     <li>The rest of <code className={CODE}>std</code>, and other imports: an error names what is missing.</li>
+                    <li><code className={CODE}>@min</code>/<code className={CODE}>@max</code> of floats, an unnamed value of a non-exhaustive enum, packed-struct sentinel values and the type of a generic function: each is an error that says so.</li>
                     <li>The error names a whole program uses: zig counts std&apos;s against <code className={CODE}>--error-limit</code> too (over a hundred for <code className={CODE}>std.debug.print</code>), so the tool only knows that a definition with more names than the limit is refused.</li>
+                </ul>
+            </section>
+
+            <section className={`${CARD} border-slate-500`}>
+                <h2 className={H2}>Other Limits</h2>
+                <ul className={UL}>
+                    <li>
+                        <strong>Nesting:</strong> in every language, input nested more than 256 levels deep (brackets, nested types and operators, or
+                        types and constants defined through one another) is an error instead of a layout. 256 is the minimum the C++ standard
+                        recommends compilers take; the compilers themselves go deeper.
+                    </li>
+                    <li>
+                        <strong>C:</strong> GCC 13&apos;s &quot;size of array element is not a multiple of its alignment&quot; check is not made (such an
+                        array is laid out); converting an out-of-range floating value to an integer in a constant expression is an error here,
+                        where GCC folds it; whether char and wchar_t are signed under XC16 and Keil C51 is not known, so a value that depends on it
+                        is an error.
+                    </li>
+                    <li>
+                        <strong>Go:</strong> floating-point constants beyond 2<sup>±2<sup>20</sup></sup> are an error; constants no layout uses
+                        are not evaluated, so an error in one is not reported.
+                    </li>
                 </ul>
             </section>
 

@@ -5,6 +5,7 @@ import type { AnyToolDefinition, ToolSpecBase, ToolVariantRow, ToolVariantTable 
 import type { OptionValues } from "@sp/contracts";
 import { Panel, cn } from "@sp/ui";
 import { ChevronIcon } from "./icons";
+import { runVariants } from "./run-tool";
 
 interface VariantsPanelProps {
   tool: AnyToolDefinition;
@@ -68,8 +69,8 @@ function Delta({ value, current }: { value: number | undefined; current: number 
  */
 export function VariantsPanel({ tool, spec, input, onSelect }: VariantsPanelProps) {
   const [open, setOpen] = useState(false);
-  const table = useMemo(
-    () => (open && tool.variants ? tool.variants(spec, input) : undefined),
+  const { table, failure } = useMemo(
+    () => (open ? runVariants(tool, spec, input) : { table: undefined, failure: undefined }),
     [open, tool, spec, input],
   );
 
@@ -98,6 +99,11 @@ export function VariantsPanel({ tool, spec, input, onSelect }: VariantsPanelProp
       }
       bodyClassName={open ? "p-0" : "hidden"}
     >
+      {failure !== undefined && (
+        <p role="alert" className="px-4 py-3 text-sm text-red-700 dark:text-red-300">
+          The table could not be built: {failure}
+        </p>
+      )}
       {table && (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">

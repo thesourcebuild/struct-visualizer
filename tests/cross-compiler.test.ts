@@ -179,18 +179,141 @@ const CASES: Record<string, string> = {
   "macro with sizeof":
     "#define ROUND_UP(x, a) (((x) + (a) - 1) / (a) * (a))\nstruct T { char a; short b; char c; };\nstruct S { char raw[ROUND_UP(sizeof(struct T), 8)]; long tail; };",
   "variadic macro": "#define DECL(type, ...) type __VA_ARGS__;\nstruct S { DECL(char, a, b, c) DECL(int, d) DECL(short, e) };",
+  // Each use of a macro takes the definition in effect where it is.
+  "macro redefined between uses": "#define N 2\nstruct A { char a[N]; };\n#undef N\n#define N 5\nstruct S { struct A x; char b[N]; char z; };",
+  "macro name reused as an enum constant": "#define N 3\nstruct T { char t[N]; };\n#undef N\nenum { N = 7 };\nstruct S { struct T t; char a[N]; char z; };",
+  // Lines are spliced before comments go, and without a space.
+  "line splice inside a number": "#define N 1\\\n2\nstruct S { char a[N]; char z; };",
+  "comment across lines in a macro": "#define N 4 /* one\n two */ + 1\nstruct S { char a[N]; char z; };",
+  "line comment continued by a backslash": "#define N 2\n// note \\\nstruct X { char q[99]; };\nstruct S { char a[N]; char z; };",
+  // C's integer types in constant expressions: each constant's type, promotions and conversions,
+  // unsigned wrap-around, 64-bit values, size_t from sizeof; SDCC compares by value.
+  "integer conversions in array sizes":
+    "struct S { char a[(sizeof(int) - 8) > 0 ? 1 : 2]; char b[-1u > 0 ? 1 : 2]; char c[(-8 / 2u) > 100 ? 1 : 2]; char d[0xFFFFFFFFu + 1u == 0 ? 1 : 2]; char e[0xFFFFFFFF > -1 ? 1 : 2]; char f[(int)((0x80000000 | 1) >> 28)]; char g[(int)(~0ULL >> 62)]; char h[(int)(((1ULL << 40) ^ (1ULL << 33)) >> 33)]; char i[(int)(0x7fffffffffffffffLL - 0x7ffffffffffffff0LL)]; char z; };",
+  "32-bit unsigned arithmetic": "struct S { char a[(1u << 31) * 2u == 0 ? 1 : 2]; char b[(int)(~0u >> 30) + 1]; char c[65535 > -1 ? 1 : 2]; char z; };",
+  "#if arithmetic in intmax_t":
+    "#if -1 > 0u\n#define A 1\n#else\n#define A 2\n#endif\n#if (0x80000000 | 0) > 0\n#define B 1\n#else\n#define B 2\n#endif\n#if '\\377' < 0\n#define C 1\n#else\n#define C 2\n#endif\n#if 0 && (1 / 0)\n#endif\n#if 1 || (1 / 0)\n#define D 3\n#endif\nstruct S { char a[A]; char b[B]; char c[C]; char d[D]; char z; };",
+  "character and string constants":
+    "#define STR \"hello\"\nstruct S { char a['\\377' < 0 ? 1 : 2]; char b[sizeof 'a']; char c[sizeof(1L)]; char d[sizeof(\"abc\")]; char e[sizeof STR]; char f[('ab' & 0xFF) - 96]; char z; };",
+  "floating constants under casts": "struct S { char a[(int)2.9]; char b[1e1 > 5 ? 1 : 2]; char c[(int)(2.5 * 2)]; char d[(int)-2.5 + 4]; char e[(int)0x1p3]; char z; };",
+  "operands that are not evaluated": "struct S { char a[1 ? 2 : 1 / 0]; char b[0 && 1 / 0 ? 3 : 2]; char c[1 || 1 / 0 ? 1 : 2]; char d[sizeof(1 / 0)]; char z; };",
+  "enumerator that overflows int": "enum E { E_BIG = 0x7fffffff + 1 }; struct S { char a; enum E e; char c; };",
+  "enumerator beyond int": "enum E { E_A = 70000 }; struct S { char a[E_A - 70001 < 0 ? 1 : 2]; enum E e; char c; };",
+  "wchar_t member": "struct S { char a; wchar_t w; char b[(wchar_t)-1 < 0 ? 1 : 2]; };",
+  // Alignment requests: on a pointer typedef, without an argument, and several on one member.
+  "aligned pointer typedef": "typedef int *IP __attribute__((aligned(32))); struct S { char a; IP p; };",
+  "aligned function pointer typedef": "typedef void (*FP)(void) __attribute__((aligned(16))); struct S { char a; FP f; };",
+  "pointer to an aligned typedef": "typedef int I8 __attribute__((aligned(8))); struct S { char a; I8 *p; };",
+  "declspec-aligned pointer typedef": "typedef __declspec(align(32)) int *IP; struct S { char a; IP p; };",
+  "aligned without an argument": "typedef int AI __attribute__((aligned)); struct S { char a; char b __attribute__((aligned)); AI c; };",
+  "several _Alignas": "struct S { char a; _Alignas(2) _Alignas(8) _Alignas(4) char b; char c; };",
+  "several aligned attributes": "struct S { char a; char b __attribute__((aligned(8), aligned(2))); char c __attribute__((aligned(2))) __attribute__((aligned(4))); };",
+  "_Alignas and an aligned attribute": "struct S { char a; _Alignas(8) char b __attribute__((aligned(2))); char c; };",
+  "several __declspec(align)": "struct S { char a; __declspec(align(8)) __declspec(align(2)) char b; char c; };",
+  "_Alignas and __declspec(align)": "struct S { char a; _Alignas(4) __declspec(align(16)) char b; };",
+  // #pragma pack changed inside a record: GCC packs the record as the pack where it ends says,
+  // MSVC each member as the pack where it is declared.
+  "pragma pack set inside a struct": "struct S { char a;\n#pragma pack(1)\n int b; char c; };\n#pragma pack()",
+  "pragma pack set after the members": "struct S { char a; int b;\n#pragma pack(1)\n char c; };\n#pragma pack()",
+  "pragma pack reset inside a struct": "#pragma pack(1)\nstruct S { char a; int b;\n#pragma pack()\n char c; int d; };",
+  "pragma pack pushed and popped inside a struct": "struct S { char a;\n#pragma pack(push, 2)\n int b; char c;\n#pragma pack(pop)\n};",
+  "pragma pack inside a nested struct": "struct S { char a;\n struct T { char x;\n#pragma pack(1)\n int y; } t;\n int b; };\n#pragma pack()",
+  "struct packed mid-way as a member": "struct T { char a; int b;\n#pragma pack(1)\n char c; };\n#pragma pack()\nstruct S { char x; struct T t; char y; };",
+  "pragma pack set inside a union": "union S { int b;\n#pragma pack(1)\n char a[5]; };\n#pragma pack()",
+  "pragma pack set after a bit-field": "struct S { char a; long b:30;\n#pragma pack(1)\n char c; };\n#pragma pack()",
+  // MSVC takes 16 levels of nested definitions (fatal error C1046 past them); GCC and SDCC more.
+  "structs nested 16 deep": "struct S { char a; " + "struct { char b; ".repeat(15) + "short x; " + "} m; ".repeat(15) + "};",
+  // A carriage return on its own: a line end to GCC and SDCC, a space to MSVC; the same layout here.
+  "carriage returns between members": "struct S { char a;\rint b;\r\nshort c;\r};",
   // Every C example: nested structs, unions, arrays, pointers and enums on every target.
   ...Object.fromEntries(examples.filter((e) => e.language === "c").map((e) => [`example: ${e.name}`, e.code])),
 };
 
+/**
+ * Cases that some or all of the compilers reject: on every target the engine must reject one
+ * exactly where the compiler does, and lay it out as the compiler does where it accepts it.
+ */
+const REJECTIONS: Record<string, string> = {
+  // A macro is not expanded before its #define.
+  "macro used before its definition": "struct S { char a[M]; };\n#define M 4\nstruct T { char b[M]; };",
+  // A bit-field no wider than its type: _Bool's 1 bit (8 under MSVC), int's 16 on AVR and the 8051.
+  "bit-field wider than int": "struct S { char c; int a:33; };",
+  "bit-field wider than char": "struct S { char c; char a:9; };",
+  "bit-field wider than _Bool": "struct S { char c; _Bool a:2; };",
+  "unnamed bit-field wider than char": "struct S { char a; char :0; char :9; };",
+  "31-bit int field": "struct S { char c; int b:31; };",
+  "32-bit unsigned field": "struct S { char c; unsigned a:32; };",
+  "33-bit long field": "struct S { char c; long a:33; };",
+  "enum field of 17 bits": "enum E { E_X = 1 }; struct S { char c; enum E a:17; };",
+  // A flexible array member: last, in a struct with another member, never in a union under GCC.
+  "flexible array member alone": "struct S { int d[]; };",
+  "flexible array member in a union": "union S { char c; int d[]; };",
+  "flexible array member not last": "struct S { char a; int d[]; char b; };",
+  // GNU zero-length arrays: anywhere under GCC; SDCC takes one for a flexible array member, MSVC
+  // accepts one last in a struct, or in a union.
+  "zero-length array in the middle": "struct S { char a; int z[0]; char b; };",
+  "zero-length array last": "struct S { char a; int z[0]; };",
+  "zero-length array alone": "struct S { char c[0]; };",
+  "zero-length arrays in a union": "union S { char c[0]; int d[0]; };",
+  "zero-length array first in a union": "union S { int d[0]; char c; };",
+  "zero-length array from an expression": "struct S { char a; double z[2 - 2]; };",
+  "zero-length inner dimension": "struct S { char a; int z[2][0]; };",
+  "zero-length array typedef": "typedef int Z[0]; struct S { char a; Z z; };",
+  "struct ending in a zero-length array as a member": "struct T { char a; int z[0]; }; struct S { struct T t; char b; };",
+  "struct ending in a flexible array member as a member": "struct T { char a; int z[]; }; struct S { struct T t; char b; };",
+  // Arrays of an aligned typedef aligned beyond its size (GCC rejects them; MSVC keeps the elements 4 apart).
+  "array of an over-aligned typedef": "typedef int I8 __attribute__((aligned(8))); struct S { I8 b[1]; };",
+  "array of an over-aligned pointer typedef": "typedef int *IP __attribute__((aligned(32))); struct S { char a; IP b[2]; };",
+  "array typedef of an over-aligned typedef": "typedef short S4 __attribute__((aligned(4))); typedef S4 A[2]; struct S { char a; };",
+  "array of an over-aligned typedef in sizeof": "typedef int I8 __attribute__((aligned(8))); struct S { char a[sizeof(I8[2])]; };",
+  "declspec-aligned typedef array": "typedef __declspec(align(8)) int I8; struct S { char c; I8 b[2]; };",
+  // Integer constant expressions with no constant value under GCC: a signed overflow, a shift by
+  // the width or more, a negative value shifted left (SDCC and MSVC fold them to the wrapped value).
+  "signed overflow in an array size": "struct S { char a[(0x7fffffff + 1) < 0 ? 1 : 2]; char z; };",
+  "signed multiplication overflow": "struct S { char a[0x7fffffff * 2 < 0 ? 1 : 2]; char z; };",
+  "negative value shifted left": "struct S { char a[(-1 << 1) < 0 ? 1 : 2]; char z; };",
+  "floating array size": "struct S { char a[2.0]; };",
+  // Old-style definitions, which SDCC rejects.
+  "K&R function definition before a struct": "int f(a, b) int a; char b; { return a + b; }\nstruct S { char a; int b; };",
+  // _Complex: GCC's alone; and typeof: GCC's typeof, __typeof and __typeof__, MSVC's __typeof__.
+  "complex members": "struct S { char a; float _Complex f; char b; double _Complex d; char c; long double _Complex l; char e; };",
+  "typeof members": "struct T { int x; }; struct S { char a; __typeof__(int) b; __typeof__(struct T) t; __typeof__(double) d; __typeof__(char *) p; };",
+  "typeof of expressions": "struct S { char a; __typeof__(1L) b; __typeof__(sizeof(int)) c; __typeof__('a') d; char e[sizeof(__typeof__(\"abc\"))]; };",
+  "gnu typeof": "struct S { char a; typeof(long long) b; __typeof(short) c; };",
+  "long double members": "struct S { char a; long double ld[2]; char b[_Alignof(long double)]; };",
+  "structs nested 17 deep": "struct S { char a; " + "struct { char b; ".repeat(16) + "short x; " + "} m; ".repeat(16) + "};",
+  // A carriage return on its own ends a // comment or a #define under GCC and SDCC; MSVC reads it as
+  // a space, so the comment or the macro takes the struct and there is nothing to lay out.
+  "carriage return ending a comment": "// note\rstruct S { char a; int b; };",
+  "carriage return ending a #define": "#define N 3\rstruct S { char a[N]; int b; };",
+  // GCC's __int128: on its 64-bit targets only; the 32-bit and 8-bit ones, MSVC and SDCC reject it.
+  "__int128 members": "struct S { char c; __int128 a; char d; unsigned __int128 u; signed __int128 s; __int128 unsigned v; };",
+  "__int128 typedef names": "typedef __int128 I128; struct S { char c; __int128_t a; __uint128_t b; char d; I128 e; };",
+  "__int128 bit-fields": "struct S { char c; __int128 a : 100; unsigned __int128 b : 28; char d; unsigned __int128 e : 65; };",
+  "__int128 in constant expressions":
+    "struct S { char a[sizeof(__int128)]; char b[_Alignof(unsigned __int128)]; char c[(__int128)-1 < 0 ? 1 : 2]; char d[(int)(((unsigned __int128)1 << 100) >> 98)]; char e[sizeof(__uint128_t) + (__int128_t)1]; char z; };",
+  "__int128 bit-field wider than 128 bits": "struct S { char c; __int128 a : 129; };",
+};
+
 /** Named top-level members of the case's last definition: [name, bit-field width or undefined]. */
-function membersOf(code: string): { kind: "struct" | "union"; tag: string; members: [string, number | undefined][] } {
-  const def = analyzeStruct(code, TARGETS[0]!.selection).definition!;
-  return {
-    kind: def.isUnion ? "union" : "struct",
-    tag: def.name,
-    members: def.members.filter((m) => m.name).map((m) => [m.name, m.bitField]),
-  };
+type Members = { kind: "struct" | "union"; tag: string; members: [string, number | undefined][] };
+const memberCache = new Map<string, Members | undefined>();
+function membersOf(code: string): Members | undefined {
+  if (memberCache.has(code)) return memberCache.get(code);
+  // As the first target that lays it out sees it: the cases keep their members on every target.
+  let def: ReturnType<typeof analyzeStruct>["definition"] | undefined;
+  for (const t of TARGETS) {
+    const a = analyzeStruct(code, t.selection);
+    if (a.errors.length === 0) {
+      def = a.definition;
+      break;
+    }
+  }
+  const found: Members | undefined = def
+    ? { kind: def.isUnion ? "union" : "struct", tag: def.name, members: def.members.filter((m) => m.name).map((m) => [m.name, m.bitField]) }
+    : undefined;
+  memberCache.set(code, found);
+  return found;
 }
 const isBitfield = ([, width]: [string, number | undefined]) => width !== undefined;
 
@@ -200,7 +323,10 @@ const isBitfield = ([, width]: [string, number | undefined]) => width !== undefi
  */
 function probeSource(i: number): string {
   const code = source(entries[i]!);
-  const { kind, tag, members } = membersOf(code);
+  const found = membersOf(code);
+  // No target lays it out: whether the compiler takes it is all there is to measure.
+  if (!found) return `${code}\nconst unsigned char sv_${i}[] = { 0xA5 };\n`;
+  const { kind, tag, members } = found;
   const t = `${kind} ${tag}`;
   const values = [`sizeof(${t})`, `_Alignof(${t})`, ...members.filter((m) => !isBitfield(m)).map(([m]) => `offsetof(${t}, ${m})`)];
   const out = [
@@ -259,7 +385,7 @@ interface Measured {
 
 /** Bits come out in memory order: from the least significant bit of each byte, or the most on big-endian targets. */
 function measured(symbols: Map<string, number[]>, code: string, i: number, bigEndian: boolean): Measured {
-  const { members } = membersOf(code);
+  const { members } = membersOf(code)!;
   const sv = symbols.get(`sv_${i}`);
   if (!sv || sv[0] !== 0xa5) throw new Error(`sv_${i} not found in the object file`);
   const word = (k: number) => sv[1 + 2 * k]! | (sv[2 + 2 * k]! << 8);
@@ -323,6 +449,8 @@ interface Entry {
   label: string;
   code: string;
   packing?: PackingSyntax;
+  /** One of REJECTIONS: the engine must reject it wherever the compiler does. */
+  rejection?: boolean;
 }
 const source = (entry: Entry) => (entry.packing ? applyPacking(entry.code, entry.packing) : entry.code);
 
@@ -330,14 +458,13 @@ const PACKED_VARIANTS: { syntax: PackingSyntax; label: string }[] = [
   { syntax: "pragma", label: "#pragma pack(1)" },
   { syntax: "attribute", label: "__attribute__((packed))" },
 ];
-const entries: Entry[] = Object.entries(CASES).flatMap(([label, code]) => [
-  { label, code },
-  ...PACKED_VARIANTS.map((v) => ({ label: `${label} [${v.label}]`, code, packing: v.syntax })),
-]);
-// A case the engine cannot parse fails in its test rather than being sent to the compilers.
-const parsable = entries.flatMap((entry, i) =>
-  analyzeStruct(entry.code, TARGETS[0]!.selection).errors.length === 0 ? [i] : [],
-);
+const entries: Entry[] = [
+  ...Object.entries(CASES).flatMap(([label, code]) => [
+    { label, code },
+    ...PACKED_VARIANTS.map((v) => ({ label: `${label} [${v.label}]`, code, packing: v.syntax })),
+  ]),
+  ...Object.entries(REJECTIONS).map(([label, code]) => ({ label, code, rejection: true })),
+];
 /** Whether the platform's compiler takes this case's packing syntax, as the app offers it. */
 const appliesTo = (entry: Entry, target: Target) =>
   entry.packing === undefined ||
@@ -364,7 +491,7 @@ for (const target of TARGETS) {
     beforeAll(async () => {
       if (!compile) return;
       const dir = mkdtempSync(join(tmpdir(), "sp-cc-"));
-      const cases = parsable.filter((i) => appliesTo(entries[i]!, target));
+      const cases = entries.flatMap((entry, i) => (appliesTo(entry, target) ? [i] : []));
       for (const i of cases) writeFileSync(join(dir, `case_${i}.c`), probeSource(i));
       if (target.msvc) {
         // One cl run compiles every case; a case it rejects leaves no .obj and its errors in the output.
@@ -404,16 +531,16 @@ for (const target of TARGETS) {
       const key = `${target.name} | ${label}`;
       refs.declare(key);
       it(label, (ctx) => {
-        if (!parsable.includes(i)) {
-          // Not parsable by the engine: report the parser's errors.
-          expect(analyzeStruct(entry.code, target.selection).errors.map((e) => e.message)).toEqual([]);
-          return;
-        }
+        // What the engine says on this target, as the Struct Layout tool asks for it.
+        const rejects = analyzeStruct(entry.code, target.selection, { packing: entry.packing }).errors.map((e) => e.message);
         let now: Answer<Measured> | undefined;
         if (compile) {
           const symbols = results.get(i)!;
           if (typeof symbols === "string") {
             now = { rejected: symbols.split("\n").find((l) => /error/i.test(l)) ?? symbols };
+          } else if (!membersOf(code)) {
+            // The compiler takes what the engine lays out on no target.
+            expect(rejects, `${target.cc} accepts it`).toEqual([]);
           } else {
             try {
               now = { layout: measured(symbols, code, i, resolvePlatform(target.selection).architecture.endianness === "big") };
@@ -425,11 +552,16 @@ for (const target of TARGETS) {
         }
         const truth = refs.answer(key, now);
         if ("rejected" in truth) {
-          // The compiler does not accept this declaration, so it has no layout to compare.
+          // Both reject it. Otherwise the compiler has no layout to compare, and one of REJECTIONS
+          // must be rejected by the engine too.
+          if (rejects.length > 0) return;
+          if (entry.rejection) expect.fail(`${target.cc} rejects it (${truth.rejected}), and the engine lays it out`);
           if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${truth.rejected}`);
           ctx.skip(`${target.cc} rejects it: ${truth.rejected}`);
           return;
         }
+        // The compiler takes it: so must the engine.
+        expect(rejects, `${target.cc} accepts it`).toEqual([]);
         if ("unmeasurable" in truth) {
           if (process.env.SP_CROSS_VERBOSE) console.log(`[skip] ${target.name} | ${label} | ${truth.unmeasurable}`);
           ctx.skip(truth.unmeasurable);

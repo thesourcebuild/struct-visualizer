@@ -9,6 +9,7 @@
  * It follows the grammar in the Zig language reference (TypeExpr, ErrorUnionExpr, SuffixExpr,
  * ContainerDecl), so what it accepts parses as Zig does.
  */
+import { Nesting, NestingError } from '../nesting';
 import { ZigLexError, lexZig } from './lexer';
 import type { ZigToken } from './lexer';
 import type { ParseError } from '../types';
@@ -179,6 +180,8 @@ const BINARY_LEVELS: readonly (readonly string[])[] = [
 class Parser {
   private pos = 0;
   readonly warnings: ParseError[] = [];
+  /** Every nested type, operand and statement is one level deeper (nesting.ts). */
+  private readonly nesting = new Nesting();
 
   constructor(
     private readonly tokens: ZigToken[],
@@ -475,6 +478,10 @@ class Parser {
   }
 
   private stmt(): Stmt {
+    return this.nesting.in(() => this.stmtHere(), this.peek().line);
+  }
+
+  private stmtHere(): Stmt {
     const t = this.peek();
     if (this.is('const') || this.is('var') || (this.is('comptime') && (this.is('var', 1) || this.is('const', 1)))) {
       this.accept('comptime');
@@ -596,11 +603,11 @@ class Parser {
     const t = this.peek();
     if (t.kind === 'punct' && (t.text === '!' || t.text === '-' || t.text === '~' || t.text === '-%' || t.text === '&')) {
       this.next();
-      return { k: 'unary', op: t.text, e: this.prefix(), line: t.line };
+      return { k: 'unary', op: t.text, e: this.nesting.in(() => this.prefix(), t.line), line: t.line };
     }
     if (this.is('try')) {
       this.next();
-      return { k: 'unary', op: 'try', e: this.prefix(), line: t.line };
+      return { k: 'unary', op: 'try', e: this.nesting.in(() => this.prefix(), t.line), line: t.line };
     }
     return this.primary();
   }
@@ -635,6 +642,10 @@ class Parser {
 
   /** TypeExpr <- PrefixTypeOp* ErrorUnionExpr */
   typeExpr(): Expr {
+    return this.nesting.in(() => this.typeExprHere(), this.peek().line);
+  }
+
+  private typeExprHere(): Expr {
     const t = this.peek();
     if (this.accept('?')) return { k: 'optional', child: this.typeExpr(), line: t.line };
     if (this.is('*') || this.is('**')) {
@@ -861,6 +872,7 @@ export function parseZig(source: string): ZigFile {
     parser.containerMembers(root, '');
   } catch (err) {
     if (err instanceof ZigParseError) file.errors.push({ message: err.message, line: err.line, type: 'syntax' });
+    else if (err instanceof NestingError) file.errors.push({ message: err.message, line: err.line ?? 1, type: 'syntax' });
     else throw err;
   }
   file.warnings.push(...parser.warnings);

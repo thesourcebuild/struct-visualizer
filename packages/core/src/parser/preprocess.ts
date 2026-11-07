@@ -1,18 +1,22 @@
 /**
  * A small C preprocessor: enough of translation phases 1-4 to lay out struct declarations.
  *
- * - Comments are removed and line continuations joined, keeping every line number intact.
- * - #if / #ifdef / #ifndef / #elif / #else / #endif are evaluated; inactive lines are blanked.
+ * - Lines are spliced at backslash-newline (phase 2), then comments are replaced by one space
+ *   (phase 3), so a comment may continue a directive onto the next line. Tokens keep the line
+ *   they start on.
+ * - #if / #ifdef / #ifndef / #elif / #else / #endif are evaluated; inactive lines are dropped.
  * - #define / #undef maintain the macro table. Object-like and function-like macros are expanded
  *   at token level as C11 6.10.3 says (see expandMacros), with `#`, `##`, `__VA_ARGS__`,
- *   `__VA_OPT__` and GNU's `, ## __VA_ARGS__`.
+ *   `__VA_OPT__` and GNU's `, ## __VA_ARGS__`, each with the macros defined at that point.
  * - #pragma pack(...) is recorded by line so each definition gets the packing in effect where
- *   it starts. #pragma once is accepted; other pragmas are reported as ignored.
+ *   its compiler reads it. #pragma once is accepted; other pragmas are reported as ignored.
  * - #include is accepted and skipped: the fixed-width and size types it would bring in are
  *   built in.
  */
 import type { ParseError } from '../types';
-import { evaluateConstExpr, ConstExprError } from './const-expr';
+import { evaluateConstExpr, ConstExprError, preprocessorModel } from './const-expr';
+import type { IntegerModel } from './const-expr';
+import { MAX_NESTING, NESTING_MESSAGE, NestingError } from '../nesting';
 import { findClosing, tokenize } from './tokens';
 import type { Token } from './tokens';
 
@@ -27,8 +31,11 @@ export type Macro =
   | { kind: 'function'; params: string[]; variadic: boolean; body: Token[] };
 
 export interface Preprocessed {
-  /** Source with comments and directives blanked; same number of lines as the input. */
+  /** Source with comments and directives blanked, macros unexpanded; same number of lines as the input. */
   text: string;
+  /** The tokens of the active lines, each macro expanded with the definitions in effect where it is used. */
+  tokens: Token[];
+  /** The macros defined at the end. */
   macros: Map<string, Macro>;
   packEvents: PackEvent[];
   errors: ParseError[];
@@ -69,20 +76,123 @@ export function stripComments(code: string): string {
   return out;
 }
 
-/** Run the directives of `code`. No macro is predefined. */
-export function preprocess(code: string): Preprocessed {
+/**
+ * The line ends of a compiler's source files. LF and CRLF end a line everywhere; a carriage return
+ * on its own does under GCC, Clang and SDCC (sdcpp is GCC's preprocessor), and is whitespace under
+ * MSVC, which warns C4335 ("Mac file format detected") when the first line ends in one, keeps it in
+ * a string literal, and lets a `//` comment or a #define run on past it to the next LF (each
+ * measured: gcc 13, sdcc 4.2, cl 19.44).
+ */
+const lineEnds = (bareCr: boolean) => (bareCr ? /\r\n?/g : /\r\n/g);
+
+/**
+ * Translation phases 1-3: lines spliced at backslash-newline without a space, then each comment
+ * replaced by one space (so a block comment spanning lines joins them, and a `//` comment ending in
+ * a backslash continues onto the next line). Each logical line with the physical line it starts on.
+ * `bareCrEndsLine`: whether a carriage return on its own ends a line (lineEnds).
+ */
+export function logicalLines(code: string, bareCrEndsLine = true): Array<{ text: string; line: number }> {
+  const src = code.replace(lineEnds(bareCrEndsLine), '\n');
+  // Phase 2: splice, remembering each character's physical line.
+  const chars: string[] = [];
+  const lineOf: number[] = [];
+  let physical = 1;
+  for (let i = 0; i < src.length; i++) {
+    if (src[i] === '\\' && src[i + 1] === '\n') {
+      i += 1;
+      physical += 1;
+      continue;
+    }
+    chars.push(src[i]!);
+    lineOf.push(physical);
+    if (src[i] === '\n') physical += 1;
+  }
+  // Phase 3: comments become one space; string and character literals are kept as they are.
+  const lines: Array<{ text: string; line: number }> = [];
+  let text = '';
+  let start = 1;
+  for (let i = 0; i < chars.length; ) {
+    const c = chars[i]!;
+    if (c === '\n') {
+      lines.push({ text, line: start });
+      text = '';
+      start = lineOf[i]! + 1;
+      i += 1;
+    } else if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < chars.length && chars[j] !== c && chars[j] !== '\n') j += chars[j] === '\\' ? 2 : 1;
+      const stop = Math.min(j + 1, chars.length);
+      text += chars.slice(i, chars[j] === '\n' ? j : stop).join('');
+      i = chars[j] === '\n' ? j : stop;
+    } else if (c === '/' && chars[i + 1] === '/') {
+      while (i < chars.length && chars[i] !== '\n') i += 1;
+      text += ' ';
+    } else if (c === '/' && chars[i + 1] === '*') {
+      let j = i + 2;
+      while (j < chars.length && !(chars[j] === '*' && chars[j + 1] === '/')) j += 1;
+      i = Math.min(j + 2, chars.length);
+      text += ' ';
+    } else {
+      text += c;
+      i += 1;
+    }
+  }
+  lines.push({ text, line: start });
+  return lines;
+}
+
+/** Thrown when the tokens so far end inside a macro invocation, which more lines may complete. */
+class UnterminatedInvocation extends Error {}
+
+/**
+ * Run the directives of `code`, expanding macros in the other lines with the definitions in
+ * effect there. No macro is predefined. `integers`: the target's, for whether plain char is
+ * signed, which a character constant in #if depends on (#if computes in intmax_t, 64 bits).
+ */
+export function preprocess(code: string, options: { integers?: IntegerModel; bareCrEndsLine?: boolean } = {}): Preprocessed {
   const result: Preprocessed = {
     text: '',
+    tokens: [],
     macros: new Map(),
     packEvents: [],
     errors: [],
     warnings: [],
   };
+  // SDCC's preprocessor is GCC's, so #if is ISO C's there too (measured: `-1 > 0u` holds).
+  const integers = preprocessorModel(options.integers ? options.integers.charSigned : true);
 
-  // Physical lines after comment removal. A logical line may span several physical ones
-  // (backslash-newline); its continuation lines are output as blank lines.
-  const physical = stripComments(code).replace(/\r\n?/g, '\n').split('\n');
-  const out: string[] = new Array(physical.length).fill('');
+  const bareCrEndsLine = options.bareCrEndsLine ?? true;
+  const lines = logicalLines(code, bareCrEndsLine);
+  const physicalCount = code.replace(lineEnds(bareCrEndsLine), '\n').split('\n').length;
+  if (!bareCrEndsLine && /^[^\r\n]*\r(?!\n)/.test(code)) {
+    result.warnings.push({
+      message: 'The first line ends in a carriage return without a line feed, which MSVC reads as a space, not a line end (warning C4335: Mac file format detected).',
+      line: 1,
+      type: 'warning',
+    });
+  }
+  const out: string[] = new Array(physicalCount).fill('');
+
+  // The tokens of the text lines since the last directive, expanded when a directive comes (which
+  // may change the macros) unless they end inside an invocation, whose arguments may go on.
+  let pending: Token[] = [];
+  const counter = { value: 0 };
+  const flush = (atEnd: boolean) => {
+    if (pending.length === 0) return;
+    const last = pending[pending.length - 1]!;
+    if (!atEnd && last.kind === 'id' && result.macros.get(last.value)?.kind === 'function') return;
+    const errors: ParseError[] = [];
+    let expanded: Token[];
+    try {
+      expanded = expandTokens(pending, result.macros, errors, !atEnd, counter);
+    } catch (err) {
+      if (err instanceof UnterminatedInvocation) return;
+      throw err;
+    }
+    result.errors.push(...errors);
+    result.tokens.push(...expanded);
+    pending = [];
+  };
 
   // Conditional-inclusion stack: active = this branch is being compiled; taken = some branch
   // of this #if group already was.
@@ -115,26 +225,24 @@ export function preprocess(code: string): Preprocessed {
       return false;
     }
     try {
-      return evaluateConstExpr(expanded, { identifier: () => 0, context: '#if' }) !== 0;
+      return evaluateConstExpr(expanded, { identifier: () => 0, integers, context: '#if' }) !== 0;
     } catch (err) {
       result.errors.push({ message: `Cannot evaluate '#if ${expr.trim()}': ${(err as Error).message}.`, line, type: 'syntax' });
       return false;
     }
   };
 
-  for (let i = 0; i < physical.length; i++) {
-    const startLine = i + 1;
-    let logical = physical[i];
-    while (logical.endsWith('\\') && i + 1 < physical.length) {
-      logical = logical.slice(0, -1) + ' ' + physical[i + 1];
-      i += 1;
-    }
-
-    const directive = /^\s*#\s*([A-Za-z_]\w*)?(.*)$/.exec(logical);
+  for (const { text: logical, line: startLine } of lines) {
+    // `s`: a carriage return that does not end the line is part of it (lineEnds).
+    const directive = /^\s*#\s*([A-Za-z_]\w*)?(.*)$/s.exec(logical);
     if (!directive) {
-      if (isActive()) out[startLine - 1] = logical;
+      if (isActive()) {
+        out[startLine - 1] = logical;
+        pending.push(...tokenize(logical).map((t) => ({ ...t, line: startLine })));
+      }
       continue;
     }
+    flush(false);
 
     const name = directive[1] ?? '';
     const rest = directive[2].trim();
@@ -192,6 +300,7 @@ export function preprocess(code: string): Preprocessed {
       result.warnings.push({ message: `Unknown directive '#${name}' is ignored.`, line: startLine, type: 'warning' });
     }
   }
+  flush(true);
 
   if (conds.length > 0) {
     result.errors.push({ message: 'Unterminated #if: missing #endif.', type: 'syntax' });
@@ -298,7 +407,7 @@ function handlePragma(rest: string, line: number, result: Preprocessed): void {
     try {
       value = evaluateConstExpr(expandMacros(tokenize(text), result.macros, result.errors, line), { context: '#pragma pack' });
     } catch (err) {
-      result.errors.push({ message: `#pragma pack value '${text}' ${err instanceof ConstExprError ? `is invalid: ${err.message}` : 'is invalid'}.`, line, type: 'syntax' });
+      result.errors.push({ message: `#pragma pack value '${text}' ${err instanceof ConstExprError || err instanceof NestingError ? `is invalid: ${err.message}` : 'is invalid'}.`, line, type: 'syntax' });
       return undefined;
     }
     if (!VALID_PACK.has(value)) {
@@ -361,7 +470,10 @@ interface PPToken extends Token {
   hide: ReadonlySet<string>;
 }
 
-class ExpansionError extends Error {}
+class ExpansionError extends Error {
+  /** The input ended inside an invocation written in it (not one a macro produced). */
+  unterminated = false;
+}
 
 /** More than this many tokens out of one expansion is a runaway macro, not a header. */
 const MAX_EXPANDED_TOKENS = 1_000_000;
@@ -392,25 +504,55 @@ export function expandMacros(
   }
 }
 
+/**
+ * expandMacros for the preprocessor's text lines: __COUNTER__ counts on across calls, and with
+ * `defer`, input that ends inside an invocation throws UnterminatedInvocation instead of an error.
+ */
+function expandTokens(tokens: readonly Token[], macros: ReadonlyMap<string, Macro>, errors: ParseError[], defer: boolean, counter: { value: number }): Token[] {
+  const expander = new Expander(macros, undefined, counter);
+  try {
+    return expander.expand(tokens.map((t) => ({ ...t, hide: NO_HIDE }))).map(({ hide: _hide, ...t }) => t);
+  } catch (err) {
+    if (!(err instanceof ExpansionError)) throw err;
+    if (defer && err.unterminated) throw new UnterminatedInvocation();
+    errors.push({ message: err.message, line: expander.errorLine, type: 'syntax' });
+    return tokens.slice();
+  }
+}
+
 const NO_HIDE: ReadonlySet<string> = new Set();
 
 class Expander {
   private produced = 0;
-  private counter = 0;
+  private depth = 0;
   errorLine: number | undefined;
 
   constructor(
     private readonly macros: ReadonlyMap<string, Macro>,
     private readonly lineOverride: number | undefined,
+    private readonly counter: { value: number } = { value: 0 },
   ) {}
 
-  private fail(message: string, line: number): never {
+  private fail(message: string, line: number, unterminated = false): never {
     this.errorLine = line;
-    throw new ExpansionError(message);
+    const err = new ExpansionError(message);
+    err.unterminated = unterminated;
+    throw err;
   }
 
-  /** Expand a token list to the end. */
+  /** Expand a token list to the end. An argument is expanded inside its invocation's expansion. */
   expand(input: PPToken[]): PPToken[] {
+    this.depth += 1;
+    // Invocations nested in each other's arguments, F(F(F(x))): one level each, the first is the text.
+    if (this.depth > MAX_NESTING + 1) this.fail(NESTING_MESSAGE, this.lineOverride ?? input[0]?.line ?? 1);
+    try {
+      return this.expandAll(input);
+    } finally {
+      this.depth -= 1;
+    }
+  }
+
+  private expandAll(input: PPToken[]): PPToken[] {
     // Tokens still to scan, last one first, so an expansion is pushed back in front cheaply.
     const pending = input.slice().reverse();
     const out: PPToken[] = [];
@@ -420,7 +562,7 @@ class Expander {
       const line = this.lineOverride ?? t.line;
 
       if (t.kind === 'id' && !t.hide.has(t.value) && (t.value === '__LINE__' || t.value === '__COUNTER__') && !macro) {
-        const value = t.value === '__LINE__' ? line : this.counter++;
+        const value = t.value === '__LINE__' ? line : this.counter.value++;
         out.push({ kind: 'num', value: String(value), line, hide: t.hide, ...(t.space && { space: true }) });
         continue;
       }
@@ -469,7 +611,7 @@ class Expander {
       if (t.kind === 'punct' && t.value === ',' && depth === 0) args.push([]);
       else args[args.length - 1].push(t);
     }
-    return this.fail(`Unterminated invocation of macro '${name}': missing ')'.`, line);
+    return this.fail(`Unterminated invocation of macro '${name}': missing ')'.`, line, this.depth === 1);
   }
 
   /** One token list per parameter; a variadic macro's extra arguments go, commas included, into the last. */

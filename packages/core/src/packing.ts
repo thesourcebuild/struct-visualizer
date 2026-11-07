@@ -129,11 +129,14 @@ export function applyPacking(code: string, syntax: PackingSyntax): string {
   if (syntax === 'pragma') return `#pragma pack(push, 1)\n${code}\n#pragma pack(pop)\n`;
 
   const inserts: { at: number; text: string }[] = [];
+  // The attribute and the keyword are GCC's and the embedded compilers', whose preprocessors end
+  // a line at a carriage return on its own too (MSVC, which does not, takes only the pragma).
+  const lineEnd = (k: number) => code[k] === '\n' || (code[k] === '\r' && code[k + 1] !== '\n');
   let i = 0;
   let lineStart = true;
   while (i < code.length) {
     const c = code[i]!;
-    if (c === '\n') {
+    if (lineEnd(i)) {
       lineStart = true;
       i += 1;
       continue;
@@ -144,8 +147,8 @@ export function applyPacking(code: string, syntax: PackingSyntax): string {
     }
     if (lineStart && c === '#') {
       // A directive runs to the end of the line, including backslash continuations.
-      while (i < code.length && code[i] !== '\n') {
-        i += code[i] === '\\' && (code[i + 1] === '\n' || code[i + 1] === '\r') ? (code[i + 1] === '\r' ? 3 : 2) : 1;
+      while (i < code.length && !lineEnd(i)) {
+        i += code[i] === '\\' && (code[i + 1] === '\n' || code[i + 1] === '\r') ? (code[i + 1] === '\r' && code[i + 2] === '\n' ? 3 : 2) : 1;
       }
       continue;
     }
@@ -156,7 +159,7 @@ export function applyPacking(code: string, syntax: PackingSyntax): string {
     }
     if (c === '"' || c === "'") {
       let j = i + 1;
-      while (j < code.length && code[j] !== c && code[j] !== '\n') j += code[j] === '\\' ? 2 : 1;
+      while (j < code.length && code[j] !== c && !lineEnd(j)) j += code[j] === '\\' ? 2 : 1;
       i = j + 1;
       continue;
     }

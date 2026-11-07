@@ -1,5 +1,5 @@
 /**
- * The part of Zig 0.16's standard library that commonly appears in structs, transcribed from its
+ * The part of Zig 0.17's standard library that commonly appears in structs, transcribed from its
  * sources (lib/std/...): each type's fields, and the declarations they and its compile-time
  * checks refer to, as std writes them. Other methods and declarations are left out. Each std file
  * is a struct of the same name here (`mem.Allocator` for mem/Allocator.zig), and `@import("std")`
@@ -13,13 +13,59 @@
 export const ZIG_STD = String.raw`
 const std = @import("std");
 
-// ---- builtin.zig
-pub const builtin = struct {
-    pub const OptimizeMode = enum {
-        Debug,
-        ReleaseSafe,
-        ReleaseFast,
-        ReleaseSmall,
+// ---- lang.zig (std.builtin is a deprecated name for it)
+pub const builtin = lang;
+pub const lang = struct {
+    pub const OptimizeMode = Optimize;
+
+    pub const Optimize = enum {
+        debug,
+        safe,
+        fast,
+        small,
+
+        pub const Debug: @This() = .debug;
+        pub const ReleaseSafe: @This() = .safe;
+        pub const ReleaseFast: @This() = .fast;
+        pub const ReleaseSmall: @This() = .small;
+
+        pub fn runtimeSafety(o: @This()) bool {
+            return switch (o) {
+                .debug, .safe => true,
+                .fast, .small => false,
+            };
+        }
+    };
+
+    pub const AddressSpace = enum(u5) {
+        generic,
+        gs,
+        fs,
+        ss,
+        far,
+        global,
+        constant,
+        param,
+        shared,
+        local,
+        private,
+        input,
+        output,
+        uniform,
+        push_constant,
+        storage_buffer,
+        physical_storage_buffer,
+        flash,
+        flash1,
+        flash2,
+        flash3,
+        flash4,
+        flash5,
+        cog,
+        hub,
+        lut,
+        externref,
+        funcref,
     };
 
     pub const Signedness = enum(u1) {
@@ -52,6 +98,7 @@ pub const builtin = struct {
         @"anyframe": AnyFrame,
         vector: Vector,
         enum_literal,
+        spirv: Spirv,
 
         pub const Int = struct {
             signedness: Signedness,
@@ -62,12 +109,8 @@ pub const builtin = struct {
         };
         pub const Pointer = struct {
             size: Size,
-            is_const: bool,
-            is_volatile: bool,
-            alignment: ?usize,
-            address_space: AddressSpace,
+            attrs: Attributes,
             child: type,
-            is_allowzero: bool,
             sentinel_ptr: ?*const anyopaque,
 
             pub const Size = enum(u2) {
@@ -75,6 +118,14 @@ pub const builtin = struct {
                 many,
                 slice,
                 c,
+            };
+
+            pub const Attributes = struct {
+                @"const": bool = false,
+                @"volatile": bool = false,
+                @"allowzero": bool = false,
+                @"addrspace": ?AddressSpace = null,
+                @"align": ?usize = null,
             };
         };
         pub const Array = struct {
@@ -87,19 +138,20 @@ pub const builtin = struct {
             @"extern",
             @"packed",
         };
-        pub const StructField = struct {
-            name: [:0]const u8,
-            type: type,
-            default_value_ptr: ?*const anyopaque,
-            is_comptime: bool,
-            alignment: ?usize,
-        };
         pub const Struct = struct {
-            layout: ContainerLayout,
-            backing_integer: ?type = null,
-            fields: []const StructField,
-            decls: []const Declaration,
             is_tuple: bool,
+            layout: ContainerLayout,
+            backing_integer: ?type,
+            field_names: []const [:0]const u8,
+            field_types: []const type,
+            field_attrs: []const FieldAttributes,
+            decl_names: []const [:0]const u8,
+
+            pub const FieldAttributes = struct {
+                @"comptime": bool = false,
+                @"align": ?usize = null,
+                default_value_ptr: ?*const anyopaque = null,
+            };
         };
         pub const Optional = struct {
             child: type,
@@ -108,46 +160,99 @@ pub const builtin = struct {
             error_set: type,
             payload: type,
         };
-        pub const Error = struct {
-            name: [:0]const u8,
-        };
-        pub const ErrorSet = ?[]const Error;
-        pub const EnumField = struct {
-            name: [:0]const u8,
-            value: comptime_int,
+        pub const ErrorSet = struct {
+            error_names: ?[]const [:0]const u8,
         };
         pub const Enum = struct {
             tag_type: type,
-            fields: []const EnumField,
-            decls: []const Declaration,
-            is_exhaustive: bool,
-        };
-        pub const UnionField = struct {
-            name: [:0]const u8,
-            type: type,
-            alignment: ?usize,
+            mode: Mode,
+            field_names: []const [:0]const u8,
+            field_values: []const comptime_int,
+            decl_names: []const [:0]const u8,
+
+            pub const Mode = enum { exhaustive, nonexhaustive };
         };
         pub const Union = struct {
             layout: ContainerLayout,
             tag_type: ?type,
-            fields: []const UnionField,
-            decls: []const Declaration,
+            backing_integer: ?type,
+            field_names: []const [:0]const u8,
+            field_types: []const type,
+            field_attrs: []const FieldAttributes,
+            decl_names: []const [:0]const u8,
+
+            pub const FieldAttributes = struct {
+                @"align": ?usize = null,
+            };
         };
         pub const Fn = struct {
-            calling_convention: CallingConvention,
+            attrs: Attributes,
             is_generic: bool,
-            is_var_args: bool,
             return_type: ?type,
-            params: []const Param,
+            param_types: []const ?type,
+            param_attrs: []const ParamAttributes,
 
-            pub const Param = struct {
-                is_generic: bool,
-                is_noalias: bool,
-                type: ?type,
+            pub const ParamAttributes = struct {
+                @"noalias": bool = false,
+            };
+
+            pub const Attributes = struct {
+                @"callconv": CallingConvention = .auto,
+                varargs: bool = false,
+            };
+        };
+        pub const Spirv = union(enum(u2)) {
+            sampler,
+            image: Image,
+            sampled_image: type,
+            runtime_array: type,
+
+            pub const Image = struct {
+                usage: Usage,
+                format: Format,
+                dim: Dimensionality,
+                depth: Depth,
+                access: Access,
+                arrayed: bool,
+                multisampled: bool,
+
+                pub const Usage = union(enum(u2)) {
+                    unknown: type,
+                    sampled: type,
+                    storage: type,
+                };
+
+                pub const Format = enum(u4) {
+                    unknown,
+                    rgba32f,
+                    rgba32i,
+                    rgba32u,
+                    rgba16f,
+                    rgba16i,
+                    rgba16u,
+                    rgba8unorm,
+                    rgba8snorm,
+                    rgba8i,
+                    rgba8u,
+                    r32f,
+                    r32i,
+                    r32u,
+                };
+
+                pub const Dimensionality = enum(u2) {
+                    @"1d",
+                    @"2d",
+                    @"3d",
+                    cube,
+                };
+
+                pub const Depth = enum(u2) { unknown, depth, not_depth };
+
+                pub const Access = enum(u2) { unknown, read_only, write_only, read_write };
             };
         };
         pub const Opaque = struct {
-            decls: []const Declaration,
+            decl_names: []const [:0]const u8,
         };
         pub const Frame = struct {
             function: *const anyopaque,
@@ -158,9 +263,6 @@ pub const builtin = struct {
         pub const Vector = struct {
             len: comptime_int,
             child: type,
-        };
-        pub const Declaration = struct {
-            name: [:0]const u8,
         };
     };
 };
@@ -202,7 +304,11 @@ pub const Target = struct {
             uefi,
 
             @"3ds",
+            wiiu,
+            @"switch",
+            gba,
 
+            psx,
             ps3,
             ps4,
             ps5,
@@ -220,6 +326,10 @@ pub const Target = struct {
             opencl,
             opengl,
             vulkan,
+
+            tios,
+
+            ashetos,
         };
     };
 
@@ -235,6 +345,8 @@ pub const Target = struct {
         gnux32,
         eabi,
         eabihf,
+        abin32,
+        x32,
         ilp32,
         android,
         androideabi,
@@ -251,6 +363,7 @@ pub const Target = struct {
         simulator,
         ohos,
         ohoseabi,
+        call0,
     };
 
     pub const Cpu = struct {
@@ -267,6 +380,7 @@ pub const Target = struct {
             bpfeb,
             bpfel,
             csky,
+            ez80,
             hexagon,
             hppa,
             hppa64,
@@ -276,6 +390,7 @@ pub const Target = struct {
             loongarch32,
             loongarch64,
             m68k,
+            m88k,
             microblaze,
             microblazeel,
             mips,
@@ -300,6 +415,7 @@ pub const Target = struct {
             sheb,
             sparc,
             sparc64,
+            spork8,
             spirv32,
             spirv64,
             thumb,
@@ -320,11 +436,9 @@ pub const Target = struct {
 // ---- debug.zig
 pub const debug = struct {
     const builtin = @import("builtin");
+    const math = std.math;
 
-    pub const runtime_safety = switch (builtin.mode) {
-        .Debug, .ReleaseSafe => true,
-        .ReleaseFast, .ReleaseSmall => false,
-    };
+    pub const runtime_safety = builtin.mode.runtimeSafety();
 
     pub fn assert(ok: bool) void {
         @disableInstrumentation();
@@ -334,34 +448,32 @@ pub const debug = struct {
     pub const SafetyLock = struct {
         state: State = if (runtime_safety) .unlocked else .unknown,
 
-        pub const State = if (runtime_safety) enum { unlocked, locked } else enum { unknown };
+        pub const State = if (runtime_safety) enum(usize) {
+            unlocked = 0,
+            exclusive = math.maxInt(usize),
+            _, // shared lock count
+        } else enum { unknown };
     };
 };
 
-// ---- meta.zig
-pub const meta = struct {
-    pub fn Int(comptime signedness: std.builtin.Signedness, comptime bit_count: u16) type {
-        return @Int(signedness, bit_count);
-    }
-};
+// ---- meta.zig: std.meta.Int is gone in 0.17 (use @Int).
+pub const meta = struct {};
 
 // ---- math.zig
 pub const math = struct {
     const assert = std.debug.assert;
 
     pub fn maxInt(comptime T: type) comptime_int {
-        const info = @typeInfo(T);
-        const bit_count = info.int.bits;
-        if (bit_count == 0) return 0;
-        return (1 << (bit_count - @intFromBool(info.int.signedness == .signed))) - 1;
+        const info = @typeInfo(T).int;
+        return (1 << (info.bits - @intFromBool(info.signedness == .signed))) - 1;
     }
 
     pub fn minInt(comptime T: type) comptime_int {
-        const info = @typeInfo(T);
-        const bit_count = info.int.bits;
-        if (info.int.signedness == .unsigned) return 0;
-        if (bit_count == 0) return 0;
-        return -(1 << (bit_count - 1));
+        const info = @typeInfo(T).int;
+        return switch (info.signedness) {
+            .unsigned => 0,
+            .signed => -(1 << (info.bits - 1)),
+        };
     }
 
     pub fn Log2Int(comptime T: type) type {
@@ -369,7 +481,7 @@ pub const math = struct {
         if (T == comptime_int) return comptime_int;
         const bits: u16 = @typeInfo(T).int.bits;
         const log2_bits = 16 - @clz(bits - 1);
-        return std.meta.Int(.unsigned, log2_bits);
+        return @Int(.unsigned, log2_bits);
     }
 
     pub fn isPowerOfTwo(int: anytype) bool {
@@ -418,13 +530,14 @@ pub const mem = struct {
         _,
 
         pub fn toByteUnits(a: Alignment) usize {
-            return @as(usize, 1) << @intFromEnum(a);
+            return @as(usize, 1) << @backingInt(a);
         }
     };
 };
 
 // ---- array_list.zig
 pub const array_list = struct {
+    const debug = std.debug;
     const mem = std.mem;
     const Allocator = mem.Allocator;
 
@@ -444,6 +557,8 @@ pub const array_list = struct {
             capacity: usize,
             allocator: Allocator,
 
+            pointer_stability: debug.SafetyLock,
+
             pub const Slice = if (alignment) |a| ([]align(a.toByteUnits()) T) else []T;
         };
     }
@@ -458,6 +573,8 @@ pub const array_list = struct {
             const Self = @This();
             items: Slice,
             capacity: usize,
+
+            pointer_stability: debug.SafetyLock,
 
             pub const Slice = if (alignment) |a| ([]align(a.toByteUnits()) T) else []T;
         };
@@ -526,7 +643,8 @@ pub const hash_map = struct {
         };
     }
 
-    pub fn HashMapUnmanaged(
+    pub const HashMapUnmanaged = Custom;
+    fn Custom(
         comptime K: type,
         comptime V: type,
         comptime Context: type,
@@ -576,8 +694,8 @@ pub const hash_map = struct {
                 fingerprint: FingerPrint = free,
                 used: u1 = 0,
 
-                const slot_free = @as(u8, @bitCast(Metadata{ .fingerprint = free }));
-                const slot_tombstone = @as(u8, @bitCast(Metadata{ .fingerprint = tombstone }));
+                const slot_free: u8 = @bitCast(Metadata{ .fingerprint = free });
+                const slot_tombstone: u8 = @bitCast(Metadata{ .fingerprint = tombstone });
             };
         };
     }
@@ -764,21 +882,27 @@ const Order = std.math.Order;
 
 // ---- bit_set.zig
 pub const bit_set = struct {
-    pub fn StaticBitSet(comptime size: usize) type {
+    const Allocator = std.mem.Allocator;
+
+    pub const StaticBitSet = Static;
+
+    pub fn Static(comptime size: usize) type {
         if (size <= @bitSizeOf(usize)) {
-            return IntegerBitSet(size);
+            return Integer(size);
         } else {
-            return ArrayBitSet(usize, size);
+            return Array(usize, size);
         }
     }
 
-    pub fn IntegerBitSet(comptime size: u16) type {
+    pub const IntegerBitSet = Integer;
+
+    pub fn Integer(comptime size: u16) type {
         return packed struct(MaskInt) {
             const Self = @This();
 
             pub const bit_length: usize = size;
 
-            pub const MaskInt = std.meta.Int(.unsigned, size);
+            pub const MaskInt = @Int(.unsigned, size);
 
             pub const ShiftInt = std.math.Log2Int(MaskInt);
 
@@ -786,18 +910,20 @@ pub const bit_set = struct {
         };
     }
 
-    pub fn ArrayBitSet(comptime MaskIntType: type, comptime size: usize) type {
+    pub const ArrayBitSet = Array;
+
+    pub fn Array(comptime MaskIntType: type, comptime size: usize) type {
         const mask_info: std.builtin.Type = @typeInfo(MaskIntType);
 
         // Make sure the mask int is indeed an int
-        if (mask_info != .int) @compileError("ArrayBitSet can only operate on integer masks, but was passed " ++ @typeName(MaskIntType));
+        if (mask_info != .int) @compileError("Array can only operate on integer masks, but was passed " ++ @typeName(MaskIntType));
 
         // It must also be unsigned.
-        if (mask_info.int.signedness != .unsigned) @compileError("ArrayBitSet requires an unsigned integer mask type, but was passed " ++ @typeName(MaskIntType));
+        if (mask_info.int.signedness != .unsigned) @compileError("Array requires an unsigned integer mask type, but was passed " ++ @typeName(MaskIntType));
 
         // And it must not be empty.
         if (MaskIntType == u0)
-            @compileError("ArrayBitSet requires a sized integer for its mask int.  u0 does not work.");
+            @compileError("Array requires a sized integer for its mask int.  u0 does not work.");
 
         const byte_size = std.mem.byte_size_in_bits;
 
@@ -806,8 +932,8 @@ pub const bit_set = struct {
         if (!std.math.isPowerOfTwo(@bitSizeOf(MaskIntType))) {
             var desired_bits = std.math.ceilPowerOfTwoAssert(usize, @bitSizeOf(MaskIntType));
             if (desired_bits < byte_size) desired_bits = byte_size;
-            const FixedMaskType = std.meta.Int(.unsigned, desired_bits);
-            @compileError("ArrayBitSet was passed integer type " ++ @typeName(MaskIntType) ++
+            const FixedMaskType = @Int(.unsigned, desired_bits);
+            @compileError("Array was passed integer type " ++ @typeName(MaskIntType) ++
                 ", which is not a power of two.  Please round this up to a power of two integer size (i.e. " ++ @typeName(FixedMaskType) ++ ").");
         }
 
@@ -817,8 +943,8 @@ pub const bit_set = struct {
         if (@bitSizeOf(MaskIntType) != @sizeOf(MaskIntType) * byte_size) {
             var desired_bits = @sizeOf(MaskIntType) * byte_size;
             desired_bits = std.math.ceilPowerOfTwoAssert(usize, desired_bits);
-            const FixedMaskType = std.meta.Int(.unsigned, desired_bits);
-            @compileError("ArrayBitSet was passed integer type " ++ @typeName(MaskIntType) ++
+            const FixedMaskType = @Int(.unsigned, desired_bits);
+            @compileError("Array was passed integer type " ++ @typeName(MaskIntType) ++
                 ", which contains padding bits.  Please round this up to an unpadded integer size (i.e. " ++ @typeName(FixedMaskType) ++ ").");
         }
 
@@ -843,7 +969,50 @@ pub const bit_set = struct {
             masks: [num_masks]MaskInt,
         };
     }
+
+    pub const DynamicBitSetUnmanaged = Dynamic;
+
+    pub const Dynamic = struct {
+        const Self = @This();
+
+        pub const MaskInt = usize;
+
+        pub const ShiftInt = std.math.Log2Int(MaskInt);
+
+        bit_length: usize = 0,
+
+        // std defaults it to empty_masks_ptr, a pointer into a constant array (a slice of
+        // [_]MaskInt{ 0, undefined }), which the parser here does not read; defaults do not
+        // change the layout.
+        masks: [*]MaskInt,
+    };
+
+    pub const DynamicBitSet = DynamicManaged;
+
+    pub const DynamicManaged = struct {
+        const Self = @This();
+
+        pub const MaskInt = usize;
+
+        pub const ShiftInt = std.math.Log2Int(MaskInt);
+
+        allocator: Allocator,
+        unmanaged: Dynamic = .{},
+    };
 };
 
+pub const DynamicBitSet = bit_set.DynamicBitSet;
+pub const DynamicBitSetUnmanaged = bit_set.DynamicBitSetUnmanaged;
 pub const StaticBitSet = bit_set.StaticBitSet;
+
+// ---- deque.zig
+pub fn Deque(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        buffer: []T,
+        head: usize,
+        len: usize,
+    };
+}
 `;
