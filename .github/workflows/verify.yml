@@ -34,7 +34,7 @@ jobs:
         timeout-minutes: 60
       # Zig is the ground truth of the Zig tools (tests/zig-compiler.test.ts). Bindings are compiled by
       # their own languages (tests/bindings.test.ts): Zig and Rust check them for the target, C# with
-      # .NET 9; Go and Python are on the runner already.
+      # .NET 9; Python is on the runner already.
       - name: Install Zig, and the toolchains the bindings are checked with
         if: matrix.node == 22
         uses: mlugg/setup-zig@v2
@@ -44,14 +44,24 @@ jobs:
         if: matrix.node == 22
         with:
           dotnet-version: 9.0.x
+      # go/types is the Go tools' ground truth: the version the answers were recorded with
+      # (tests/support/go-version), not the runner's.
+      - uses: actions/setup-go@v6
+        if: matrix.node == 22
+        with:
+          go-version-file: tests/support/go-version
+          cache: false
       # Every target the Rust engine and the Rust bindings are checked on: rustup ships the library of
       # most; the tier-3 ones (MIPS, AVR) have core built from source on nightly (-Zbuild-std).
       - name: Add the Rust targets
         if: matrix.node == 22
         run: |
           rustup target add x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin i686-unknown-linux-gnu i686-pc-windows-msvc armv7-unknown-linux-gnueabihf thumbv7em-none-eabihf aarch64-unknown-linux-gnu riscv32imac-unknown-none-elf riscv64gc-unknown-linux-gnu powerpc-unknown-linux-gnu wasm32-unknown-unknown
-          rustup toolchain install nightly --profile minimal -c rust-src
-          echo "nightly=$(rustup run nightly rustc --version | tr -c 'A-Za-z0-9.-' '_')" >> "$GITHUB_OUTPUT"
+          # The nightly the answers were recorded with (tests/support/rust-nightly): a newer one can
+          # fail to build core for a tier-3 target, as one did for AVR.
+          nightly=$(cat tests/support/rust-nightly)
+          rustup toolchain install "$nightly" --profile minimal -c rust-src
+          echo "nightly=$nightly" >> "$GITHUB_OUTPUT"
         id: rust
       # The core the tier-3 targets need, built by that nightly: reused until nightly changes.
       - name: Cache core built for the tier-3 Rust targets

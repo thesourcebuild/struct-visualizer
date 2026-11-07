@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RUST_TARGETS, analyzeRust, formatRustType, generateRustVerificationModule, rustExamples } from "@sp/core";
 import type { CalculationResult, RustAnalysis } from "@sp/core";
 import { References, useReferences } from "./support/references";
+import { RUST_NIGHTLY } from "./support/toolchains";
 import type { Answer } from "./support/references";
 
 /**
@@ -35,8 +36,8 @@ const rustupLines = (args: string[]) => {
 const installed = new Set(rustupLines(["target", "list", "--installed"]));
 /** Targets rustup distributes a standard library for; the rest are tier 3. */
 const distributed = new Set(rustupLines(["target", "list"]).map((l) => l.replace(/ \(.*\)$/, "")));
-/** A nightly toolchain with the library source, to build core and alloc for a tier-3 target. */
-const buildStd = rustupLines(["component", "list", "--toolchain", "nightly", "--installed"]).some((l) => l.startsWith("rust-src"));
+/** The nightly the answers were recorded with, with the library source, to build core and alloc for a tier-3 target. */
+const buildStd = rustupLines(["component", "list", "--toolchain", RUST_NIGHTLY, "--installed"]).some((l) => l.startsWith("rust-src"));
 /** Where cargo keeps the core and alloc it builds (as in tests/bindings.test.ts). */
 const buildStdDir = process.env.SP_RUST_BUILD_STD_DIR || join(tmpdir(), "sp-rust-build-std");
 /** Targets without std: their crates are no_std and use alloc. */
@@ -294,7 +295,7 @@ async function checkTarget(target: string, how: "stable" | "build-std", cases: C
     writeFileSync(join(dir, "Cargo.toml"), '[package]\nname = "layoutcheck"\nversion = "0.0.0"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n');
     writeFileSync(join(dir, "src", "lib.rs"), lines.join("\n"));
     const env = { ...process.env, CARGO_TARGET_DIR: buildStdDir, RUSTFLAGS: [...flags, "-A", "warnings"].join(" ") };
-    const args = ["run", "nightly", "cargo", "check", "-q", "-Zbuild-std=core,alloc", "--target", target];
+    const args = ["run", RUST_NIGHTLY, "cargo", "check", "-q", "-Zbuild-std=core,alloc", "--target", target];
     output = await run("rustup", args, { cwd: dir, env, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
   }
 
@@ -337,7 +338,7 @@ for (const target of RUST_TARGETS) {
       throw new Error(
         distributed.has(target.id) || distributed.size === 0
           ? `rustup target add ${target.id}`
-          : `${target.id} is tier 3: rustup toolchain install nightly --profile minimal -c rust-src`,
+          : `${target.id} is tier 3: rustup toolchain install ${RUST_NIGHTLY} --profile minimal -c rust-src`,
       );
     });
     continue;

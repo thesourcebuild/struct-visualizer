@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PaddingCalculator, analyzeStruct, bindingTargetName, examples, generateBindings } from "@sp/core";
 import type { BindingLanguage, BindingOutput, CalculationResult, PlatformSelection } from "@sp/core";
 import { References, digest, useReferences } from "./support/references";
+import { RUST_NIGHTLY } from "./support/toolchains";
 import type { Answer } from "./support/references";
 
 /**
@@ -69,8 +70,8 @@ const rustStd = (target: string) => {
   const lib = join(rustSysroot, "lib", "rustlib", target, "lib");
   return existsSync(lib) && readdirSync(lib).some((f) => /^libstd-.*\.rlib$/.test(f));
 };
-/** A nightly toolchain with the library source, to build core for a tier-3 target. */
-const buildStd = toolchains.rust && rustupLines(["component", "list", "--toolchain", "nightly", "--installed"]).some((l) => l.startsWith("rust-src"));
+/** The nightly the answers were recorded with, with the library source, to build core for a tier-3 target. */
+const buildStd = toolchains.rust && rustupLines(["component", "list", "--toolchain", RUST_NIGHTLY, "--installed"]).some((l) => l.startsWith("rust-src"));
 /**
  * Where cargo keeps the core it builds for the tier-3 targets: building it is most of the time
  * they take, and it is reused by later runs with the same nightly (CI caches the directory).
@@ -259,7 +260,7 @@ async function checkRust() {
     const tier3 = !rustupTargets.has(target);
     if (!stable && !(tier3 && buildStd)) {
       const why = tier3
-        ? `rustup ships no core library for ${target} (tier 3); building it needs nightly: rustup toolchain install nightly --profile minimal -c rust-src`
+        ? `rustup ships no core library for ${target} (tier 3); building it needs nightly: rustup toolchain install ${RUST_NIGHTLY} --profile minimal -c rust-src`
         : `rustup target add ${target}`;
       for (const p of cases) unavailable.get("rust")!.set(p.index, why);
       continue;
@@ -312,7 +313,7 @@ async function checkRust() {
       file = join(crate, "src", "lib.rs");
       writeFileSync(file, lines.join("\n"));
       const env = { ...process.env, CARGO_TARGET_DIR: buildStdDir, RUSTFLAGS: flags.join(" ") };
-      const args = ["run", "nightly", "cargo", "check", "-q", hosted ? "-Zbuild-std" : "-Zbuild-std=core", "--target", target];
+      const args = ["run", RUST_NIGHTLY, "cargo", "check", "-q", hosted ? "-Zbuild-std" : "-Zbuild-std=core", "--target", target];
       output = await run("rustup", args, { cwd: crate, env, maxBuffer: 64 * 1024 * 1024 }).then(() => "", fail);
     }
     record("rust", cases, output, file);

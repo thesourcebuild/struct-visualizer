@@ -131,7 +131,7 @@ sudo apt install --no-install-recommends g++ gcc-i686-linux-gnu g++-i686-linux-g
   gcc-arm-none-eabi gcc-riscv64-unknown-elf gcc-avr avr-libc sdcc
 ```
 
-For Rust: `rustup target add <triple>` for each target, and `rustup toolchain install nightly --profile minimal -c rust-src` for the tier-3 ones. Without them, those targets are checked against the recorded answers.
+For Rust: `rustup target add <triple>` for each target, and for the tier-3 ones the nightly the answers were recorded with, named in `tests/support/rust-nightly`: `rustup toolchain install nightly-2026-10-29 --profile minimal -c rust-src`. Without them, those targets are checked against the recorded answers. CI installs the same nightly, and the Go named in `tests/support/go-version`.
 
 ## Lint rules
 

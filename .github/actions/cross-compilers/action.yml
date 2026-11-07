@@ -10,13 +10,15 @@ runs:
     - id: plan
       shell: bash
       run: |
-        # The compilers only, without recommended extras such as the bare-metal ARM C++ library
-        # (2 GB): the probes are compiled freestanding and never linked. gcc-arm-none-eabi and
-        # gcc-avr bring their g++ too. Windows is MSVC's, checked on a Windows runner instead.
+        # The compilers only, without recommended extras such as the bare-metal ARM C++ libraries
+        # (libstdc++-arm-none-eabi-newlib, 2 GB): the probes are compiled freestanding and never
+        # linked. Its headers are needed (libstdc++-arm-none-eabi-dev, 19 MB: <cstddef>), as on the
+        # machine the answers were recorded on. gcc-arm-none-eabi and gcc-avr bring their g++ too.
+        # Windows is MSVC's, checked on a Windows runner instead.
         packages="g++ gcc-i686-linux-gnu g++-i686-linux-gnu gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
           gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
           gcc-mipsel-linux-gnu g++-mipsel-linux-gnu gcc-powerpc-linux-gnu g++-powerpc-linux-gnu \
-          gcc-mips-linux-gnu g++-mips-linux-gnu gcc-arm-none-eabi gcc-riscv64-unknown-elf \
+          gcc-mips-linux-gnu g++-mips-linux-gnu gcc-arm-none-eabi libstdc++-arm-none-eabi-dev gcc-riscv64-unknown-elf \
           gcc-avr avr-libc sdcc"
         packages=$(echo $packages)
         echo "packages=$packages" >> "$GITHUB_OUTPUT"
