@@ -16,7 +16,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # The compilers the recorded answers come from are Ubuntu 24.04's (tests/references), and
+    # 26.04 no longer packages the MIPS cross compilers: the release is pinned, not "latest".
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v6

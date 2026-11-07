@@ -21,14 +21,16 @@ runs:
         packages=$(echo $packages)
         echo "packages=$packages" >> "$GITHUB_OUTPUT"
         echo "key=cross-compilers-$ImageOS-$ImageVersion-$(echo "$packages" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        echo "release=cross-compilers-$ImageOS-" >> "$GITHUB_OUTPUT"
 
     - id: cache
       uses: actions/cache/restore@v6
       with:
         path: ~/apt-archives
         key: ${{ steps.plan.outputs.key }}
-        # An older image's packages: most are still current, so only the updated ones download.
-        restore-keys: cross-compilers-
+        # An older image of the same Ubuntu release: most of its packages are still current, so
+        # only the updated ones download. Another release's packages are of no use.
+        restore-keys: ${{ steps.plan.outputs.release }}
 
     - shell: bash
       run: |
